@@ -6,7 +6,7 @@ status: "Draft"
 normative: true
 priority: "P1/P2"
 last_updated: "2026-08-21"
-depends_on: ["DXB-ARC-012", "DXB-RUN-032", "DXB-ENG-053"]
+depends_on: ["DXB-ARC-012", "DXB-GOV-003"]
 ---
 
 # Plugin 시스템

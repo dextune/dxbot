@@ -39,7 +39,7 @@ depends_on: ["DXB-INDEX"]
 | `10-architecture/11-rust-workspace-modules.md` | Updated v0.2 |
 | `10-architecture/12-shared-contracts-extension-model.md` | Updated v0.2 |
 | `10-architecture/13-harness-integration.md` | Updated v0.2 |
-| `10-architecture/14-event-state-model.md` | Inherited |
+| `10-architecture/14-event-state-model.md` | Updated v0.2 |
 | `10-architecture/15-storage-data-model.md` | Updated v0.2 |
 | `10-architecture/16-plugin-system.md` | New v0.2 |
 

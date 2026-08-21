@@ -6,7 +6,7 @@ status: "Draft"
 normative: true
 priority: "P0"
 last_updated: "2026-08-21"
-depends_on: ["DXB-ARC-011", "DXB-ARC-012", "DXB-ARC-016", "DXB-RUN-030", "DXB-ENG-051"]
+depends_on: ["DXB-ARC-011", "DXB-ARC-012", "DXB-ARC-016", "DXB-RUN-030"]
 ---
 
 # Rust 구현 규칙
@@ -101,6 +101,8 @@ temporary shim은 owner/expiry/removal issue 없이 추가하지 않는다.
 - cache는 canonical source/key/version/max bytes/invalidation/rebuild를 명시
 - 동일 Canonical data의 Bot/Core/UI별 중복 cache 금지
 - Canonical Memory 삭제를 cache eviction 코드에 넣지 않음
+
+구체 성능 목표와 benchmark 방법은 `DXB-ENG-051`을 참조하며 본 문서는 그 값을 소유하지 않는다.
 
 ## 9. Error / Side Effect
 

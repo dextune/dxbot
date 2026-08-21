@@ -6,7 +6,7 @@ status: "Draft"
 normative: true
 priority: "P0/P1"
 last_updated: "2026-08-21"
-depends_on: ["DXB-DOM-023", "DXB-DOM-021", "DXB-RUN-031", "DXB-ARC-012"]
+depends_on: ["DXB-DOM-023", "DXB-DOM-021", "DXB-ARC-012"]
 ---
 
 # Dynamic Core Scheduler
@@ -21,9 +21,9 @@ Core는 Bot/Task/Execution에 속한 일시 Lease이며 독립 Persona, Goal, Lo
 
 ## 3. Admission
 
-`Global → Per-Bot → Provider → Tool/Sandbox → Memory/Artifact Budget → Lease`
+Resource Governance가 제공하는 grant/limit snapshot을 입력으로 `Global → Per-Bot → Provider → Tool/Sandbox → Memory/Artifact Budget → Lease` admission을 수행한다. Permit 획득/반환 순서를 고정해 deadlock과 leak을 방지한다. Provider permit은 selector가 고른 Provider에 대해 획득한다.
 
-Permit 획득/반환 순서를 고정해 deadlock과 leak을 방지한다. Provider permit은 selector가 고른 Provider에 대해 획득한다.
+본 문서는 자원 limit 값의 Owner가 아니며 실제 상한/default는 `DXB-RUN-031`의 Policy SSOT를 참조한다.
 
 ## 4. Provider Selection 관계
 
