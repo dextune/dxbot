@@ -101,9 +101,44 @@ depends_on: ["DXB-INDEX"]
 |---|---|
 | `readme.md` | Updated v0.2 |
 
-## 9. Review Requirement
+## 9. Review Evidence
 
-문서 패키지는 commit 전/승격 전 다음 두 검수를 별도 수행한다.
+### Review 1 — Structural / Consistency — Passed
 
-1. Structural / Consistency Review
-2. Cross-Layer Executability Review
+검사:
+- 파일/디렉터리 naming 및 ASCII path
+- document ID / `depends_on`
+- Canonical/Lifecycle Owner
+- Provider/Plugin 용어
+- Manifest/Acceptance/Risk 연결
+
+발견 및 수정:
+- Plugin↔Security/Versioning의 순환 `depends_on` 제거
+- Scheduler↔Resource Governance의 순환 `depends_on` 제거
+- Rust Engineering↔Performance의 순환 `depends_on` 제거
+- v0.1에 남아 있던 Event/State 문서를 v0.2로 승격해 Routine/Continuation/Side Effect 관계 보강
+- repository naming 문서의 Unicode/invisible path guard 명시
+
+### Review 2 — Cross-Layer Executability — Passed
+
+검사 경로:
+`Command → Application → Domain → Persistence → Scheduler → Provider → Recovery → Projection → Control API → Interface → Acceptance`
+
+검증 시나리오:
+- Bot persistence
+- Multi-Bot delegation/restart
+- Waiting Continuation recovery
+- Side Effect crash/reconciliation
+- Routine restart/missed occurrence
+- Provider replacement/removal/multi-selection
+- Plugin install/disable/upgrade/uninstall
+- Long-term Memory pressure
+- Repository/Policy governance
+
+발견 및 수정:
+- Multi-Bot delegated child와 Parent Continuation 연결 보강
+- concurrency 문서에 Routine/Waiting/Provider drain/Plugin disable/Side Effect race 보강
+- CLI/TUI/Web에 Routine/Provider/Plugin/Recovery 운영 표면 연결
+- Plugin uninstall `block` data policy를 Storage 계약과 일치시킴
+
+두 검수 후 새로 확인된 owner 없는 Canonical State 또는 silent fallback 경로는 없다.

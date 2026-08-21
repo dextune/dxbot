@@ -126,7 +126,8 @@ occurrence claim/dedup + generated Task + Routine next/last state를 일관되�
 Provider/Plugin 제거 시:
 - Core Domain rows를 삭제하지 않는다.
 - provider-specific operational rows의 migration/retain/purge를 명시한다.
-- Plugin-owned data는 manifest uninstall policy에 따라 retain/export/migrate/purge한다.
+- Plugin-owned data는 manifest uninstall policy에 따라 `retain | export-and-remove | migrate | purge | block` 중 지원된 의미를 적용한다.
+- `block`이면 active dependency 또는 안전한 data disposition이 해결되기 전 uninstall 완료를 Commit하지 않는다.
 - derived index/cache/projection은 stale owner reference를 정리한다.
 - removed ID를 참조하는 config/state는 silent fallback하지 않는다.
 
@@ -150,4 +151,5 @@ threshold 값은 Config/Policy SSOT에서 소유하고 benchmark/운영 정책�
 - side-effect external success 후 outcome commit 전 crash가 Unknown으로 복구된다.
 - Routine restart가 occurrence 중복 Task를 만들지 않는다.
 - Provider 제거 후 Bot/Memory/Task DB가 그대로 load된다.
+- Plugin uninstall `block` 정책이 dependency가 남은 상태의 제거 완료를 거부한다.
 - cache/index 삭제가 Canonical Memory를 손상시키지 않는다.
