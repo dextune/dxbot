@@ -6,17 +6,23 @@ on:
       - automation/v0-8-five-pass-import
     paths:
       - '.github/workflows/import-v0-8-five-pass.yml'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   promote:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Checkout import branch
         uses: actions/checkout@v4
         with:
+          ref: automation/v0-8-five-pass-import
           fetch-depth: 0
 
       - name: Reconstruct and verify payload
