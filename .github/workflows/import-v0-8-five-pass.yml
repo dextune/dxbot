@@ -18,12 +18,19 @@ jobs:
   promote:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout import branch
-        uses: actions/checkout@v4
-        with:
-          ref: automation/v0-8-five-pass-import
-          fetch-depth: 0
+      - name: Checkout import branch without external actions
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags origin \
+            automation/v0-8-five-pass-import \
+            main
+          git checkout --detach origin/automation/v0-8-five-pass-import
 
       - name: Reconstruct and verify payload
         shell: bash
@@ -39,7 +46,7 @@ jobs:
         run: |
           set -euo pipefail
           expected_main='5b55b67fbaaf0f3192c126865e8b665ff26fc5aa'
-          git fetch origin main
+          git fetch --no-tags origin main
           actual_main="$(git rev-parse origin/main)"
           if [[ "$actual_main" != "$expected_main" ]]; then
             echo "main moved: expected=$expected_main actual=$actual_main" >&2
@@ -94,10 +101,10 @@ jobs:
           git push origin HEAD:main
           git push origin --delete automation/v0-8-five-pass-import || true
 
-      - name: Upload promotion validation evidence
+      - name: Print validation evidence
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dxbot-v0-8-five-iteration-validation
-          path: /tmp/five-iteration-validation-report.json
-          if-no-files-found: warn
+        shell: bash
+        run: |
+          if [[ -f /tmp/five-iteration-validation-report.json ]]; then
+            cat /tmp/five-iteration-validation-report.json
+          fi
