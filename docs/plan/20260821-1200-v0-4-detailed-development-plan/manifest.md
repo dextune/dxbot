@@ -34,10 +34,10 @@ v0.3은 수정하지 않고 source baseline으로 보존한다.
 | `30-runtime` | 7 | 6 upgraded + 1 new |
 | `40-interfaces` | 4 | all upgraded |
 | `50-engineering` | 5 | 4 upgraded / 1 inherited |
-| `60-delivery` | 4 | all upgraded |
-| Normative/plan docs | **42** | complete |
+| `60-delivery` | 5 | 4 upgraded / 1 inherited |
+| Normative/plan docs | **43** | complete |
 | `readme.md` + `manifest.md` | 2 | v0.4 index/evidence |
-| Total Markdown | **44** | complete |
+| Total Markdown | **45** | complete |
 
 Inherited blob을 재사용한 문서도 v0.4 package의 유효한 계약이며 source v0.3 semantic을 유지한다.
 
@@ -104,6 +104,7 @@ Inherited blob을 재사용한 문서도 v0.4 package의 유효한 계약이며 
 - `10-architecture/17-extension-framework.md`
 - `20-domains/25-multi-bot-network.md`
 - `50-engineering/50-rust-engineering-rules.md`
+- `60-delivery/64-external-reference-snapshot.md`
 
 ## 6. Canonical Ownership Check
 
@@ -124,7 +125,7 @@ Session meanings are split into Interface Session, Provider Session, Thread and 
 ## 7. Review 1 — Structural / Canonical Ownership
 
 ### Scope
-- 42 plan document paths + readme/manifest
+- 43 plan document paths + readme/manifest
 - lowercase kebab-case naming
 - document IDs/versions/depends_on
 - Canonical Owner duplication
@@ -142,8 +143,18 @@ Correction:
 
 Recheck: dependency direction/cycle issue **resolved**.
 
+**F3 — post-compose inventory verification에서 상속 문서 `60-delivery/64-external-reference-snapshot.md`가 Manifest 집계에서 누락됨.**
+
+Correction:
+- Delivery count `4 → 5`
+- plan document count `42 → 43`
+- total Markdown count `44 → 45`
+- inherited list에 `64-external-reference-snapshot.md` 추가
+
+Recheck: GitHub commit diff 기준 실제 45개 Markdown과 Manifest/Readme 집계가 일치함.
+
 ### Result
-**PASS after correction**
+**PASS after correction and inventory recheck**
 
 ## 8. Review 2 — Contract / Traceability
 
@@ -247,6 +258,7 @@ P0 Open Questions:
 - Naming/layout: **PASS**
 - Canonical ownership: **PASS**
 - Dependency relationship: **PASS after correction**
+- Package inventory: **PASS after correction**
 - Contract traceability: **PASS after correction**
 - Cross-layer executability: **PASS**
 - Required three independent reviews: **3 / 3 PASS**
