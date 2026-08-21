@@ -68,8 +68,10 @@ jobs:
           ## 문서 목차
 
           '''
-          # Heredoc indentation above is stripped explicitly to keep byte-identical output.
-          header = '\n'.join(line[10:] if line.startswith('          ') else line for line in header.splitlines()) + '\n'
+          header = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in header.splitlines()
+          )
 
           toc = '\n'.join(
               f'{i}. `{path}` — {first_h1((root / path).read_text(encoding="utf-8"))}'
