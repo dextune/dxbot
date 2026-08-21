@@ -150,9 +150,11 @@ v0.3의 AT-SPI-001~010과 기존 Bot/Brain/Core/Memory/Task/Side Effect/Routine/
 - Runtime: 7
 - Interfaces: 4
 - Engineering: 5
-- Delivery: 4
-- Normative/plan documents: **42**
-- Index + Manifest 포함 총 Markdown: **44**
+- Delivery: 5
+- Normative/plan documents: **43**
+- Index + Manifest 포함 총 Markdown: **45**
+
+`60-delivery/64-external-reference-snapshot.md`는 v0.3에서 상속된 외부 참조 Snapshot이며 v0.4에서도 변경 없이 보존한다.
 
 ## 9. 구현 순서
 
@@ -175,7 +177,7 @@ Provider Framework Phase와 Extension Tier A/B 규칙은 v0.3에서 그대로 �
 
 ## 11. 관계성 검토 상태
 
-- Review 1 — Structural / Canonical Ownership: **PASS after correction**
+- Review 1 — Structural / Canonical Ownership: **PASS after correction and inventory recheck**
 - Review 2 — Contract / Traceability: **PASS after correction**
 - Review 3 — Cross-Layer Executability: **PASS**
 
