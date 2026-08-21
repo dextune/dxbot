@@ -52,14 +52,14 @@ depends_on: ["DXB-INDEX"]
 | `20-domains/22-memory-system.md` | Updated v0.2 |
 | `20-domains/23-goal-task-execution.md` | Updated v0.2 |
 | `20-domains/24-dynamic-core-scheduler.md` | Updated v0.2 |
-| `20-domains/25-multi-bot-network.md` | Inherited |
+| `20-domains/25-multi-bot-network.md` | Updated v0.2 |
 | `20-domains/26-control-plane.md` | Updated v0.2 |
 
 ## 4. Runtime
 
 | 파일 | 상태 |
 |---|---|
-| `30-runtime/30-concurrency-consistency.md` | Inherited |
+| `30-runtime/30-concurrency-consistency.md` | Updated v0.2 |
 | `30-runtime/31-resource-governance.md` | Updated v0.2 |
 | `30-runtime/32-security-permissions-sandbox.md` | Updated v0.2 |
 | `30-runtime/33-resilience-recovery.md` | Updated v0.2 |
@@ -71,9 +71,9 @@ depends_on: ["DXB-INDEX"]
 | 파일 | 상태 |
 |---|---|
 | `40-interfaces/40-api-protocols.md` | Updated v0.2 |
-| `40-interfaces/41-cli.md` | Inherited |
-| `40-interfaces/42-tui.md` | Inherited |
-| `40-interfaces/43-web-control-center.md` | Inherited |
+| `40-interfaces/41-cli.md` | Updated v0.2 |
+| `40-interfaces/42-tui.md` | Updated v0.2 |
+| `40-interfaces/43-web-control-center.md` | Updated v0.2 |
 
 ## 6. Engineering
 
