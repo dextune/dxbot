@@ -1,0 +1,97 @@
+name: import-v0-8-five-pass
+
+on:
+  push:
+    branches:
+      - automation/v0-8-five-pass-import
+    paths:
+      - '.github/workflows/import-v0-8-five-pass.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout import branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct and verify payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .dxbot-import/archive.part-* | base64 --decode > /tmp/dxbot-v0-8-five-packages-import.tar.xz
+          echo '42ce0ba07771edb2661b8383fd3eeda4a3f0d865cbda5b1d2221f39ae0df0fc1  /tmp/dxbot-v0-8-five-packages-import.tar.xz' | sha256sum --check --strict
+          mkdir -p /tmp/dxbot-payload
+          tar -xJf /tmp/dxbot-v0-8-five-packages-import.tar.xz -C /tmp/dxbot-payload
+
+      - name: Build five clean commits from current main
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_main='5b55b67fbaaf0f3192c126865e8b665ff26fc5aa'
+          git fetch origin main
+          actual_main="$(git rev-parse origin/main)"
+          if [[ "$actual_main" != "$expected_main" ]]; then
+            echo "main moved: expected=$expected_main actual=$actual_main" >&2
+            exit 1
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -B dxbot-v0-8-promotion origin/main
+
+          copy_and_commit() {
+            local package="$1"
+            local message="$2"
+            cp -a "/tmp/dxbot-payload/docs/plan/$package" docs/plan/
+            git add "docs/plan/$package"
+            git diff --cached --check
+            git commit -m "$message"
+          }
+
+          copy_and_commit \
+            '20260821-2050-v0-8-1-detailed-development-plan' \
+            'docs: add v0.8.1 structural review baseline'
+          copy_and_commit \
+            '20260821-2110-v0-8-2-detailed-development-plan' \
+            'docs: add v0.8.2 cli contract review baseline'
+          copy_and_commit \
+            '20260821-2130-v0-8-3-detailed-development-plan' \
+            'docs: add v0.8.3 runtime persistence review baseline'
+          copy_and_commit \
+            '20260821-2150-v0-8-4-detailed-development-plan' \
+            'docs: add v0.8.4 implementation delivery review baseline'
+
+          cp -a "/tmp/dxbot-payload/docs/plan/20260821-2210-v0-8-5-detailed-development-plan" docs/plan/
+          cp "/tmp/dxbot-payload/docs/plan/active-plan.toml" docs/plan/active-plan.toml
+          mkdir -p scripts .github/workflows
+          cp "/tmp/dxbot-payload/scripts/validate-active-plan.py" scripts/validate-active-plan.py
+          chmod +x scripts/validate-active-plan.py
+          cp "/tmp/dxbot-payload/.github/workflows/validate-dxbot-plan.yml" .github/workflows/validate-dxbot-plan.yml
+          git rm .github/workflows/finalize-dxbot-plan.yml
+          git add \
+            docs/plan/20260821-2210-v0-8-5-detailed-development-plan \
+            docs/plan/active-plan.toml \
+            scripts/validate-active-plan.py \
+            .github/workflows/validate-dxbot-plan.yml
+          git diff --cached --check
+          python3 scripts/validate-active-plan.py \
+            --repository-root . \
+            --self-test \
+            --json-out /tmp/five-iteration-validation-report.json
+          git commit -m 'docs: add v0.8.5 final cli implementation baseline'
+
+          git push origin HEAD:main
+          git push origin --delete automation/v0-8-five-pass-import || true
+
+      - name: Upload promotion validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxbot-v0-8-five-iteration-validation
+          path: /tmp/five-iteration-validation-report.json
+          if-no-files-found: warn
