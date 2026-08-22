@@ -1,0 +1,27 @@
+name: validate-active-plan
+
+on:
+  pull_request:
+    paths:
+      - "docs/plan/**"
+      - "scripts/plan-validator.py"
+      - ".github/workflows/validate-active-plan.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docs/plan/**"
+      - "scripts/plan-validator.py"
+      - ".github/workflows/validate-active-plan.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate active plan
+        run: python3 scripts/plan-validator.py --active
+      - name: Validate negative fixtures
+        run: python3 scripts/plan-validator.py --self-test
