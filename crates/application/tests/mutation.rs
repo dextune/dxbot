@@ -1,36 +1,81 @@
-//! Acceptance tests for AT-APP-005: mutation target materialization, receipt,
-//! and domain-outcome semantics.
-//!
-//! Covered in-process with the in-memory [`DomainState`] fixture (no external
-//! I/O): CreateBot materialization, stale-revision conflict, receipt retrieval,
-//! and idempotent (same CommandId) playback.
+//! Acceptance tests for AT-APP-005: mutation materialization, binding identity,
+//! receipt, and domain-outcome semantics.
+
+#![allow(clippy::expect_used)]
 
 use application::mutation::AppError;
 use application::{ApplicationMutator, DomainOutcome, cas_if_revision, resolve_outcome};
 use dxbot_core::receipt::ReceiptDisposition;
-use dxbot_core::types::{CanonicalTarget, CommandPayload, InstanceId, PrincipalRef};
+use dxbot_core::types::{
+    CanonicalTarget, CommandId, CommandPayload, IdempotencyKey, InstanceId, OperationId,
+    OperationRequest, PrincipalRef, RequestDigest,
+};
 
-/// Build a `CreateBot` command payload for a given bot id/name.
-fn create_bot_payload(bot_id: &str, name: &str) -> CommandPayload {
-    CommandPayload {
-        command_key: "bot-create".to_string(),
-        principal_ref: PrincipalRef("http:principal-a".to_string()),
-        instance_id: InstanceId("instance-1".to_string()),
-        canonical_target: CanonicalTarget::Bot {
-            id: dxbot_core::types::BotId(bot_id.to_string()),
-            revision: 0,
+fn principal() -> PrincipalRef {
+    PrincipalRef("http:principal-a".to_string())
+}
+
+fn create_bot_request(
+    command_id: &str,
+    key: &str,
+    digest: &str,
+    operation_id: &str,
+    name: &str,
+) -> OperationRequest {
+    OperationRequest {
+        command_id: CommandId(command_id.to_string()),
+        idempotency_key: IdempotencyKey {
+            principal_ref: principal(),
+            key_digest: key.to_string(),
+            expires_at: i64::MAX,
         },
-        cas: None,
-        content: None,
-        semantic_options: serde_json::json!({ "name": name }),
+        request_digest: RequestDigest(digest.to_string()),
+        new_operation_id: OperationId(operation_id.to_string()),
+        payload: CommandPayload {
+            command_key: "bot-create".to_string(),
+            principal_ref: principal(),
+            instance_id: InstanceId("instance-1".to_string()),
+            canonical_target: CanonicalTarget::Instance(InstanceId("instance-1".to_string())),
+            cas: None,
+            content: None,
+            semantic_options: serde_json::json!({ "name": name }),
+        },
+    }
+}
+
+fn update_request(command_id: &str, operation_id: &str, revision: i64) -> OperationRequest {
+    OperationRequest {
+        command_id: CommandId(command_id.to_string()),
+        idempotency_key: IdempotencyKey {
+            principal_ref: principal(),
+            key_digest: format!("key-{command_id}"),
+            expires_at: i64::MAX,
+        },
+        request_digest: RequestDigest(format!("digest-{command_id}")),
+        new_operation_id: OperationId(operation_id.to_string()),
+        payload: CommandPayload {
+            command_key: "bot-deactivate".to_string(),
+            principal_ref: principal(),
+            instance_id: InstanceId("instance-1".to_string()),
+            canonical_target: CanonicalTarget::Bot {
+                id: dxbot_core::types::BotId("alpha-bot".to_string()),
+                revision,
+            },
+            cas: Some(cas_if_revision(revision)),
+            content: None,
+            semantic_options: serde_json::Value::Null,
+        },
     }
 }
 
 #[test]
 fn mutation_create_bot_produces_bot_ref_and_main_conversation() -> Result<(), AppError> {
     let mutator = ApplicationMutator::new();
-    let result = mutator.mutate(&create_bot_payload("bot-1", "alpha-bot"))?;
+    let request = create_bot_request("command-1", "key-1", "digest-1", "operation-1", "alpha-bot");
+    let result = mutator.mutate(&request)?;
 
+    assert_eq!(result.command_id, request.command_id);
+    assert_eq!(result.operation_id, request.new_operation_id);
     assert_eq!(result.status, "committed");
     assert_eq!(result.error, None);
     assert_eq!(result.receipt.disposition, ReceiptDisposition::Committed);
@@ -40,29 +85,15 @@ fn mutation_create_bot_produces_bot_ref_and_main_conversation() -> Result<(), Ap
         .committed_payload
         .as_ref()
         .ok_or_else(|| AppError::Internal("missing committed payload".to_string()))?;
-    let bot_ref = committed
-        .get("bot_ref")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Internal("missing bot_ref".to_string()))?;
-    let main_conv = committed
-        .get("main_conversation_ref")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Internal("missing main_conversation_ref".to_string()))?;
-    assert_eq!(bot_ref, "bot:bot-1");
-    assert_eq!(main_conv, "conversation:main-bot-1");
+    assert_eq!(committed["bot_ref"], "bot:alpha-bot");
     assert_eq!(
-        committed.get("bot_revision").and_then(|v| v.as_i64()),
-        Some(1)
+        committed["main_conversation_ref"],
+        "conversation:alpha-bot:main"
     );
+    assert_eq!(committed["bot_revision"], 1);
 
-    // The domain state actually materialized both identities.
     let state = mutator.snapshot().expect("snapshot must succeed");
     assert_eq!(state.bot_count(), 1);
-    assert!(
-        state
-            .bots
-            .contains_key(&dxbot_core::types::BotId("bot-1".to_string()))
-    );
     assert_eq!(state.conversation_count(), 1);
     Ok(())
 }
@@ -70,22 +101,15 @@ fn mutation_create_bot_produces_bot_ref_and_main_conversation() -> Result<(), Ap
 #[test]
 fn mutation_stale_revision_is_conflict() -> Result<(), AppError> {
     let mutator = ApplicationMutator::new();
-    mutator.mutate(&create_bot_payload("bot-1", "alpha-bot"))?;
+    mutator.mutate(&create_bot_request(
+        "command-1",
+        "key-1",
+        "digest-1",
+        "operation-1",
+        "alpha-bot",
+    ))?;
 
-    // A stale update expecting revision 0 while the bot is at revision 1.
-    let stale = CommandPayload {
-        command_key: "bot-deactivate".to_string(),
-        principal_ref: PrincipalRef("http:principal-a".to_string()),
-        instance_id: InstanceId("instance-1".to_string()),
-        canonical_target: CanonicalTarget::Bot {
-            id: dxbot_core::types::BotId("bot-1".to_string()),
-            revision: 0,
-        },
-        cas: Some(cas_if_revision(0)),
-        content: None,
-        semantic_options: serde_json::Value::Null,
-    };
-
+    let stale = update_request("command-2", "operation-2", 0);
     assert!(matches!(
         mutator.mutate(&stale).err(),
         Some(AppError::Conflict(_))
@@ -96,38 +120,36 @@ fn mutation_stale_revision_is_conflict() -> Result<(), AppError> {
 #[test]
 fn mutation_receipt_is_retrievable() -> Result<(), AppError> {
     let mutator = ApplicationMutator::new();
-    let result = mutator.mutate(&create_bot_payload("bot-1", "alpha-bot"))?;
-
+    let result = mutator.mutate(&create_bot_request(
+        "command-1",
+        "key-1",
+        "digest-1",
+        "operation-1",
+        "alpha-bot",
+    ))?;
     let receipt = mutator
         .get_receipt(&result.operation_id)?
         .ok_or_else(|| AppError::Internal("receipt must be retrievable".to_string()))?;
 
-    assert_eq!(receipt.operation_id, result.operation_id.0);
+    assert_eq!(receipt.operation_id, "operation-1");
     assert_eq!(receipt.disposition, ReceiptDisposition::Committed);
-    assert!(!receipt.result_ref.is_empty());
-    assert!(!receipt.resolved_binding_digest.is_empty());
-
-    // Unknown operation ids yield None, not an error.
-    let missing = mutator.get_receipt(&dxbot_core::types::OperationId("op-missing".to_string()))?;
-    assert!(missing.is_none());
+    assert_eq!(receipt.resolved_binding_digest, "digest-1");
+    assert!(
+        mutator
+            .get_receipt(&OperationId("op-missing".to_string()))?
+            .is_none()
+    );
     Ok(())
 }
 
 #[test]
-fn mutation_idempotent_returns_existing() -> Result<(), AppError> {
+fn mutation_exact_retry_returns_existing() -> Result<(), AppError> {
     let mutator = ApplicationMutator::new();
-    let payload = create_bot_payload("bot-1", "alpha-bot");
+    let request = create_bot_request("command-1", "key-1", "digest-1", "operation-1", "alpha-bot");
+    let first = mutator.mutate(&request)?;
+    let second = mutator.mutate(&request)?;
 
-    let first = mutator.mutate(&payload)?;
-
-    // Same command identity -> replay the existing outcome, no new effect.
-    let second = mutator.mutate(&payload)?;
-
-    assert_eq!(second.operation_id, first.operation_id);
-    assert_eq!(second.command_id, first.command_id);
-    assert_eq!(second.receipt, first.receipt);
-
-    // Exactly one bot and one main conversation were materialized.
+    assert_eq!(second, first);
     let state = mutator.snapshot().expect("snapshot must succeed");
     assert_eq!(state.bot_count(), 1);
     assert_eq!(state.conversation_count(), 1);
@@ -135,14 +157,84 @@ fn mutation_idempotent_returns_existing() -> Result<(), AppError> {
 }
 
 #[test]
+fn mutation_distinct_commands_of_same_kind_are_independent() -> Result<(), AppError> {
+    let mutator = ApplicationMutator::new();
+    mutator.mutate(&create_bot_request(
+        "command-1",
+        "key-1",
+        "digest-1",
+        "operation-1",
+        "alpha-bot",
+    ))?;
+    mutator.mutate(&create_bot_request(
+        "command-2",
+        "key-2",
+        "digest-2",
+        "operation-2",
+        "beta-bot",
+    ))?;
+
+    let state = mutator.snapshot().expect("snapshot must succeed");
+    assert_eq!(state.bot_count(), 2);
+    assert_eq!(state.conversation_count(), 2);
+    Ok(())
+}
+
+#[test]
 fn mutation_same_command_different_digest_conflicts() -> Result<(), AppError> {
     let mutator = ApplicationMutator::new();
-    mutator.mutate(&create_bot_payload("bot-1", "alpha-bot"))?;
+    let original = create_bot_request(
+        "command-1",
+        "key-1",
+        "digest-1",
+        "operation-1",
+        "alpha-bot",
+    );
+    mutator.mutate(&original)?;
 
-    // Same command key but different semantic content -> different binding.
-    let different = create_bot_payload("bot-2", "beta-bot");
+    let mut conflicting = original.clone();
+    conflicting.request_digest = RequestDigest("digest-other".to_string());
+    conflicting.new_operation_id = OperationId("operation-other".to_string());
     assert!(matches!(
-        mutator.mutate(&different).err(),
+        mutator.mutate(&conflicting).err(),
+        Some(AppError::Conflict(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn mutation_single_sided_binding_conflicts() -> Result<(), AppError> {
+    let mutator = ApplicationMutator::new();
+    let original = create_bot_request(
+        "command-1",
+        "key-1",
+        "digest-1",
+        "operation-1",
+        "alpha-bot",
+    );
+    mutator.mutate(&original)?;
+
+    let same_command_new_key = create_bot_request(
+        "command-1",
+        "key-2",
+        "digest-1",
+        "operation-2",
+        "beta-bot",
+    );
+    assert!(matches!(
+        mutator.mutate(&same_command_new_key).err(),
+        Some(AppError::Conflict(_))
+    ));
+
+    let new_command_same_key = create_bot_request(
+        "command-2",
+        "key-1",
+        "digest-2",
+        "operation-2",
+        "beta-bot",
+    );
+    assert!(matches!(
+        mutator.mutate(&new_command_same_key).err(),
         Some(AppError::Conflict(_))
     ));
     Ok(())
@@ -151,17 +243,20 @@ fn mutation_same_command_different_digest_conflicts() -> Result<(), AppError> {
 #[test]
 fn resolve_outcome_semantics() -> Result<(), AppError> {
     let mutator = ApplicationMutator::new();
-    mutator.mutate(&create_bot_payload("bot-1", "alpha-bot"))?;
+    mutator.mutate(&create_bot_request(
+        "command-1",
+        "key-1",
+        "digest-1",
+        "operation-1",
+        "alpha-bot",
+    ))?;
     let state = mutator.snapshot().expect("snapshot must succeed");
     let target = CanonicalTarget::Bot {
-        id: dxbot_core::types::BotId("bot-1".to_string()),
+        id: dxbot_core::types::BotId("alpha-bot".to_string()),
         revision: 1,
     };
 
-    assert_eq!(
-        resolve_outcome(&state, &target, &None),
-        DomainOutcome::Updated
-    );
+    assert_eq!(resolve_outcome(&state, &target, &None), DomainOutcome::Updated);
     assert_eq!(
         resolve_outcome(&state, &target, &Some(cas_if_revision(1))),
         DomainOutcome::Updated
@@ -175,10 +270,7 @@ fn resolve_outcome_semantics() -> Result<(), AppError> {
         id: dxbot_core::types::BotId("bot-nope".to_string()),
         revision: 0,
     };
-    assert_eq!(
-        resolve_outcome(&state, &absent, &None),
-        DomainOutcome::Created
-    );
+    assert_eq!(resolve_outcome(&state, &absent, &None), DomainOutcome::Created);
     assert_eq!(
         resolve_outcome(&state, &absent, &Some(cas_if_revision(1))),
         DomainOutcome::NotFound

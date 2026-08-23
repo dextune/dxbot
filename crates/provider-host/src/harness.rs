@@ -1,23 +1,20 @@
 //! Provider-host harness (`AT-HARNESS-001`): Reference Provider plus one real
 //! Harness Adapter canary.
 //!
-//! The Reference Provider is deterministic and always available once
-//! registered; the Harness Adapter is the "real" canary that completes a
-//! bounded task through the provider chain. When the real adapter is not
-//! registered or is temporarily unavailable, execution falls back to the
-//! Reference Provider so the host never silently loses the task.
-//!
-//! All types are data values: `Debug + Clone + PartialEq`.
+//! ProviderHost owns provider registration, common transport/protocol execution,
+//! deadline interpretation, and fallback ordering. Extension providers supply
+//! model-specific request/event mapping only.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::expect_used)]
 
 use std::fmt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dxbot_core::types::ProviderId;
 
-use crate::protocol::ProviderExecuteConfig;
+use crate::protocol::{ProviderError, ProviderEvent, ProviderExecuteConfig};
 use crate::real_provider::RealProvider;
 use crate::transport::HttpTransport;
 
@@ -37,40 +34,30 @@ pub struct TaskDescription {
 /// A piece of provider-produced evidence attached to a [`TaskResult`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evidence {
-    /// The provider that produced this evidence.
     pub provider: ProviderId,
-    /// Bounded observation text.
     pub observation: String,
 }
 
 /// Terminal execution status of a bounded task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
-    /// The task completed successfully.
     Completed,
-    /// The task failed.
     Failed,
-    /// The task was cancelled.
     Cancelled,
 }
 
 /// The result of executing a [`TaskDescription`] through a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskResult {
-    /// The produced output.
     pub output: String,
-    /// Provider-attributed evidence for the result.
     pub evidence: Vec<Evidence>,
-    /// Terminal status.
     pub status: TaskStatus,
 }
 
 /// Availability of a registered provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderStatus {
-    /// The provider can execute tasks.
     Ready,
-    /// The provider is registered but unavailable.
     Unavailable,
 }
 
@@ -86,24 +73,17 @@ pub struct ProviderInfo {
 /// Errors produced by the provider-host harness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HarnessError {
-    /// A provider with the same id is already registered.
     AlreadyRegistered { id: ProviderId },
-    /// A registration failed validation.
     InvalidProvider { reason: String },
-    /// No Reference Provider is registered.
     NoReferenceProvider,
-    /// No real Harness Adapter is registered.
     NoHarnessAdapter,
-    /// The adapter is temporarily unavailable; execution should fall back.
     ProviderUnavailable { id: ProviderId },
-    /// No provider matches the requested id.
     ProviderNotFound { id: ProviderId },
-    /// A provider failed to execute the bounded task.
+    DeadlineExceeded,
     ExecutionFailed { id: ProviderId, reason: String },
 }
 
-/// The deterministic Reference Provider: always completes a bounded task
-/// against its `intent`.
+/// The deterministic Reference Provider used by explicit test/canary policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceProvider {
     pub id: ProviderId,
@@ -112,7 +92,6 @@ pub struct ReferenceProvider {
 }
 
 impl ReferenceProvider {
-    /// Creates a reference provider with the given identity.
     pub fn new(id: ProviderId, capability: &str, generation: i64) -> Self {
         Self {
             id,
@@ -121,7 +100,6 @@ impl ReferenceProvider {
         }
     }
 
-    /// Deterministically completes the task, echoing the intent as output.
     pub fn execute(&self, task: &TaskDescription) -> Result<TaskResult, HarnessError> {
         Ok(self.completed(task.intent.clone()))
     }
@@ -147,20 +125,14 @@ impl ReferenceProvider {
     }
 }
 
-/// Behaviour selectable for the real Harness Adapter canary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterMode {
-    /// The adapter completes the bounded task.
     Succeed,
-    /// The adapter is temporarily unavailable; the chain falls back.
     Unavailable,
-    /// The adapter fails execution.
     Fail,
 }
 
-/// The "real" Harness Adapter canary. It executes a bounded task through the
-/// provider chain and, when unavailable, triggers fallback to the Reference
-/// Provider.
+/// The real Harness Adapter canary used by `AT-HARNESS-001`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessAdapter {
     pub id: ProviderId,
@@ -170,7 +142,6 @@ pub struct HarnessAdapter {
 }
 
 impl HarnessAdapter {
-    /// Creates a succeeding adapter (the default canary).
     pub fn new(id: ProviderId, capability: &str, generation: i64) -> Self {
         Self {
             id,
@@ -180,7 +151,6 @@ impl HarnessAdapter {
         }
     }
 
-    /// Creates an adapter that is temporarily unavailable (triggers fallback).
     pub fn unavailable(id: ProviderId, capability: &str, generation: i64) -> Self {
         Self {
             id,
@@ -190,7 +160,6 @@ impl HarnessAdapter {
         }
     }
 
-    /// Creates an adapter that fails execution.
     pub fn failing(id: ProviderId, capability: &str, generation: i64) -> Self {
         Self {
             id,
@@ -200,7 +169,6 @@ impl HarnessAdapter {
         }
     }
 
-    /// Executes a bounded task through the real adapter canary.
     pub fn execute(&self, task: &TaskDescription) -> Result<TaskResult, HarnessError> {
         match self.mode {
             AdapterMode::Succeed => Ok(TaskResult {
@@ -234,28 +202,21 @@ impl HarnessAdapter {
     }
 }
 
-/// The provider host: owns the Reference Provider, the real Harness Adapter,
-/// common transport/protocol infrastructure, and registered real providers.
-///
-/// The execution chain is:
-/// 1. Real providers (registered extension providers)
-/// 2. HarnessAdapter (canary)
-/// 3. ReferenceProvider (deterministic fallback)
+/// Provider host and common execution authority.
 pub struct ProviderHost {
     reference: Option<ReferenceProvider>,
     adapter: Option<HarnessAdapter>,
-    transport: Option<HttpTransport>,
     protocol: Option<crate::protocol::ChatCompletionProtocol>,
     real_providers: Vec<Box<dyn RealProvider>>,
     rt: tokio::runtime::Runtime,
 }
 
 impl fmt::Debug for ProviderHost {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProviderHost")
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderHost")
             .field("reference", &self.reference)
             .field("adapter", &self.adapter)
-            .field("transport", &self.transport)
             .field("protocol", &self.protocol)
             .field("real_providers_count", &self.real_providers.len())
             .finish()
@@ -269,14 +230,10 @@ impl Default for ProviderHost {
 }
 
 impl ProviderHost {
-    /// Creates an empty host with a single-threaded async runtime.
-    /// Register the Reference Provider and at least one real provider or
-    /// Harness Adapter before the canary test.
     pub fn new() -> Self {
         Self {
             reference: None,
             adapter: None,
-            transport: None,
             protocol: None,
             real_providers: Vec::new(),
             rt: tokio::runtime::Builder::new_current_thread()
@@ -287,183 +244,120 @@ impl ProviderHost {
         }
     }
 
-    /// Registers the deterministic Reference Provider.
     pub fn register_reference_provider(
         &mut self,
         provider: ReferenceProvider,
     ) -> Result<(), HarnessError> {
-        if self.reference.is_some() {
+        if self.provider_id_registered(&provider.id) {
             return Err(HarnessError::AlreadyRegistered {
                 id: provider.id.clone(),
             });
         }
-        validate_provider(&provider.id, &provider.capability)?;
+        validate_provider(&provider.id, &provider.capability, provider.generation)?;
         self.reference = Some(provider);
         Ok(())
     }
 
-    /// Registers a real Harness Adapter.
     pub fn register_harness_adapter(
         &mut self,
         adapter: HarnessAdapter,
     ) -> Result<(), HarnessError> {
-        if self.adapter.is_some() {
+        if self.provider_id_registered(&adapter.id) {
             return Err(HarnessError::AlreadyRegistered {
                 id: adapter.id.clone(),
             });
         }
-        validate_provider(&adapter.id, &adapter.capability)?;
+        validate_provider(&adapter.id, &adapter.capability, adapter.generation)?;
         self.adapter = Some(adapter);
         Ok(())
     }
 
-    /// Sets the common HTTP transport and creates the chat completion
-    /// protocol handler with reasonable output bounds.
+    /// Installs the single Common-owned transport/protocol state.
     pub fn set_transport(&mut self, transport: HttpTransport) {
-        let protocol = crate::protocol::ChatCompletionProtocol::new(
-            transport.clone(),
-            1024 * 1024, // 1 MiB max output bytes
-            1000,        // max output items
-        );
-        self.transport = Some(transport);
-        self.protocol = Some(protocol);
+        self.protocol = Some(crate::protocol::ChatCompletionProtocol::new(
+            transport,
+            1024 * 1024,
+            1000,
+        ));
     }
 
-    /// Registers a real (extension) provider.
     pub fn register_real_provider(
         &mut self,
         provider: Box<dyn RealProvider>,
     ) -> Result<(), HarnessError> {
-        // Check for duplicate ID among real providers
-        for existing in &self.real_providers {
-            if existing.id() == provider.id() {
-                return Err(HarnessError::AlreadyRegistered {
-                    id: provider.id().clone(),
-                });
-            }
+        if self.provider_id_registered(provider.id()) {
+            return Err(HarnessError::AlreadyRegistered {
+                id: provider.id().clone(),
+            });
         }
-        // Check for duplicate ID with reference and adapter
-        if let Some(r) = &self.reference {
-            if r.id == *provider.id() {
-                return Err(HarnessError::AlreadyRegistered {
-                    id: provider.id().clone(),
-                });
-            }
-        }
-        if let Some(a) = &self.adapter {
-            if a.id == *provider.id() {
-                return Err(HarnessError::AlreadyRegistered {
-                    id: provider.id().clone(),
-                });
-            }
-        }
-        validate_provider(provider.id(), provider.capability())?;
+        validate_provider(provider.id(), provider.capability(), provider.generation())?;
         self.real_providers.push(provider);
         Ok(())
     }
 
-    /// Executes a task through the provider chain.
-    ///
-    /// Chain order:
-    /// 1. Real providers (registered extension providers)
-    /// 2. HarnessAdapter (canary)
-    /// 3. ReferenceProvider (deterministic fallback)
+    /// Executes through real providers first, then the explicit canary adapter,
+    /// then the explicitly registered Reference Provider test fallback.
     pub fn execute_task(&self, task: &TaskDescription) -> Result<TaskResult, HarnessError> {
-        // 1. Try real providers first
+        let deadline = deadline_instant(task.deadline)?;
+
         for provider in &self.real_providers {
-            let protocol = self
-                .protocol
-                .as_ref()
-                .ok_or(HarnessError::NoReferenceProvider)?;
+            let protocol = self.protocol.as_ref().ok_or_else(|| HarnessError::ExecutionFailed {
+                id: provider.id().clone(),
+                reason: "common provider transport is not configured".to_string(),
+            })?;
             let request = provider.build_request(task);
             let config = ProviderExecuteConfig {
-                deadline: task
-                    .deadline
-                    .map(|d| tokio::time::Instant::now() + std::time::Duration::from_secs(d as u64)),
-                cancel_notify: None,
+                deadline,
+                cancel_token: None,
                 max_output_bytes: protocol.max_output_bytes,
                 max_output_items: protocol.max_output_items,
             };
 
             match self.rt.block_on(protocol.execute(&request, &config)) {
-                Ok(events) => {
-                    let output = events
-                        .iter()
-                        .filter_map(|e| match e {
-                            crate::protocol::ProviderEvent::ContentDelta { text, .. } => {
-                                Some(text.as_str())
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("");
-                    if !output.is_empty() {
-                        return Ok(TaskResult {
-                            output,
-                            evidence: vec![Evidence {
-                                provider: provider.id().clone(),
-                                observation: format!(
-                                    "real-provider:{}",
-                                    provider.capability()
-                                ),
-                            }],
-                            status: TaskStatus::Completed,
-                        });
-                    }
-                    // Fall through if empty output
-                }
-                Err(crate::protocol::ProviderError::TransportUnavailable { .. })
-                | Err(crate::protocol::ProviderError::UpstreamUnavailable { .. }) => {
-                    // Fall through to next provider
-                    continue;
-                }
-                Err(e) => {
+                Ok(events) => return real_provider_result(provider.as_ref(), events),
+                Err(ProviderError::TransportUnavailable { .. })
+                | Err(ProviderError::UpstreamUnavailable { .. }) => continue,
+                Err(ProviderError::DeadlineExceeded) => return Err(HarnessError::DeadlineExceeded),
+                Err(error) => {
                     return Err(HarnessError::ExecutionFailed {
                         id: provider.id().clone(),
-                        reason: format!("{e:?}"),
+                        reason: format!("{error:?}"),
                     });
                 }
             }
         }
 
-        // 2. Try HarnessAdapter
-        let reference = self
-            .reference
-            .as_ref()
-            .ok_or(HarnessError::NoReferenceProvider)?;
         if let Some(adapter) = &self.adapter {
             match adapter.execute(task) {
                 Ok(result) => return Ok(result),
-                Err(HarnessError::ProviderUnavailable { .. }) => {
-                    // Real canary is unavailable: fall back to Reference.
-                }
-                Err(err) => return Err(err),
+                Err(HarnessError::ProviderUnavailable { .. }) => {}
+                Err(error) => return Err(error),
             }
         }
 
-        // 3. Fall back to ReferenceProvider
-        reference.execute(task)
+        self.reference
+            .as_ref()
+            .ok_or(HarnessError::NoReferenceProvider)?
+            .execute(task)
     }
 
-    /// Lists registered providers, optionally filtered by capability.
     pub fn list_providers(&self, capability: Option<&str>) -> Vec<ProviderInfo> {
         let mut out = Vec::new();
         if let Some(reference) = &self.reference {
-            if capability.is_none_or(|cap| reference.capability == cap) {
+            if capability.is_none_or(|requested| reference.capability == requested) {
                 out.push(reference.info());
             }
         }
         if let Some(adapter) = &self.adapter {
-            if capability.is_none_or(|cap| adapter.capability == cap) {
+            if capability.is_none_or(|requested| adapter.capability == requested) {
                 out.push(adapter.info());
             }
         }
         for provider in &self.real_providers {
-            let cap = provider.capability();
-            if capability.is_none_or(|c| cap == c) {
+            if capability.is_none_or(|requested| provider.capability() == requested) {
                 out.push(ProviderInfo {
                     id: provider.id().clone(),
-                    capability: cap.to_string(),
+                    capability: provider.capability().to_string(),
                     generation: provider.generation(),
                     status: ProviderStatus::Ready,
                 });
@@ -472,7 +366,6 @@ impl ProviderHost {
         out
     }
 
-    /// Returns the registration info for a specific provider id.
     pub fn get_provider(&self, provider_id: &ProviderId) -> Result<ProviderInfo, HarnessError> {
         if let Some(reference) = &self.reference {
             if &reference.id == provider_id {
@@ -498,13 +391,99 @@ impl ProviderHost {
             id: provider_id.clone(),
         })
     }
+
+    fn provider_id_registered(&self, provider_id: &ProviderId) -> bool {
+        self.reference
+            .as_ref()
+            .is_some_and(|provider| &provider.id == provider_id)
+            || self
+                .adapter
+                .as_ref()
+                .is_some_and(|provider| &provider.id == provider_id)
+            || self
+                .real_providers
+                .iter()
+                .any(|provider| provider.id() == provider_id)
+    }
 }
 
-/// Validates a provider registration identity.
-fn validate_provider(_id: &ProviderId, capability: &str) -> Result<(), HarnessError> {
+fn real_provider_result(
+    provider: &dyn RealProvider,
+    events: Vec<ProviderEvent>,
+) -> Result<TaskResult, HarnessError> {
+    let mut output = String::new();
+    let mut completed = false;
+    for event in events {
+        match provider.map_event(event) {
+            ProviderEvent::ContentDelta { text, .. } => output.push_str(&text),
+            ProviderEvent::ReasoningDelta { .. } => {}
+            ProviderEvent::Completed { .. } => completed = true,
+            ProviderEvent::Failed { reason } => {
+                return Err(HarnessError::ExecutionFailed {
+                    id: provider.id().clone(),
+                    reason,
+                });
+            }
+            ProviderEvent::Cancelled => {
+                return Err(HarnessError::ExecutionFailed {
+                    id: provider.id().clone(),
+                    reason: "provider execution cancelled".to_string(),
+                });
+            }
+        }
+    }
+    if !completed {
+        return Err(HarnessError::ExecutionFailed {
+            id: provider.id().clone(),
+            reason: "provider stream ended without completion".to_string(),
+        });
+    }
+    Ok(TaskResult {
+        output,
+        evidence: vec![Evidence {
+            provider: provider.id().clone(),
+            observation: format!("real-provider:{}", provider.capability()),
+        }],
+        status: TaskStatus::Completed,
+    })
+}
+
+fn deadline_instant(deadline: Option<i64>) -> Result<Option<tokio::time::Instant>, HarnessError> {
+    let Some(deadline) = deadline else {
+        return Ok(None);
+    };
+    let now_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let now_seconds = i64::try_from(now_seconds).unwrap_or(i64::MAX);
+    let remaining = deadline
+        .checked_sub(now_seconds)
+        .filter(|seconds| *seconds > 0)
+        .ok_or(HarnessError::DeadlineExceeded)?;
+    let remaining = u64::try_from(remaining).map_err(|_| HarnessError::DeadlineExceeded)?;
+    Ok(Some(
+        tokio::time::Instant::now() + Duration::from_secs(remaining),
+    ))
+}
+
+fn validate_provider(
+    id: &ProviderId,
+    capability: &str,
+    generation: i64,
+) -> Result<(), HarnessError> {
+    if id.0.trim().is_empty() {
+        return Err(HarnessError::InvalidProvider {
+            reason: "provider id must not be empty".to_string(),
+        });
+    }
     if capability.trim().is_empty() {
         return Err(HarnessError::InvalidProvider {
             reason: "capability must not be empty".to_string(),
+        });
+    }
+    if generation < 0 {
+        return Err(HarnessError::InvalidProvider {
+            reason: "generation must not be negative".to_string(),
         });
     }
     Ok(())

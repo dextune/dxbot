@@ -19,8 +19,6 @@ fn task(intent: &str) -> TaskDescription {
     }
 }
 
-// ── AT-DEEPSEEK-001: DeepSeekFlashAdapter implements RealProvider trait ──
-
 #[test]
 fn deepseek_001_implements_real_provider_trait() {
     let adapter = DeepSeekFlashAdapter::new(
@@ -38,11 +36,16 @@ fn deepseek_001_implements_real_provider_trait() {
     assert!(!req.messages.is_empty());
     assert_eq!(req.messages[0].role, "user");
     assert!(req.messages[0].content.contains("Say hello"));
+
+    let oversized = TaskDescription {
+        budget: Some(u64::MAX),
+        ..task("bounded conversion")
+    };
+    assert_eq!(adapter.build_request(&oversized).max_tokens, Some(u32::MAX));
 }
 
-// ── AT-DEEPSEEK-002: Real proxy call produces non-empty output ──
-
 #[test]
+#[ignore = "requires local OpenAI-compatible proxy on localhost:10000"]
 fn deepseek_002_real_proxy_produces_output() {
     let mut host = ProviderHost::new();
     host.set_transport(HttpTransport::new(
@@ -63,17 +66,15 @@ fn deepseek_002_real_proxy_produces_output() {
     .unwrap();
 
     let result = host.execute_task(&task("Say hello")).unwrap();
-    assert!(!result.output.is_empty(), "real provider should produce output");
+    assert!(!result.output.is_empty());
     assert_eq!(result.status, TaskStatus::Completed);
 }
 
-// ── AT-DEEPSEEK-003: Reasoning token included in SSE stream ──
-
 #[test]
+#[ignore = "requires local OpenAI-compatible proxy on localhost:10000"]
 fn deepseek_003_reasoning_tokens_in_stream() {
     let transport = HttpTransport::new("http://localhost:10000", Duration::from_secs(30));
     let protocol = ChatCompletionProtocol::new(transport, 1024 * 1024, 1000);
-
     let request = ProviderRequest {
         model: "alibaba/deepseek-v4-flash-0731".to_string(),
         messages: vec![ChatMessage {
@@ -84,36 +85,31 @@ fn deepseek_003_reasoning_tokens_in_stream() {
         temperature: Some(0.0),
         stream: true,
     };
-
     let config = ProviderExecuteConfig {
         deadline: None,
-        cancel_notify: None,
+        cancel_token: None,
         max_output_bytes: 1024 * 1024,
         max_output_items: 1000,
     };
-
-    let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build().expect("tokio runtime");
-    let events = rt.block_on(protocol.execute(&request, &config)).expect("protocol execute");
-
-    let has_reasoning = events
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("tokio runtime");
+    let events = rt
+        .block_on(protocol.execute(&request, &config))
+        .expect("protocol execute");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderEvent::ReasoningDelta { .. } | ProviderEvent::ContentDelta { .. }
+    )));
+    assert!(events
         .iter()
-        .any(|e| matches!(e, ProviderEvent::ReasoningDelta { .. }));
-    let has_content = events
-        .iter()
-        .any(|e| matches!(e, ProviderEvent::ContentDelta { .. }));
-    let has_completed = events
-        .iter()
-        .any(|e| matches!(e, ProviderEvent::Completed { .. }));
-    assert!(
-        has_reasoning || has_content,
-        "deepseek should produce reasoning or content deltas"
-    );
-    assert!(has_completed, "should have Completed event");
+        .any(|event| matches!(event, ProviderEvent::Completed { .. })));
 }
 
-// ── AT-DEEPSEEK-004: Provider chain: real adapter preferred, Reference fallback ──
-
 #[test]
+#[ignore = "requires local OpenAI-compatible proxy on localhost:10000"]
 fn deepseek_004_chain_real_adapter_preferred() {
     let mut host = ProviderHost::new();
     host.set_transport(HttpTransport::new(
@@ -135,16 +131,12 @@ fn deepseek_004_chain_real_adapter_preferred() {
 
     let result = host.execute_task(&task("Say hello")).unwrap();
     assert!(!result.output.is_empty());
-    assert!(
-        !result.output.starts_with("adapter:"),
-        "real provider output should not be canary prefix"
-    );
+    assert!(!result.output.starts_with("adapter:"));
     assert_eq!(result.status, TaskStatus::Completed);
 }
 
-// ── AT-DEEPSEEK-005: temperature=0.0 gives deterministic output (soft) ──
-
 #[test]
+#[ignore = "requires local OpenAI-compatible proxy on localhost:10000"]
 fn deepseek_005_temperature_zero_is_deterministic() {
     let mut host = ProviderHost::new();
     host.set_transport(HttpTransport::new(
@@ -166,7 +158,7 @@ fn deepseek_005_temperature_zero_is_deterministic() {
 
     let task_def = TaskDescription {
         intent: "Say just the number 42".to_string(),
-        context: "".to_string(),
+        context: String::new(),
         budget: Some(10),
         deadline: None,
     };

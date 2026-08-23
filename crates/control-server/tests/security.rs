@@ -1,9 +1,7 @@
 //! Acceptance tests for AT-SEC-005: endpoint security boundary, fail-closed
-//! information flow, and non-disclosure of target existence.
-//!
-//! Covered in-process: authentication resolves a registered principal; any
-//! security failure yields `PermissionDenied` (never an internal error); and an
-//! unauthorized request never discloses whether its target exists.
+//! information flow, non-disclosure, and request-identity preservation.
+
+#![allow(clippy::panic)]
 
 use std::error::Error;
 use std::sync::{Arc, Mutex};
@@ -15,20 +13,19 @@ use dxbot_core::types::{
     OperationId, OperationRequest, PrincipalRef, RequestDigest, ScopeSelector,
 };
 
-/// Build a `CreateBot` operation request for `principal` targeting `bot_id`.
 fn create_bot_request(principal: &str, bot_id: &str, command_id: &str) -> OperationRequest {
     let principal_ref = PrincipalRef(format!("http:{principal}"));
     OperationRequest {
         command_id: CommandId(command_id.to_string()),
         idempotency_key: IdempotencyKey {
             principal_ref: principal_ref.clone(),
-            key_digest: "digest".to_string(),
+            key_digest: format!("key-{command_id}"),
             expires_at: i64::MAX,
         },
-        request_digest: RequestDigest("request-digest".to_string()),
-        new_operation_id: OperationId("op-new".to_string()),
+        request_digest: RequestDigest(format!("request-{command_id}")),
+        new_operation_id: OperationId(format!("operation-{command_id}")),
         payload: CommandPayload {
-            command_key: "CreateBot".to_string(),
+            command_key: "bot-create".to_string(),
             principal_ref,
             instance_id: InstanceId("instance-1".to_string()),
             canonical_target: CanonicalTarget::Bot {
@@ -42,20 +39,17 @@ fn create_bot_request(principal: &str, bot_id: &str, command_id: &str) -> Operat
     }
 }
 
-/// The bot scope for a canonical bot id.
 fn bot_scope(bot_id: &str) -> ScopeSelector {
     ScopeSelector::Bot(BotSelector::CanonicalId(BotId(bot_id.to_string())))
 }
 
-/// A control server with an empty security state and empty domain state.
 fn server() -> (ControlServer, Arc<Mutex<SecurityState>>) {
     let security = Arc::new(Mutex::new(SecurityState::new()));
-    let application = Arc::new(Mutex::new(ApplicationMutator::new()));
+    let application = Arc::new(ApplicationMutator::new());
     let server = ControlServer::new(security.clone(), application);
     (server, security)
 }
 
-/// Register `principal` so it is authenticated at the boundary.
 fn register(
     security: &Arc<Mutex<SecurityState>>,
     principal: &PrincipalRef,
@@ -67,7 +61,6 @@ fn register(
     Ok(())
 }
 
-/// Grant `role` to `principal` on `scope`.
 fn grant(
     security: &Arc<Mutex<SecurityState>>,
     principal: &PrincipalRef,
@@ -83,29 +76,27 @@ fn grant(
 #[test]
 fn security_authenticate_resolves_principal() -> Result<(), Box<dyn Error>> {
     let (server, security) = server();
-
-    // A registered principal with the needed authority on the target scope.
-    let alice = PrincipalRef("http:alice".into());
+    let alice = PrincipalRef("http:alice".to_string());
     register(&security, &alice)?;
     grant(&security, &alice, &bot_scope("bot-1"))?;
 
-    let result = server.handle_request(&create_bot_request("alice", "bot-1", "cmd-1"))?;
+    let request = create_bot_request("alice", "bot-1", "cmd-1");
+    let result = server.handle_request(&request)?;
     assert_eq!(result.status, "committed");
+    assert_eq!(result.command_id, request.command_id);
+    assert_eq!(result.operation_id, request.new_operation_id);
     assert!(result.error.is_none());
-    if let Some(payload) = result.committed_payload.as_ref() {
-        assert!(payload.get("bot_ref").is_some());
-    } else {
-        panic!("authorized mutation must produce a committed payload");
-    }
+    assert!(result
+        .committed_payload
+        .as_ref()
+        .is_some_and(|payload| payload.get("bot_ref").is_some()));
     Ok(())
 }
 
 #[test]
 fn security_unauthorized_operation_is_denied() -> Result<(), Box<dyn Error>> {
     let (server, security) = server();
-
-    // Registered principal but NO authority bound -> not authorized.
-    register(&security, &PrincipalRef("http:eve".into()))?;
+    register(&security, &PrincipalRef("http:eve".to_string()))?;
 
     assert!(matches!(
         server.handle_request(&create_bot_request("eve", "bot-1", "cmd-1")),
@@ -117,33 +108,24 @@ fn security_unauthorized_operation_is_denied() -> Result<(), Box<dyn Error>> {
 #[test]
 fn security_information_flow_is_fail_closed() -> Result<(), Box<dyn Error>> {
     let (server, security) = server();
-
-    // The peer is not even registered (unauthenticated).
     let request = create_bot_request("mallory", "bot-1", "cmd-1");
+    assert!(matches!(
+        server.handle_request(&request),
+        Err(ServerError::PermissionDenied(_))
+    ));
 
-    // Fail-closed: a security failure is always PermissionDenied, never an
-    // internal invariant error.
-    match server.handle_request(&request) {
-        Err(ServerError::PermissionDenied(_)) => {}
-        other => panic!("fail-closed: expected PermissionDenied, got {other:?}"),
-    }
-
-    // A registered but unauthorized principal is likewise fail-closed.
-    register(&security, &PrincipalRef("http:eve".into()))?;
-    match server.handle_request(&create_bot_request("eve", "bot-1", "cmd-1")) {
-        Err(ServerError::PermissionDenied(_)) => {}
-        other => panic!("fail-closed: expected PermissionDenied, got {other:?}"),
-    }
+    register(&security, &PrincipalRef("http:eve".to_string()))?;
+    assert!(matches!(
+        server.handle_request(&create_bot_request("eve", "bot-1", "cmd-2")),
+        Err(ServerError::PermissionDenied(_))
+    ));
     Ok(())
 }
 
 #[test]
 fn security_nonexistent_target_does_not_disclose_existence() -> Result<(), Box<dyn Error>> {
     let (server, security) = server();
-
-    // Authorized for the target's scope, so the mutator legitimately creates
-    // the (previously nonexistent) target — committing reveals nothing.
-    let alice = PrincipalRef("http:alice".into());
+    let alice = PrincipalRef("http:alice".to_string());
     register(&security, &alice)?;
     grant(&security, &alice, &bot_scope("ghost-bot"))?;
     assert!(
@@ -152,15 +134,30 @@ fn security_nonexistent_target_does_not_disclose_existence() -> Result<(), Box<d
             .is_ok()
     );
 
-    // An UNAUTHORIZED request to a (different) nonexistent target must yield
-    // PermissionDenied and never an existence-disclosing NotFound.
-    register(&security, &PrincipalRef("http:carol".into()))?;
-    match server.handle_request(&create_bot_request("carol", "ghost-bot", "cmd-ghost2")) {
-        Err(ServerError::PermissionDenied(_)) => {}
-        Err(ServerError::NotFound(_)) => panic!(
-            "non-disclosure: unauthorized request must not leak target existence via NotFound"
-        ),
-        other => panic!("non-disclosure: expected PermissionDenied, got {other:?}"),
-    }
+    register(&security, &PrincipalRef("http:carol".to_string()))?;
+    assert!(matches!(
+        server.handle_request(&create_bot_request("carol", "other-ghost", "cmd-ghost2")),
+        Err(ServerError::PermissionDenied(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn security_same_command_id_with_changed_digest_conflicts_after_authorization(
+) -> Result<(), Box<dyn Error>> {
+    let (server, security) = server();
+    let alice = PrincipalRef("http:alice".to_string());
+    register(&security, &alice)?;
+    grant(&security, &alice, &bot_scope("bot-1"))?;
+
+    let request = create_bot_request("alice", "bot-1", "cmd-1");
+    server.handle_request(&request)?;
+    let mut conflicting = request.clone();
+    conflicting.request_digest = RequestDigest("changed-digest".to_string());
+    conflicting.new_operation_id = OperationId("changed-operation".to_string());
+    assert!(matches!(
+        server.handle_request(&conflicting),
+        Err(ServerError::Conflict(_))
+    ));
     Ok(())
 }

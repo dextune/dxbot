@@ -7,7 +7,7 @@ use crate::protocol::{ChatMessage, ProviderEvent, ProviderRequest};
 use crate::real_provider::RealProvider;
 
 /// DeepSeek v4 Flash 0731 adapter.
-/// Implements `RealProvider` trait — first real provider canary.
+/// Model-specific configuration only; Common owns transport and execution policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeepSeekFlashAdapter {
     pub id: ProviderId,
@@ -47,15 +47,15 @@ impl RealProvider for DeepSeekFlashAdapter {
                 role: "user".to_string(),
                 content: format!("{}\n\nContext: {}", task.intent, task.context),
             }],
-            max_tokens: task.budget.map(|b| b as u32),
+            max_tokens: task
+                .budget
+                .map(|budget| u32::try_from(budget).unwrap_or(u32::MAX)),
             temperature: Some(0.0),
             stream: false,
         }
     }
 
     fn map_event(&self, event: ProviderEvent) -> ProviderEvent {
-        // deepseek reasoning tokens are already separated by Common handler.
-        // Pass through without modification.
         event
     }
 }

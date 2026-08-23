@@ -1,14 +1,15 @@
-//! Acceptance coverage for `AT-CLI-CORE-001`: the CLI core Bot-only path.
+//! Acceptance coverage for `AT-CLI-CORE-001`.
 //!
-//! Verifies the boundary-local `operation → CommandPayload` projection for
-//! bot create, conversation send, and the task submit → show → result path.
-#![allow(clippy::unwrap_used)]
+//! The convenience path must use `application-contract` as the canonical owner
+//! of target/CAS materialization rather than redefining that policy in CLI.
+
+#![allow(clippy::unwrap_used, clippy::panic)]
 
 use std::collections::HashMap;
 
 use cli::commands::{CoreCommands, TaskOptions};
 use dxbot_core::types::{
-    BotId, BotSelector, CanonicalTarget, ContentSource, ConversationId,
+    BotId, BotSelector, CanonicalTarget, ContentSource, ConversationId, InstanceId, PrincipalRef,
     TaskId,
 };
 
@@ -23,26 +24,21 @@ fn text(value: &str) -> ContentSource {
 }
 
 #[test]
-fn core_bot_create_produces_valid_payload() {
+fn core_bot_create_uses_canonical_instance_target() {
     let mut policies = HashMap::new();
-    policies.insert("approval".to_string(), "required".to_string());
-    policies.insert("memory".to_string(), "shared".to_string());
+    policies.insert("brain_policy".to_string(), "default".to_string());
+    policies.insert("provider_policy".to_string(), "text".to_string());
 
     let payload = commands().bot_create("alpha", &policies).unwrap();
-
     assert_eq!(payload.command_key, "bot-create");
-    // Correct BotRef: the canonical target is the created Bot id.
-    match &payload.canonical_target {
-        CanonicalTarget::Bot { id, revision } => {
-            assert_eq!(id, &BotId("alpha".to_string()));
-            assert_eq!(*revision, 0);
-        }
-        other => panic!("expected Bot canonical target, got {other:?}"),
-    }
-    // Correct MainConversationRef: the created bot's main conversation id.
-    assert_eq!(payload.semantic_options["main_conversation"], "alpha:main");
+    assert_eq!(
+        payload.canonical_target,
+        CanonicalTarget::Instance(InstanceId("default".to_string()))
+    );
     assert_eq!(payload.semantic_options["name"], "alpha");
-    assert_eq!(payload.semantic_options["policies"]["approval"], "required");
+    assert_eq!(payload.semantic_options["brain_policy"], "default");
+    assert_eq!(payload.semantic_options["provider_policy"], "text");
+    assert!(payload.cas.is_some());
 }
 
 #[test]
@@ -50,9 +46,7 @@ fn core_conversation_send_resolves_bot_main_conversation() {
     let payload = commands()
         .conversation_send("alpha", &text("hello there"))
         .unwrap();
-
     assert_eq!(payload.command_key, "conversation-send");
-    // Send resolves to the bot's main conversation id.
     match &payload.canonical_target {
         CanonicalTarget::Conversation { id, revision } => {
             assert_eq!(id, &ConversationId("alpha:main".to_string()));
@@ -60,9 +54,7 @@ fn core_conversation_send_resolves_bot_main_conversation() {
         }
         other => panic!("expected Conversation target, got {other:?}"),
     }
-    // The bot selector is retained for authoritative re-resolution.
     assert_eq!(payload.semantic_options["bot"], "alpha");
-    // Content is carried through.
     assert_eq!(payload.content, Some(text("hello there")));
 }
 
@@ -84,26 +76,21 @@ fn core_task_submit_show_result_path() {
         }
         other => panic!("expected Task target, got {other:?}"),
     }
-    // Content intent is carried through.
-    assert_eq!(submit.content, Some(intent.clone()));
+    assert_eq!(submit.content, Some(intent));
 
-    // Show resolves the same canonical task.
     let show = commands().task_show("task:alpha").unwrap();
     assert_eq!(show.command_key, "task-show");
     assert!(matches!(
         show.canonical_target,
-        CanonicalTarget::Task { id: _, .. }
+        CanonicalTarget::Task { ref id, .. } if id == &TaskId("alpha".to_string())
     ));
 
-    // Result resolves the same canonical task, via the parsed selector.
     let result = commands().task_result("task:alpha").unwrap();
     assert_eq!(result.command_key, "task-result");
     assert!(matches!(
         result.canonical_target,
-        CanonicalTarget::Task { id: _, .. }
+        CanonicalTarget::Task { ref id, .. } if id == &TaskId("alpha".to_string())
     ));
-
-    // The semantic option carries the selector used.
     assert_eq!(result.semantic_options["task"], "task:alpha");
 }
 
@@ -117,15 +104,22 @@ fn core_task_submit_with_delegate_option() {
     let payload = commands()
         .task_submit("alpha", &text("delegated work"), &options)
         .unwrap();
-
-    // Delegation option is projected into the payload, canonically encoded.
     assert_eq!(payload.semantic_options["delegate_to_bot"], "bot:worker");
     assert_eq!(payload.semantic_options["deadline"], 100);
     assert_eq!(payload.semantic_options["budget"], 50);
+}
 
-    // Without delegation the option is absent from the payload.
-    let plain = commands()
-        .task_submit("alpha", &text("work"), &TaskOptions::default())
-        .unwrap();
-    assert!(plain.semantic_options["delegate_to_bot"].is_null());
+#[test]
+fn core_projection_preserves_boundary_identity_without_owning_target_policy() {
+    let commands = CoreCommands::at(
+        InstanceId("instance-a".to_string()),
+        PrincipalRef("principal-a".to_string()),
+    );
+    let payload = commands.bot_create("alpha", &HashMap::new()).unwrap();
+    assert_eq!(payload.instance_id, InstanceId("instance-a".to_string()));
+    assert_eq!(payload.principal_ref, PrincipalRef("principal-a".to_string()));
+    assert_eq!(
+        payload.canonical_target,
+        CanonicalTarget::Instance(InstanceId("instance-a".to_string()))
+    );
 }

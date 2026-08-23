@@ -1,13 +1,59 @@
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::future::Future;
 use std::time::Duration;
 
+use futures::StreamExt;
 use serde::Deserialize;
+use tokio::sync::watch;
 
 use crate::transport::HttpTransport;
 
-// ── public data types ──────────────────────────────────────────────────────
+const PROTOCOL_OVERHEAD_BYTES: usize = 64 * 1024;
+const ERROR_DETAIL_BYTES: usize = 16 * 1024;
+
+/// Level-triggered caller cancellation owned by provider Common.
+///
+/// The state is retained after cancellation, so a subscriber created after the
+/// cancel request still observes it immediately. This avoids the lost-wakeup
+/// semantics of using a bare notification as a cancellation token.
+#[derive(Debug, Clone)]
+pub struct CancellationToken {
+    state: watch::Sender<bool>,
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        let (state, _) = watch::channel(false);
+        Self { state }
+    }
+
+    pub fn cancel(&self) {
+        self.state.send_replace(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.state.borrow()
+    }
+
+    async fn cancelled(&self) {
+        let mut receiver = self.state.subscribe();
+        if *receiver.borrow_and_update() {
+            return;
+        }
+        while receiver.changed().await.is_ok() {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+        }
+    }
+}
 
 /// A single chat message with role and content.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -38,49 +84,36 @@ pub struct UsageInfo {
 /// Unified output event produced by the common handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderEvent {
-    /// A content chunk (non-reasoning).
     ContentDelta { sequence: u64, text: String },
-    /// A reasoning chunk (e.g. deepseek thinking).
     ReasoningDelta { sequence: u64, text: String },
-    /// Terminal: completed with usage.
     Completed { usage: UsageInfo },
-    /// Terminal: failed.
     Failed { reason: String },
-    /// Terminal: cancelled.
     Cancelled,
 }
 
 /// Stable error from the common handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderError {
-    /// HTTP transport failure (DNS, connection refused, TLS).
     TransportUnavailable { detail: String },
-    /// HTTP 4xx — invalid request (model not found, bad API key).
     InvalidRequest { status: u16, detail: String },
-    /// HTTP 429 — rate limited.
     RateLimited { retry_after: Option<Duration> },
-    /// HTTP 5xx — upstream unavailable.
     UpstreamUnavailable { status: u16, detail: String },
-    /// Deadline exceeded.
     DeadlineExceeded,
-    /// Cancelled by caller.
     Cancelled,
-    /// Response parsing failed (malformed SSE, JSON).
     ProtocolViolation { detail: String },
-    /// Output exceeded bounded buffer.
     OutputExceeded,
 }
 
 /// Execution configuration for a provider call.
 #[derive(Debug, Clone)]
 pub struct ProviderExecuteConfig {
-    /// Optional wall-clock deadline.
+    /// Optional caller-owned monotonic deadline.
     pub deadline: Option<tokio::time::Instant>,
-    /// Optional cancellation signal.
-    pub cancel_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Optional level-triggered cancellation token.
+    pub cancel_token: Option<CancellationToken>,
     /// Maximum cumulative output bytes before `OutputExceeded`.
     pub max_output_bytes: usize,
-    /// Maximum number of events before `OutputExceeded`.
+    /// Maximum number of output events, including the terminal event.
     pub max_output_items: usize,
 }
 
@@ -92,8 +125,6 @@ pub struct ChatCompletionProtocol {
     pub max_output_bytes: usize,
     pub max_output_items: usize,
 }
-
-// ── private deserialization helpers ────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct ChatCompletionResponse {
@@ -121,7 +152,6 @@ struct UsageResponse {
     reasoning_tokens: Option<u32>,
 }
 
-/// An SSE data chunk in the streaming path.
 #[derive(Deserialize)]
 struct SseChunk {
     choices: Option<Vec<SseChoice>>,
@@ -140,8 +170,6 @@ struct DeltaResponse {
     reasoning_content: Option<String>,
 }
 
-// ── ChatCompletionProtocol implementation ──────────────────────────────────
-
 impl ChatCompletionProtocol {
     pub fn new(transport: HttpTransport, max_output_bytes: usize, max_output_items: usize) -> Self {
         Self {
@@ -151,62 +179,52 @@ impl ChatCompletionProtocol {
         }
     }
 
-    /// Execute a provider request.
-    ///
-    /// Builds the OpenAI-compatible JSON body, POSTs to
-    /// `{base_url}/v1/chat/completions`, and returns a sequence of
-    /// [`ProviderEvent`]s.
+    /// Executes one bounded provider request under the same deadline and
+    /// cancellation authority for connect, body reads, and streaming reads.
     pub async fn execute(
         &self,
         request: &ProviderRequest,
         config: &ProviderExecuteConfig,
     ) -> Result<Vec<ProviderEvent>, ProviderError> {
+        self.check_control(config)?;
+
         let body = serde_json::json!({
             "model": request.model,
-            "messages": request.messages.iter().map(|m| {
-                serde_json::json!({"role": m.role, "content": m.content})
+            "messages": request.messages.iter().map(|message| {
+                serde_json::json!({"role": message.role, "content": message.content})
             }).collect::<Vec<_>>(),
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
             "stream": request.stream,
         });
-
         let url = format!(
             "{}/v1/chat/completions",
             self.transport.base_url.trim_end_matches('/')
         );
-
-        let http_req = self.transport.client.post(&url).json(&body);
-
-        let response = self.send_request(http_req, config).await?;
+        let response = self
+            .controlled(self.transport.client.post(&url).json(&body).send(), config)
+            .await?
+            .map_err(map_reqwest_error)?;
 
         let status = response.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             let retry_after = response
                 .headers()
                 .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
                 .map(Duration::from_secs);
             return Err(ProviderError::RateLimited { retry_after });
         }
-
         if status.is_client_error() {
-            let detail = response
-                .text()
-                .await
-                .unwrap_or_default();
+            let detail = self.read_error_detail(response, config).await?;
             return Err(ProviderError::InvalidRequest {
                 status: status.as_u16(),
                 detail,
             });
         }
-
         if status.is_server_error() {
-            let detail = response
-                .text()
-                .await
-                .unwrap_or_default();
+            let detail = self.read_error_detail(response, config).await?;
             return Err(ProviderError::UpstreamUnavailable {
                 status: status.as_u16(),
                 detail,
@@ -216,83 +234,52 @@ impl ChatCompletionProtocol {
         if request.stream {
             self.parse_stream(response, config).await
         } else {
-            self.parse_non_stream(response).await
+            self.parse_non_stream(response, config).await
         }
     }
 
-    /// Send the HTTP request, respecting deadline and cancellation.
-    async fn send_request(
-        &self,
-        req: reqwest::RequestBuilder,
-        config: &ProviderExecuteConfig,
-    ) -> Result<reqwest::Response, ProviderError> {
-        let response_future = req.send();
-
-        // Check cancel signal
-        if let Some(notify) = &config.cancel_notify {
-            tokio::select! {
-                _ = notify.notified() => {
-                    Err(ProviderError::Cancelled)
-                }
-                result = response_future => {
-                    result.map_err(map_reqwest_error)
-                }
-            }
-        } else if let Some(deadline) = config.deadline {
-            match tokio::time::timeout_at(deadline, response_future).await {
-                Ok(Ok(resp)) => Ok(resp),
-                Ok(Err(e)) => Err(map_reqwest_error(e)),
-                Err(_elapsed) => Err(ProviderError::DeadlineExceeded),
-            }
-        } else {
-            response_future.await.map_err(map_reqwest_error)
-        }
-    }
-
-    /// Parse a non-streaming JSON response.
     async fn parse_non_stream(
         &self,
         response: reqwest::Response,
+        config: &ProviderExecuteConfig,
     ) -> Result<Vec<ProviderEvent>, ProviderError> {
-        let body: ChatCompletionResponse = response
-            .json()
-            .await
-            .map_err(|e| ProviderError::ProtocolViolation {
-                detail: e.to_string(),
+        let (max_bytes, max_items) = self.effective_limits(config);
+        let wire_limit = max_bytes.saturating_add(PROTOCOL_OVERHEAD_BYTES);
+        let bytes = self.read_body_limited(response, config, wire_limit).await?;
+        let body: ChatCompletionResponse =
+            serde_json::from_slice(&bytes).map_err(|error| ProviderError::ProtocolViolation {
+                detail: error.to_string(),
             })?;
 
-        let mut events: Vec<ProviderEvent> = Vec::new();
-        let mut total_bytes: usize = 0;
-        let mut seq: u64 = 0;
+        let mut events = Vec::new();
+        let mut total_bytes = 0usize;
+        let mut sequence = 0u64;
 
-        for choice in &body.choices {
-            if let Some(msg) = &choice.message {
-                if let Some(content) = &msg.content {
-                    total_bytes = total_bytes.saturating_add(content.len());
-                    if total_bytes > self.max_output_bytes
-                        || events.len() >= self.max_output_items
-                    {
-                        return Err(ProviderError::OutputExceeded);
-                    }
-                    events.push(ProviderEvent::ContentDelta {
-                        sequence: seq,
-                        text: content.clone(),
-                    });
-                    seq = seq.saturating_add(1);
-                }
-                if let Some(reasoning) = &msg.reasoning_content {
-                    total_bytes = total_bytes.saturating_add(reasoning.len());
-                    if total_bytes > self.max_output_bytes
-                        || events.len() >= self.max_output_items
-                    {
-                        return Err(ProviderError::OutputExceeded);
-                    }
-                    events.push(ProviderEvent::ReasoningDelta {
-                        sequence: seq,
-                        text: reasoning.clone(),
-                    });
-                    seq = seq.saturating_add(1);
-                }
+        for choice in body.choices {
+            let Some(message) = choice.message else {
+                continue;
+            };
+            if let Some(content) = message.content {
+                push_delta(
+                    &mut events,
+                    &mut total_bytes,
+                    &mut sequence,
+                    content,
+                    false,
+                    max_bytes,
+                    max_items,
+                )?;
+            }
+            if let Some(reasoning) = message.reasoning_content {
+                push_delta(
+                    &mut events,
+                    &mut total_bytes,
+                    &mut sequence,
+                    reasoning,
+                    true,
+                    max_bytes,
+                    max_items,
+                )?;
             }
         }
 
@@ -302,158 +289,307 @@ impl ChatCompletionProtocol {
                 completion_tokens: 0,
                 reasoning_tokens: None,
             },
-            |u| UsageInfo {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                reasoning_tokens: u.reasoning_tokens,
-            },
+            usage_info,
         );
-
-        events.push(ProviderEvent::Completed { usage });
+        push_completed(&mut events, usage, max_items)?;
         Ok(events)
     }
 
-    /// Parse an SSE streaming response.
     async fn parse_stream(
         &self,
         response: reqwest::Response,
         config: &ProviderExecuteConfig,
     ) -> Result<Vec<ProviderEvent>, ProviderError> {
-        use futures::StreamExt;
-
-        let mut events: Vec<ProviderEvent> = Vec::new();
-        let mut total_bytes: usize = 0;
-        let mut seq: u64 = 0;
-        let mut buffer = String::new();
-
+        let (max_bytes, max_items) = self.effective_limits(config);
+        let max_frame_bytes = max_bytes.saturating_add(PROTOCOL_OVERHEAD_BYTES);
+        let mut events = Vec::new();
+        let mut total_bytes = 0usize;
+        let mut sequence = 0u64;
+        let mut buffer = Vec::<u8>::new();
         let mut stream = response.bytes_stream();
 
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| ProviderError::TransportUnavailable {
-                detail: e.to_string(),
-            })?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            // Process complete SSE events (delimited by "\n\n")
-            while let Some(pos) = buffer.find("\n\n") {
-                let event_str = buffer[..pos].to_string();
-                buffer = buffer[pos + 2..].to_string();
-
-                for line in event_str.lines() {
-                    let line = line.trim().to_string();
-                    if line.is_empty() {
-                        continue;
+        loop {
+            let next = self.controlled(stream.next(), config).await?;
+            match next {
+                Some(Ok(chunk)) => {
+                    if buffer.len().saturating_add(chunk.len()) > max_frame_bytes {
+                        return Err(ProviderError::OutputExceeded);
                     }
-
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        if data == "[DONE]" {
-                            let usage = UsageInfo {
-                                prompt_tokens: 0,
-                                completion_tokens: 0,
-                                reasoning_tokens: None,
-                            };
-                            events.push(ProviderEvent::Completed { usage });
-                            return Ok(events);
-                        }
-
-                        let chunk: SseChunk =
-                            serde_json::from_str(data).map_err(|e| {
-                                ProviderError::ProtocolViolation {
-                                    detail: e.to_string(),
-                                }
-                            })?;
-
-                        if let Some(usage_resp) = chunk.usage {
-                            let usage = UsageInfo {
-                                prompt_tokens: usage_resp.prompt_tokens,
-                                completion_tokens: usage_resp.completion_tokens,
-                                reasoning_tokens: usage_resp.reasoning_tokens,
-                            };
-                            events.push(ProviderEvent::Completed { usage });
-                            return Ok(events);
-                        }
-
-                        if let Some(choices) = &chunk.choices {
-                            for choice in choices {
-                                if let Some(delta) = &choice.delta {
-                                    if let Some(content) = &delta.content {
-                                        if !content.is_empty() {
-                                            total_bytes =
-                                                total_bytes.saturating_add(content.len());
-                                            if total_bytes > self.max_output_bytes
-                                                || events.len() >= self.max_output_items
-                                            {
-                                                return Err(
-                                                    ProviderError::OutputExceeded,
-                                                );
-                                            }
-                                            events.push(ProviderEvent::ContentDelta {
-                                                sequence: seq,
-                                                text: content.clone(),
-                                            });
-                                            seq = seq.saturating_add(1);
-                                        }
-                                    }
-                                    if let Some(reasoning) = &delta.reasoning_content {
-                                        if !reasoning.is_empty() {
-                                            total_bytes = total_bytes
-                                                .saturating_add(reasoning.len());
-                                            if total_bytes > self.max_output_bytes
-                                                || events.len() >= self.max_output_items
-                                            {
-                                                return Err(
-                                                    ProviderError::OutputExceeded,
-                                                );
-                                            }
-                                            events.push(
-                                                ProviderEvent::ReasoningDelta {
-                                                    sequence: seq,
-                                                    text: reasoning.clone(),
-                                                },
-                                            );
-                                            seq = seq.saturating_add(1);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    buffer.extend_from_slice(&chunk);
                 }
+                Some(Err(error)) => return Err(map_reqwest_error(error)),
+                None => break,
             }
 
-            // Check cancellation between chunks
-            if let Some(notify) = &config.cancel_notify {
-                // Notify::notified() is a future; use a quick poll
-                if std::future::Future::poll(
-                    std::pin::pin!(notify.notified()),
-                    &mut std::task::Context::from_waker(std::task::Waker::noop()),
-                )
-                .is_ready()
-                {
-                    return Err(ProviderError::Cancelled);
+            while let Some((position, separator_len)) = find_sse_separator(&buffer) {
+                let mut frame = buffer
+                    .drain(..position + separator_len)
+                    .collect::<Vec<_>>();
+                frame.truncate(position);
+                if process_sse_frame(
+                    &frame,
+                    &mut events,
+                    &mut total_bytes,
+                    &mut sequence,
+                    max_bytes,
+                    max_items,
+                )? {
+                    return Ok(events);
                 }
             }
         }
 
-        // Stream ended without an explicit [DONE]
-        let usage = UsageInfo {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            reasoning_tokens: None,
-        };
-        events.push(ProviderEvent::Completed { usage });
-        Ok(events)
+        if buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            return Err(ProviderError::ProtocolViolation {
+                detail: "stream ended with an incomplete SSE frame".to_string(),
+            });
+        }
+        Err(ProviderError::ProtocolViolation {
+            detail: "stream ended without a terminal SSE event".to_string(),
+        })
+    }
+
+    fn effective_limits(&self, config: &ProviderExecuteConfig) -> (usize, usize) {
+        (
+            self.max_output_bytes.min(config.max_output_bytes),
+            self.max_output_items.min(config.max_output_items),
+        )
+    }
+
+    fn check_control(&self, config: &ProviderExecuteConfig) -> Result<(), ProviderError> {
+        if config
+            .cancel_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(ProviderError::Cancelled);
+        }
+        if config
+            .deadline
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+        {
+            return Err(ProviderError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+
+    async fn controlled<T, F>(
+        &self,
+        future: F,
+        config: &ProviderExecuteConfig,
+    ) -> Result<T, ProviderError>
+    where
+        F: Future<Output = T>,
+    {
+        self.check_control(config)?;
+        match (&config.cancel_token, config.deadline) {
+            (Some(token), Some(deadline)) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => Err(ProviderError::Cancelled),
+                    _ = tokio::time::sleep_until(deadline) => Err(ProviderError::DeadlineExceeded),
+                    output = future => Ok(output),
+                }
+            }
+            (Some(token), None) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => Err(ProviderError::Cancelled),
+                    output = future => Ok(output),
+                }
+            }
+            (None, Some(deadline)) => match tokio::time::timeout_at(deadline, future).await {
+                Ok(output) => Ok(output),
+                Err(_) => Err(ProviderError::DeadlineExceeded),
+            },
+            (None, None) => Ok(future.await),
+        }
+    }
+
+    async fn read_body_limited(
+        &self,
+        response: reqwest::Response,
+        config: &ProviderExecuteConfig,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ProviderError> {
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::with_capacity(max_bytes.min(8 * 1024));
+        loop {
+            let next = self.controlled(stream.next(), config).await?;
+            match next {
+                Some(Ok(chunk)) => {
+                    if body.len().saturating_add(chunk.len()) > max_bytes {
+                        return Err(ProviderError::OutputExceeded);
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Some(Err(error)) => return Err(map_reqwest_error(error)),
+                None => return Ok(body),
+            }
+        }
+    }
+
+    async fn read_error_detail(
+        &self,
+        response: reqwest::Response,
+        config: &ProviderExecuteConfig,
+    ) -> Result<String, ProviderError> {
+        match self
+            .read_body_limited(response, config, ERROR_DETAIL_BYTES)
+            .await
+        {
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(ProviderError::OutputExceeded) => {
+                Ok("upstream error body exceeded diagnostic limit".to_string())
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
-// ── helpers ────────────────────────────────────────────────────────────────
+fn process_sse_frame(
+    frame: &[u8],
+    events: &mut Vec<ProviderEvent>,
+    total_bytes: &mut usize,
+    sequence: &mut u64,
+    max_bytes: usize,
+    max_items: usize,
+) -> Result<bool, ProviderError> {
+    let text = std::str::from_utf8(frame).map_err(|error| ProviderError::ProtocolViolation {
+        detail: error.to_string(),
+    })?;
 
-fn map_reqwest_error(e: reqwest::Error) -> ProviderError {
-    if e.is_timeout() {
-        ProviderError::DeadlineExceeded
-    } else {
-        ProviderError::TransportUnavailable {
-            detail: e.to_string(),
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim_start();
+        if data == "[DONE]" {
+            push_completed(
+                events,
+                UsageInfo {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    reasoning_tokens: None,
+                },
+                max_items,
+            )?;
+            return Ok(true);
         }
+        if data.is_empty() {
+            continue;
+        }
+
+        let chunk: SseChunk =
+            serde_json::from_str(data).map_err(|error| ProviderError::ProtocolViolation {
+                detail: error.to_string(),
+            })?;
+        if let Some(usage) = chunk.usage {
+            push_completed(events, usage_info(usage), max_items)?;
+            return Ok(true);
+        }
+        if let Some(choices) = chunk.choices {
+            for choice in choices {
+                let Some(delta) = choice.delta else {
+                    continue;
+                };
+                if let Some(content) = delta.content {
+                    if !content.is_empty() {
+                        push_delta(
+                            events,
+                            total_bytes,
+                            sequence,
+                            content,
+                            false,
+                            max_bytes,
+                            max_items,
+                        )?;
+                    }
+                }
+                if let Some(reasoning) = delta.reasoning_content {
+                    if !reasoning.is_empty() {
+                        push_delta(
+                            events,
+                            total_bytes,
+                            sequence,
+                            reasoning,
+                            true,
+                            max_bytes,
+                            max_items,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn push_delta(
+    events: &mut Vec<ProviderEvent>,
+    total_bytes: &mut usize,
+    sequence: &mut u64,
+    text: String,
+    reasoning: bool,
+    max_bytes: usize,
+    max_items: usize,
+) -> Result<(), ProviderError> {
+    let next_bytes = total_bytes.saturating_add(text.len());
+    if next_bytes > max_bytes || events.len() >= max_items {
+        return Err(ProviderError::OutputExceeded);
+    }
+    *total_bytes = next_bytes;
+    let event = if reasoning {
+        ProviderEvent::ReasoningDelta {
+            sequence: *sequence,
+            text,
+        }
+    } else {
+        ProviderEvent::ContentDelta {
+            sequence: *sequence,
+            text,
+        }
+    };
+    events.push(event);
+    *sequence = (*sequence).saturating_add(1);
+    Ok(())
+}
+
+fn push_completed(
+    events: &mut Vec<ProviderEvent>,
+    usage: UsageInfo,
+    max_items: usize,
+) -> Result<(), ProviderError> {
+    if events.len() >= max_items {
+        return Err(ProviderError::OutputExceeded);
+    }
+    events.push(ProviderEvent::Completed { usage });
+    Ok(())
+}
+
+fn usage_info(usage: UsageResponse) -> UsageInfo {
+    UsageInfo {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+    }
+}
+
+fn find_sse_separator(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(left), Some(right)) if left <= right => Some((left, 2)),
+        (Some(_), Some(right)) => Some((right, 4)),
+        (Some(position), None) => Some((position, 2)),
+        (None, Some(position)) => Some((position, 4)),
+        (None, None) => None,
+    }
+}
+
+fn map_reqwest_error(error: reqwest::Error) -> ProviderError {
+    ProviderError::TransportUnavailable {
+        detail: error.to_string(),
     }
 }

@@ -1,54 +1,39 @@
-//! Domain mutation: target materialization, receipt, and domain-outcome semantics.
+//! Domain mutation: target materialization, binding-first identity, receipt, and
+//! domain-outcome semantics.
 //!
-//! [`ApplicationMutator`] applies domain mutations against an in-memory
-//! [`DomainState`]. It validates the canonical target against the current state
-//! and CAS conditions, applies the mutation atomically, records an operation
-//! receipt, and returns an [`OperationResult`]. The same command identity is
-//! idempotent: a retry with the same payload returns the existing receipt with
-//! no duplicate effect.
+//! [`ApplicationMutator`] consumes the complete [`OperationRequest`] so the
+//! command/idempotency/request identities chosen before dispatch are preserved
+//! through the authoritative mutation boundary.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use dxbot_core::receipt::{ReceiptDisposition, ReceiptRecord};
 use dxbot_core::types::{
     CanonicalTarget, CasConditions, CommandId, CommandPayload, ConversationId, InstanceId,
-    OperationId, OperationResult, ThreadId,
+    OperationId, OperationRequest, OperationResult, RequestDigest, ThreadId,
 };
 
 use crate::outcome::{DomainOutcome, resolve_outcome};
 use crate::state::{BotState, ConversationState, DomainState, LifecycleState, ThreadState};
 
-/// Application-layer error surfaced when a mutation is rejected by the domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppError {
-    /// The canonical target does not exist and a precondition requires it.
     NotFound(String),
-    /// The target's revision/generation does not match the CAS conditions.
     Conflict(String),
-    /// The principal is not permitted to mutate the target.
     PermissionDenied(String),
-    /// An internal invariant or state failure.
     Internal(String),
-    /// The requested stream cursor is behind the oldest retained event; the
-    /// caller must resync from the current state. The payload carries a resync
-    /// hint (the oldest available cursor).
     GapDetected(String),
-    /// No event arrived within the requested window.
     Timeout(String),
 }
 
-/// The resolved identity of an operation derived from its command payload.
 #[derive(Debug, Clone)]
 struct OperationIdentity {
     operation_id: OperationId,
     command_id: CommandId,
     instance_id: InstanceId,
-    binding_digest: String,
+    request_digest: RequestDigest,
 }
 
-/// Apply domain mutations with receipt and domain-outcome semantics.
 #[derive(Debug)]
 pub struct ApplicationMutator {
     state: Arc<Mutex<DomainState>>,
@@ -61,74 +46,100 @@ impl Default for ApplicationMutator {
 }
 
 impl ApplicationMutator {
-    /// Create a mutator over an empty in-memory domain state.
     pub fn new() -> Self {
         Self::with_state(DomainState::new())
     }
 
-    /// Create a mutator over a caller-provided in-memory domain state.
-    ///
-    /// Used to seed state for tests and offline scenarios.
     pub fn with_state(state: DomainState) -> Self {
         Self {
             state: Arc::new(Mutex::new(state)),
         }
     }
 
-    /// Clone a snapshot of the current domain state.
-    ///
-    /// Returns [`AppError::Internal`] when the internal mutex is poisoned,
-    /// indicating a prior panic in a critical section.
     pub fn snapshot(&self) -> Result<DomainState, AppError> {
         self.lock().map(|guard| guard.clone()).map_err(AppError::Internal)
     }
 
-    /// Apply a domain mutation described by `payload`, atomically, and return
-    /// an [`OperationResult`] carrying the operation receipt.
-    pub fn mutate(&self, payload: &CommandPayload) -> Result<OperationResult, AppError> {
-        let instance_id = payload.instance_id.clone();
-        let binding_digest = binding_digest(payload)?;
-        let command_id = command_id_for(payload);
-        let operation_id = operation_id_for(payload, &binding_digest);
-
+    /// Applies one complete operation request atomically in the in-memory
+    /// fixture. Existing bindings are resolved before any domain effect.
+    pub fn mutate(&self, request: &OperationRequest) -> Result<OperationResult, AppError> {
+        validate_request_identity(request)?;
+        let payload = &request.payload;
+        let idempotency_binding = (
+            request.idempotency_key.principal_ref.0.clone(),
+            request.idempotency_key.key_digest.clone(),
+        );
         let mut guard = self
             .lock()
-            .map_err(|m| AppError::Internal(format!("domain state lock unavailable: {m}")))?;
+            .map_err(|message| AppError::Internal(format!("domain state lock unavailable: {message}")))?;
 
-        // Same command bound to a different digest -> typed conflict.
-        if let Some(existing_op) = guard.command_bindings.get(&command_id) {
-            if existing_op != &operation_id {
-                return Err(AppError::Conflict(format!(
-                    "idempotency conflict: command {command_id:?} already bound to {existing_op:?}"
-                )));
+        match (
+            guard.command_bindings.get(&request.command_id),
+            guard.idempotency_bindings.get(&idempotency_binding),
+        ) {
+            (Some(operation_id), Some(bound_command_id)) => {
+                if bound_command_id != &request.command_id {
+                    return Err(AppError::Conflict(
+                        "idempotency key is already bound to another command".to_string(),
+                    ));
+                }
+                let stored_digest = guard
+                    .command_request_digests
+                    .get(&request.command_id)
+                    .ok_or_else(|| {
+                        AppError::Internal(
+                            "command binding exists without request digest".to_string(),
+                        )
+                    })?;
+                if stored_digest != &request.request_digest {
+                    return Err(AppError::Conflict(
+                        "command binding request digest mismatch".to_string(),
+                    ));
+                }
+                return guard.results.get(operation_id).cloned().ok_or_else(|| {
+                    AppError::Internal(
+                        "committed command binding exists without operation result".to_string(),
+                    )
+                });
+            }
+            (None, None) => {}
+            _ => {
+                return Err(AppError::Conflict(
+                    "incomplete or conflicting command/idempotency binding".to_string(),
+                ));
             }
         }
 
-        // Idempotent replay: the same command already committed.
-        if guard.receipts.contains_key(&operation_id) {
-            if let Some(existing) = guard.results.get(&operation_id) {
-                return Ok(existing.clone());
-            }
+        if guard.receipts.contains_key(&request.new_operation_id)
+            || guard.results.contains_key(&request.new_operation_id)
+        {
+            return Err(AppError::Conflict(
+                "new operation id is already in use".to_string(),
+            ));
         }
 
-        // Preflight + resolve the domain outcome.
         self.validate_target_against(&guard, &payload.canonical_target, &payload.cas)?;
         let outcome = resolve_outcome(&guard, &payload.canonical_target, &payload.cas);
-
         let identity = OperationIdentity {
-            operation_id,
-            command_id,
-            instance_id,
-            binding_digest,
+            operation_id: request.new_operation_id.clone(),
+            command_id: request.command_id.clone(),
+            instance_id: payload.instance_id.clone(),
+            request_digest: request.request_digest.clone(),
         };
         let result = self.apply(&mut guard, payload, &identity, outcome)?;
+
+        guard
+            .command_request_digests
+            .insert(identity.command_id.clone(), identity.request_digest.clone());
         guard
             .command_bindings
             .insert(identity.command_id.clone(), identity.operation_id.clone());
+        guard
+            .idempotency_bindings
+            .insert(idempotency_binding, identity.command_id.clone());
         Ok(result)
     }
 
-    /// Preflight-validate a target/CAS pair without mutating state.
     pub fn validate_target(
         &self,
         target: &CanonicalTarget,
@@ -136,18 +147,17 @@ impl ApplicationMutator {
     ) -> Result<(), AppError> {
         let guard = self
             .lock()
-            .map_err(|m| AppError::Internal(format!("domain state lock unavailable: {m}")))?;
+            .map_err(|message| AppError::Internal(format!("domain state lock unavailable: {message}")))?;
         self.validate_target_against(&guard, target, cas)
     }
 
-    /// Retrieve the receipt for an operation, if one was recorded.
     pub fn get_receipt(
         &self,
         operation_id: &OperationId,
     ) -> Result<Option<ReceiptRecord>, AppError> {
         let guard = self
             .lock()
-            .map_err(|m| AppError::Internal(format!("domain state lock unavailable: {m}")))?;
+            .map_err(|message| AppError::Internal(format!("domain state lock unavailable: {message}")))?;
         Ok(guard.receipts.get(operation_id).cloned())
     }
 
@@ -185,6 +195,11 @@ impl ApplicationMutator {
         outcome: DomainOutcome,
     ) -> Result<OperationResult, AppError> {
         let committed_payload = match (&payload.canonical_target, outcome) {
+            (CanonicalTarget::Instance(_), DomainOutcome::Updated)
+                if payload.command_key == "bot-create" =>
+            {
+                self.materialize_bot_from_payload(guard, payload)?
+            }
             (CanonicalTarget::Bot { id, .. }, DomainOutcome::Created) => {
                 self.materialize_bot(guard, payload, id)
             }
@@ -193,6 +208,13 @@ impl ApplicationMutator {
             }
             (CanonicalTarget::Thread { id, parent_id, .. }, DomainOutcome::Created) => {
                 self.materialize_thread(guard, id, parent_id.clone())
+            }
+            (CanonicalTarget::Bot { .. }, DomainOutcome::Updated)
+                if payload.command_key == "bot-create" =>
+            {
+                return Err(AppError::Conflict(
+                    "bot-create cannot update an existing bot identity".to_string(),
+                ));
             }
             (CanonicalTarget::Bot { id, .. }, DomainOutcome::Updated) => {
                 self.update_bot(guard, id, payload)
@@ -208,13 +230,12 @@ impl ApplicationMutator {
             operation_id: identity.operation_id.0.clone(),
             disposition: ReceiptDisposition::Committed,
             result_ref: format!("operation:{}", identity.operation_id.0),
-            resolved_binding_digest: identity.binding_digest.clone(),
+            resolved_binding_digest: identity.request_digest.0.clone(),
             owner_kind: "application".to_string(),
             lease_until: None,
             last_progress: 1,
             reconciliation_policy: "idempotent".to_string(),
         };
-
         let result = OperationResult {
             operation_id: identity.operation_id.clone(),
             command_id: identity.command_id.clone(),
@@ -225,14 +246,32 @@ impl ApplicationMutator {
             error: None,
             operation_may_continue: false,
         };
-
-        guard
-            .receipts
-            .insert(identity.operation_id.clone(), receipt);
+        guard.receipts.insert(identity.operation_id.clone(), receipt);
         guard
             .results
             .insert(identity.operation_id.clone(), result.clone());
         Ok(result)
+    }
+
+    fn materialize_bot_from_payload(
+        &self,
+        guard: &mut DomainState,
+        payload: &CommandPayload,
+    ) -> Result<Option<serde_json::Value>, AppError> {
+        let name = payload
+            .semantic_options
+            .get("name")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| AppError::NotFound("bot-create requires a materialized name".to_string()))?;
+        let id = dxbot_core::types::BotId(name.to_string());
+        if guard.bots.contains_key(&id) {
+            return Err(AppError::Conflict(format!(
+                "bot identity already exists: {}",
+                id.0
+            )));
+        }
+        Ok(self.materialize_bot(guard, payload, &id))
     }
 
     fn materialize_bot(
@@ -244,13 +283,11 @@ impl ApplicationMutator {
         let name = payload
             .semantic_options
             .get("name")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
             .unwrap_or_else(|| id.0.clone());
-
-        let conversation_id = ConversationId(format!("main-{}", id.0));
+        let conversation_id = ConversationId(format!("{}:main", id.0));
         let revision = 1_i64;
-
         guard.bots.insert(
             id.clone(),
             BotState {
@@ -269,7 +306,6 @@ impl ApplicationMutator {
                 messages: Vec::new(),
             },
         );
-
         Some(serde_json::json!({
             "bot_ref": format!("bot:{}", id.0),
             "bot_revision": revision,
@@ -288,12 +324,10 @@ impl ApplicationMutator {
         bot.revision += 1;
         let lifecycle = match payload.command_key.as_str() {
             "bot-deactivate" => LifecycleState::Inactive,
-            "bot-activate" => LifecycleState::Active,
-            "bot-restore" => LifecycleState::Active,
+            "bot-activate" | "bot-restore" => LifecycleState::Active,
             _ => bot.lifecycle,
         };
         bot.lifecycle = lifecycle;
-
         Some(serde_json::json!({
             "bot_ref": format!("bot:{}", id.0),
             "bot_revision": bot.revision,
@@ -345,6 +379,24 @@ impl ApplicationMutator {
     }
 }
 
+fn validate_request_identity(request: &OperationRequest) -> Result<(), AppError> {
+    if request.command_id.0.trim().is_empty()
+        || request.new_operation_id.0.trim().is_empty()
+        || request.request_digest.0.trim().is_empty()
+        || request.idempotency_key.key_digest.trim().is_empty()
+    {
+        return Err(AppError::Conflict(
+            "operation identity fields must not be empty".to_string(),
+        ));
+    }
+    if request.idempotency_key.principal_ref != request.payload.principal_ref {
+        return Err(AppError::Conflict(
+            "idempotency principal does not match payload principal".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn lifecycle_str(lifecycle: LifecycleState) -> &'static str {
     match lifecycle {
         LifecycleState::Active => "active",
@@ -352,35 +404,4 @@ fn lifecycle_str(lifecycle: LifecycleState) -> &'static str {
         LifecycleState::Degraded => "degraded",
         LifecycleState::Terminated => "terminated",
     }
-}
-
-fn digest_of(values: &[&str]) -> String {
-    let mut hasher = DefaultHasher::new();
-    for value in values {
-        value.hash(&mut hasher);
-    }
-    format!("{:016x}", hasher.finish())
-}
-
-/// Stable binding digest for the whole payload (identity of the intent).
-fn binding_digest(payload: &CommandPayload) -> Result<String, AppError> {
-    let serialized = serde_json::to_string(payload)
-        .map_err(|e| AppError::Internal(format!("payload serialization failed: {e}")))?;
-    Ok(digest_of(&[&serialized]))
-}
-
-/// Command identity: an instance-scoped, command-scoped key.
-fn command_id_for(payload: &CommandPayload) -> CommandId {
-    let key = digest_of(&[&payload.instance_id.0, &payload.command_key]);
-    CommandId(format!("{}-{key}", payload.command_key))
-}
-
-/// Operation identity: a command identity pinned to the exact binding digest.
-fn operation_id_for(payload: &CommandPayload, binding_digest: &str) -> OperationId {
-    let key = digest_of(&[
-        &payload.instance_id.0,
-        &payload.command_key,
-        binding_digest,
-    ]);
-    OperationId(format!("{}-{key}", payload.command_key))
 }
