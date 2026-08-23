@@ -49,6 +49,7 @@ pub enum CrashPoint {
 #[derive(Debug, Clone, Copy)]
 pub struct OperationRequest<'a> {
     pub principal_ref: &'a str,
+    pub idempotency_key_principal_ref: &'a str,
     pub idempotency_key_digest: &'a str,
     pub command_id: &'a str,
     pub request_digest: &'a str,

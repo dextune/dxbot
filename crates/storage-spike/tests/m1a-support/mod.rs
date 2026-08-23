@@ -22,6 +22,7 @@ pub const fn request<'a>(
 ) -> OperationRequest<'a> {
     OperationRequest {
         principal_ref,
+        idempotency_key_principal_ref: principal_ref,
         idempotency_key_digest: key_digest,
         command_id,
         request_digest,

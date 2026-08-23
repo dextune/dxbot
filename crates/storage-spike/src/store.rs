@@ -2,7 +2,9 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
-use crate::schema::{configure_connection, initialize_schema, initialize_writer_fence, verify_writer_fence};
+use crate::schema::{
+    configure_connection, initialize_schema, initialize_writer_fence, verify_writer_fence,
+};
 use crate::{
     CrashPoint, OperationArtifactCounts, OperationEffect, OperationRequest, ReceiptDisposition,
     SpikeError, SubmitOutcome,
@@ -181,7 +183,8 @@ impl ReferenceStore {
                 request.command_id,
             )?,
             principal_binding: self.connection.query_row(
-                "SELECT COUNT(*) FROM principal_bindings WHERE principal_ref = ?1 AND key_digest = ?2",
+                "SELECT COUNT(*) FROM principal_bindings \
+                 WHERE principal_ref = ?1 AND key_digest = ?2",
                 params![request.principal_ref, request.idempotency_key_digest],
                 |row| row.get(0),
             )?,
@@ -226,6 +229,9 @@ impl ReferenceStore {
         effect: &OperationEffect<'_>,
         crash_point: Option<CrashPoint>,
     ) -> Result<SubmitOutcome, SpikeError> {
+        if request.idempotency_key_principal_ref != request.principal_ref {
+            return Err(SpikeError::IdempotencyConflict);
+        }
         if request.now > request.key_expires_at {
             return Ok(SubmitOutcome::IdempotencyExpired);
         }

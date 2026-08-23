@@ -54,7 +54,7 @@ fn compacted_receipt_keeps_two_binding_tombstones() -> Result<(), SpikeError> {
 }
 
 #[test]
-fn expired_stored_tombstone_is_never_reinterpreted_as_absent() -> Result<(), SpikeError> {
+fn stored_tombstone_horizon_is_inclusive_then_expires_without_new_mutation() -> Result<(), SpikeError> {
     let path = database_path("expired-tombstone");
     let mut store = ReferenceStore::open_file(&path, "instance-1", 1)?;
     let operation = request(
@@ -67,16 +67,33 @@ fn expired_stored_tombstone_is_never_reinterpreted_as_absent() -> Result<(), Spi
     store.submit(&operation, &effect())?;
     assert!(store.compact_terminal_receipt("operation-a")?);
 
+    let mut boundary_retry = request(
+        "principal-a",
+        "key-a",
+        "command-a",
+        "request-a",
+        "operation-boundary",
+    );
+    boundary_retry.now = 100;
+    boundary_retry.key_expires_at = 200;
+    assert_eq!(
+        store.submit(&boundary_retry, &effect())?,
+        SubmitOutcome::Existing {
+            operation_id: "operation-a".to_owned(),
+            disposition: ReceiptDisposition::Committed,
+            compacted: true,
+        }
+    );
+
     let mut expired_retry = request(
         "principal-a",
         "key-a",
         "command-a",
         "request-a",
-        "operation-b",
+        "operation-after",
     );
     expired_retry.now = 101;
     expired_retry.key_expires_at = 200;
-
     assert_eq!(
         store.submit(&expired_retry, &effect())?,
         SubmitOutcome::IdempotencyExpired

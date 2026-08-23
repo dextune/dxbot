@@ -1,6 +1,7 @@
 #[path = "m1a-support/mod.rs"]
 mod m1a_fixture;
 
+use rusqlite::Connection;
 use storage_spike::{
     OperationArtifactCounts, ReceiptDisposition, ReferenceStore, SpikeError, SubmitOutcome,
 };
@@ -104,6 +105,34 @@ fn idempotency_same_key_different_digest_conflicts_without_creation() -> Result<
 }
 
 #[test]
+fn idempotency_same_command_different_key_conflicts_without_creation() -> Result<(), SpikeError> {
+    let path = database_path("same-command-different-key");
+    let mut store = ReferenceStore::open_file(&path, "instance-1", 1)?;
+    let first = request(
+        "principal-a",
+        "key-a",
+        "command-a",
+        "request-a",
+        "operation-a",
+    );
+    let conflicting = request(
+        "principal-a",
+        "key-b",
+        "command-a",
+        "request-a",
+        "operation-b",
+    );
+
+    store.submit(&first, &effect())?;
+    assert!(matches!(
+        store.submit(&conflicting, &effect()),
+        Err(SpikeError::IdempotencyConflict)
+    ));
+    assert_eq!(store.operation_count()?, 1);
+    Ok(())
+}
+
+#[test]
 fn idempotency_command_reuse_across_principals_conflicts() -> Result<(), SpikeError> {
     let path = database_path("same-command-different-principal");
     let mut store = ReferenceStore::open_file(&path, "instance-1", 1)?;
@@ -121,6 +150,66 @@ fn idempotency_command_reuse_across_principals_conflicts() -> Result<(), SpikeEr
         "request-a",
         "operation-b",
     );
+
+    store.submit(&first, &effect())?;
+    assert!(matches!(
+        store.submit(&conflicting, &effect()),
+        Err(SpikeError::IdempotencyConflict)
+    ));
+    assert_eq!(store.operation_count()?, 1);
+    Ok(())
+}
+
+#[test]
+fn principal_scoped_same_key_digest_can_be_distinct() -> Result<(), SpikeError> {
+    let path = database_path("same-key-different-principal-valid-scope");
+    let mut store = ReferenceStore::open_file(&path, "instance-1", 1)?;
+    let first = request(
+        "principal-a",
+        "key-a",
+        "command-a",
+        "request-a",
+        "operation-a",
+    );
+    let second = request(
+        "principal-b",
+        "key-a",
+        "command-b",
+        "request-b",
+        "operation-b",
+    );
+
+    assert!(matches!(
+        store.submit(&first, &effect())?,
+        SubmitOutcome::Created { .. }
+    ));
+    assert!(matches!(
+        store.submit(&second, &effect())?,
+        SubmitOutcome::Created { .. }
+    ));
+    assert_eq!(store.operation_count()?, 2);
+    Ok(())
+}
+
+#[test]
+fn idempotency_key_principal_scope_mismatch_conflicts_without_creation() -> Result<(), SpikeError> {
+    let path = database_path("key-principal-scope-mismatch");
+    let mut store = ReferenceStore::open_file(&path, "instance-1", 1)?;
+    let first = request(
+        "principal-a",
+        "key-a",
+        "command-a",
+        "request-a",
+        "operation-a",
+    );
+    let mut conflicting = request(
+        "principal-b",
+        "key-a",
+        "command-b",
+        "request-b",
+        "operation-b",
+    );
+    conflicting.idempotency_key_principal_ref = "principal-a";
 
     store.submit(&first, &effect())?;
     assert!(matches!(
@@ -155,6 +244,80 @@ fn idempotency_principal_key_reuse_with_new_command_conflicts() -> Result<(), Sp
         store.submit(&conflicting, &effect()),
         Err(SpikeError::IdempotencyConflict)
     ));
+    assert_eq!(store.operation_count()?, 1);
+    Ok(())
+}
+
+#[test]
+fn one_sided_binding_index_is_conflict_not_absence() -> Result<(), SpikeError> {
+    let path = database_path("one-sided-binding");
+    let mut store = ReferenceStore::open_file(&path, "instance-1", 1)?;
+    let first = request(
+        "principal-a",
+        "key-a",
+        "command-a",
+        "request-a",
+        "operation-a",
+    );
+    store.submit(&first, &effect())?;
+    drop(store);
+
+    {
+        let connection = Connection::open(&path)?;
+        let deleted = connection.execute(
+            "DELETE FROM principal_bindings WHERE principal_ref = ?1 AND key_digest = ?2",
+            ["principal-a", "key-a"],
+        )?;
+        assert_eq!(deleted, 1);
+    }
+
+    let mut reopened = ReferenceStore::open_file(&path, "instance-1", 1)?;
+    let retry = request(
+        "principal-a",
+        "key-a",
+        "command-a",
+        "request-a",
+        "operation-b",
+    );
+    assert!(matches!(
+        reopened.submit(&retry, &effect()),
+        Err(SpikeError::IdempotencyConflict)
+    ));
+    assert_eq!(reopened.operation_count()?, 1);
+    Ok(())
+}
+
+#[test]
+fn idempotency_horizon_boundary_is_inclusive_then_expires() -> Result<(), SpikeError> {
+    let path = database_path("horizon-boundary");
+    let mut store = ReferenceStore::open_file(&path, "instance-1", 1)?;
+    let mut at_boundary = request(
+        "principal-a",
+        "key-a",
+        "command-a",
+        "request-a",
+        "operation-a",
+    );
+    at_boundary.now = 100;
+    at_boundary.key_expires_at = 100;
+    assert!(matches!(
+        store.submit(&at_boundary, &effect())?,
+        SubmitOutcome::Created { .. }
+    ));
+
+    let mut after_boundary = request(
+        "principal-a",
+        "key-b",
+        "command-b",
+        "request-b",
+        "operation-b",
+    );
+    after_boundary.now = 101;
+    after_boundary.key_expires_at = 100;
+    assert_eq!(
+        store.submit(&after_boundary, &effect())?,
+        SubmitOutcome::IdempotencyExpired
+    );
     assert_eq!(store.operation_count()?, 1);
     Ok(())
 }
