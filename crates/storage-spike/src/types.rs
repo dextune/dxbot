@@ -28,6 +28,18 @@ impl ReceiptDisposition {
             _ => Err(SpikeError::InvariantViolation("unknown receipt disposition")),
         }
     }
+
+    pub(crate) const fn is_terminal(self) -> bool {
+        !matches!(self, Self::RecoveryRequired)
+    }
+}
+
+/// Deliberate process-termination boundary used only by the executable crash fixture.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashPoint {
+    BeforeCommit,
+    AfterCommitBeforeResponse,
 }
 
 /// Borrowed operation identity used only by the internal storage spike.

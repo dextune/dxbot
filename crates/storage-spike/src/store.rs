@@ -4,13 +4,15 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{
-    OperationArtifactCounts, OperationEffect, OperationRequest, ReceiptDisposition, SpikeError,
-    SubmitOutcome,
+    CrashPoint, OperationArtifactCounts, OperationEffect, OperationRequest, ReceiptDisposition,
+    SpikeError, SubmitOutcome,
 };
 
 const SCHEMA_VERSION: i64 = 1;
 const WAL_AUTOCHECKPOINT_PAGES: i64 = 64;
 const JOURNAL_SIZE_LIMIT_BYTES: i64 = 262_144;
+const CRASH_EXIT_BEFORE_COMMIT: i32 = 86;
+const CRASH_EXIT_AFTER_COMMIT: i32 = 87;
 
 #[derive(Debug)]
 struct BindingRecord {
@@ -75,10 +77,26 @@ impl ReferenceStore {
         request: &OperationRequest<'_>,
         effect: &OperationEffect<'_>,
     ) -> Result<SubmitOutcome, SpikeError> {
-        if request.now > request.key_expires_at {
-            return Ok(SubmitOutcome::IdempotencyExpired);
-        }
+        self.submit_internal(request, effect, None)
+    }
 
+    /// Runs the same atomic submission path with a deliberate process crash boundary.
+    ///
+    /// This exists only for the executable M1A child-process fixture.
+    #[doc(hidden)]
+    pub fn submit_with_crash_point(
+        &mut self,
+        request: &OperationRequest<'_>,
+        effect: &OperationEffect<'_>,
+        crash_point: CrashPoint,
+    ) -> Result<SubmitOutcome, SpikeError> {
+        self.submit_internal(request, effect, Some(crash_point))
+    }
+
+    /// Compacts a terminal Receipt payload while retaining both identity tombstones.
+    ///
+    /// Returns `false` when no full Receipt exists or the Receipt is recoverable/nonterminal.
+    pub fn compact_terminal_receipt(&mut self, operation_id: &str) -> Result<bool, SpikeError> {
         let instance_id = self.instance_id.as_str();
         let host_generation = self.host_generation;
         let transaction = self
@@ -86,27 +104,51 @@ impl ReferenceStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         verify_writer_fence(&transaction, instance_id, host_generation)?;
 
-        let command_binding = lookup_command_binding(&transaction, request.command_id)?;
-        let principal_binding = lookup_principal_binding(
-            &transaction,
-            request.principal_ref,
-            request.idempotency_key_digest,
-        )?;
+        let disposition: Option<String> = transaction
+            .query_row(
+                "SELECT disposition FROM receipts WHERE operation_id = ?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(disposition) = disposition else {
+            return Ok(false);
+        };
+        let parsed = ReceiptDisposition::parse(&disposition)?;
+        if !parsed.is_terminal() {
+            return Ok(false);
+        }
 
-        match (command_binding, principal_binding) {
-            (None, None) => insert_new_operation(&transaction, request, effect)?,
-            (Some(command), Some(principal)) => {
-                let outcome = validate_existing_bindings(request, &command, &principal)?;
-                transaction.commit()?;
-                return Ok(outcome);
-            }
-            (Some(_), None) | (None, Some(_)) => return Err(SpikeError::IdempotencyConflict),
+        let command_rows = transaction.execute(
+            "UPDATE command_bindings \
+             SET terminal_disposition = ?2, compacted = 1 \
+             WHERE operation_id = ?1",
+            params![operation_id, disposition.as_str()],
+        )?;
+        let principal_rows = transaction.execute(
+            "UPDATE principal_bindings \
+             SET terminal_disposition = ?2, compacted = 1 \
+             WHERE operation_id = ?1",
+            params![operation_id, disposition.as_str()],
+        )?;
+        if command_rows != 1 || principal_rows != 1 {
+            return Err(SpikeError::InvariantViolation(
+                "terminal receipt does not have two binding indexes",
+            ));
+        }
+
+        let deleted = transaction.execute(
+            "DELETE FROM receipts WHERE operation_id = ?1",
+            [operation_id],
+        )?;
+        if deleted != 1 {
+            return Err(SpikeError::InvariantViolation(
+                "terminal receipt compaction lost receipt row",
+            ));
         }
 
         transaction.commit()?;
-        Ok(SubmitOutcome::Created {
-            operation_id: request.new_operation_id.to_owned(),
-        })
+        Ok(true)
     }
 
     /// Counts persisted artifacts tied to one operation identity.
@@ -159,6 +201,53 @@ impl ReferenceStore {
         Ok(self
             .connection
             .query_row("SELECT COUNT(*) FROM command_bindings", [], |row| row.get(0))?)
+    }
+
+    fn submit_internal(
+        &mut self,
+        request: &OperationRequest<'_>,
+        effect: &OperationEffect<'_>,
+        crash_point: Option<CrashPoint>,
+    ) -> Result<SubmitOutcome, SpikeError> {
+        if request.now > request.key_expires_at {
+            return Ok(SubmitOutcome::IdempotencyExpired);
+        }
+
+        let instance_id = self.instance_id.as_str();
+        let host_generation = self.host_generation;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_writer_fence(&transaction, instance_id, host_generation)?;
+
+        let command_binding = lookup_command_binding(&transaction, request.command_id)?;
+        let principal_binding = lookup_principal_binding(
+            &transaction,
+            request.principal_ref,
+            request.idempotency_key_digest,
+        )?;
+
+        let outcome = match (command_binding, principal_binding) {
+            (None, None) => {
+                insert_new_operation(&transaction, request, effect)?;
+                if crash_point == Some(CrashPoint::BeforeCommit) {
+                    std::process::exit(CRASH_EXIT_BEFORE_COMMIT);
+                }
+                SubmitOutcome::Created {
+                    operation_id: request.new_operation_id.to_owned(),
+                }
+            }
+            (Some(command), Some(principal)) => {
+                validate_existing_bindings(request, &command, &principal)?
+            }
+            (Some(_), None) | (None, Some(_)) => return Err(SpikeError::IdempotencyConflict),
+        };
+
+        transaction.commit()?;
+        if crash_point == Some(CrashPoint::AfterCommitBeforeResponse) {
+            std::process::exit(CRASH_EXIT_AFTER_COMMIT);
+        }
+        Ok(outcome)
     }
 }
 

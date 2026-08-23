@@ -7,8 +7,8 @@ use rusqlite::Connection;
 
 pub use store::ReferenceStore;
 pub use types::{
-    OperationArtifactCounts, OperationEffect, OperationRequest, ReceiptDisposition, SpikeError,
-    SubmitOutcome,
+    CrashPoint, OperationArtifactCounts, OperationEffect, OperationRequest, ReceiptDisposition,
+    SpikeError, SubmitOutcome,
 };
 
 /// Opens an in-memory SQLite connection for the isolated M1A storage spike.
