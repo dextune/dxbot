@@ -8,7 +8,7 @@ use storage_spike::{
     OperationArtifactCounts, ReceiptDisposition, ReferenceStore, SubmitOutcome,
 };
 
-use m1a_fixture::{database_path, effect, request};
+use m1a_fixture::{database_path, effect_for, request};
 
 #[test]
 fn crash_before_commit_leaves_no_partial_operation() -> Result<(), Box<dyn Error>> {
@@ -30,7 +30,7 @@ fn crash_before_commit_leaves_no_partial_operation() -> Result<(), Box<dyn Error
         "operation-a",
     );
     assert_eq!(
-        store.submit(&operation, &effect())?,
+        store.submit(&operation, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Created {
             operation_id: "operation-a".to_owned()
         }
@@ -58,7 +58,7 @@ fn crash_after_commit_recovers_existing_operation() -> Result<(), Box<dyn Error>
         "operation-b",
     );
     assert_eq!(
-        store.submit(&retry, &effect())?,
+        store.submit(&retry, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Existing {
             operation_id: "operation-a".to_owned(),
             disposition: ReceiptDisposition::Committed,

@@ -9,8 +9,9 @@ mod types;
 use rusqlite::Connection;
 
 pub use store::ReferenceStore;
+pub use dxbot_core::receipt::ReceiptDisposition;
 pub use types::{
-    CrashPoint, OperationArtifactCounts, OperationEffect, OperationRequest, ReceiptDisposition,
+    CrashPoint, OperationArtifactCounts, OperationEffect, OperationRequest,
     SnapshotBudget, SnapshotPage, SpikeError, StorageRuntimeProfile, SubmitOutcome,
 };
 

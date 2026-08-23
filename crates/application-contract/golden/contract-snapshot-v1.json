@@ -1,0 +1,2692 @@
+{
+  "command_total": 63,
+  "commands": [
+    {
+      "command_key": "runtime-start",
+      "input_schema": "in-runtime-start-v1",
+      "kind": "H",
+      "output_schema": "out-host-action-v1",
+      "security_class": "host-admin",
+      "target_schema": "tgt-instance-bootstrap-v1",
+      "typed_fields": [
+        {
+          "cardinality": "optional-one",
+          "default": "control",
+          "items": [
+            "process",
+            "storage",
+            "runtime",
+            "control"
+          ],
+          "name": "ready_at",
+          "source": "@local",
+          "type": "ReadyAt"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "timeout",
+          "source": "@local",
+          "type": "Duration"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "applied"
+        ],
+        "default": "applied"
+      }
+    },
+    {
+      "command_key": "runtime-status",
+      "input_schema": "in-runtime-status-v1",
+      "kind": "H/Q",
+      "output_schema": "out-host-status-v1",
+      "security_class": "read",
+      "target_schema": "tgt-instance-v1",
+      "typed_fields": [],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "runtime-stop-graceful",
+      "input_schema": "in-runtime-stop-graceful-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "host-admin",
+      "target_schema": "tgt-runtime-current-v1",
+      "typed_fields": [
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "reason",
+          "source": "@argv",
+          "type": "BoundedText"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "runtime-stop-host",
+      "input_schema": "in-runtime-stop-host-v1",
+      "kind": "H",
+      "output_schema": "out-host-action-v1",
+      "security_class": "host-admin",
+      "target_schema": "tgt-runtime-generation-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "host_stop",
+          "source": "@argv",
+          "type": "True"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_host_generation",
+          "source": "@argv",
+          "type": "HostGeneration"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "confirmation",
+          "source": "@local",
+          "type": "Confirmation"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "applied"
+        ],
+        "default": "applied"
+      }
+    },
+    {
+      "command_key": "runtime-doctor",
+      "input_schema": "in-runtime-doctor-v1",
+      "kind": "H/Q",
+      "output_schema": "out-diagnostic-stream-v1",
+      "security_class": "read",
+      "target_schema": "tgt-instance-v1",
+      "typed_fields": [
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "section",
+          "source": "@argv",
+          "type": "DoctorSection"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "version",
+      "input_schema": "in-version-v1",
+      "kind": "Q",
+      "output_schema": "out-version-v1",
+      "security_class": "read",
+      "target_schema": "tgt-instance-optional-v1",
+      "typed_fields": [],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "bot-create",
+      "input_schema": "in-bot-create-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-instance-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "name",
+          "source": "@argv",
+          "type": "BotName"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "brain_policy",
+          "source": "@argv",
+          "type": "PolicyRef"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "permission_policy",
+          "source": "@argv",
+          "type": "PolicyRef"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "resource_policy",
+          "source": "@argv",
+          "type": "PolicyRef"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "provider_policy",
+          "source": "@argv",
+          "type": "PolicyRef"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "bot-list",
+      "input_schema": "in-bot-list-v1",
+      "kind": "Q",
+      "output_schema": "out-bot-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-instance-v1",
+      "typed_fields": [
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "bot-show",
+      "input_schema": "in-bot-show-v1",
+      "kind": "Q",
+      "output_schema": "out-bot-v1",
+      "security_class": "read",
+      "target_schema": "tgt-bot-selector-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "bot",
+          "source": "@argv",
+          "type": "BotSelector"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "bot-activate",
+      "input_schema": "in-bot-activate-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-bot-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "bot",
+          "source": "@argv",
+          "type": "BotSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "bot-deactivate",
+      "input_schema": "in-bot-deactivate-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-bot-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "bot",
+          "source": "@argv",
+          "type": "BotSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "bot-archive",
+      "input_schema": "in-bot-archive-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "destructive",
+      "target_schema": "tgt-bot-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "bot",
+          "source": "@argv",
+          "type": "BotSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "confirmation",
+          "source": "@local",
+          "type": "Confirmation"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "bot-restore",
+      "input_schema": "in-bot-restore-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-bot-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "bot",
+          "source": "@argv",
+          "type": "BotSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "conversation-show",
+      "input_schema": "in-conversation-show-v1",
+      "kind": "Q",
+      "output_schema": "out-conversation-v1",
+      "security_class": "read",
+      "target_schema": "tgt-conversation-selector-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "conversation-id-or-bot-main"
+          ],
+          "name": "conversation",
+          "source": "@argv",
+          "type": "ConversationSelector"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "conversation-send",
+      "input_schema": "in-conversation-send-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-conversation-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "conversation-id-or-bot-main"
+          ],
+          "name": "conversation",
+          "source": "@argv",
+          "type": "ConversationSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "text",
+            "input-file",
+            "stdin",
+            "artifact-ref"
+          ],
+          "name": "content",
+          "source": "@oneof",
+          "type": "ContentSource"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "conversation-history",
+      "input_schema": "in-conversation-history-v1",
+      "kind": "Q",
+      "output_schema": "out-message-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-conversation-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "conversation-id-or-bot-main"
+          ],
+          "name": "conversation",
+          "source": "@argv",
+          "type": "ConversationSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "output",
+          "source": "@local",
+          "type": "SafeOutputPath"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "thread-create",
+      "input_schema": "in-thread-create-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-conversation-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "conversation-id-or-bot-main"
+          ],
+          "name": "conversation",
+          "source": "@argv",
+          "type": "ConversationSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "title",
+          "source": "@argv",
+          "type": "ThreadTitle"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "thread-list",
+      "input_schema": "in-thread-list-v1",
+      "kind": "Q",
+      "output_schema": "out-thread-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-conversation-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "conversation-id-or-bot-main"
+          ],
+          "name": "conversation",
+          "source": "@argv",
+          "type": "ConversationSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "thread-show",
+      "input_schema": "in-thread-show-v1",
+      "kind": "Q",
+      "output_schema": "out-thread-v1",
+      "security_class": "read",
+      "target_schema": "tgt-thread-parent-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "thread",
+          "source": "@argv",
+          "type": "ThreadSelector"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "thread-send",
+      "input_schema": "in-thread-send-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-thread-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "thread",
+          "source": "@argv",
+          "type": "ThreadSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "text",
+            "input-file",
+            "stdin",
+            "artifact-ref"
+          ],
+          "name": "content",
+          "source": "@oneof",
+          "type": "ContentSource"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "thread-history",
+      "input_schema": "in-thread-history-v1",
+      "kind": "Q",
+      "output_schema": "out-message-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-thread-parent-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "thread",
+          "source": "@argv",
+          "type": "ThreadSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "output",
+          "source": "@local",
+          "type": "SafeOutputPath"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "thread-branch",
+      "input_schema": "in-thread-branch-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-thread-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "thread",
+          "source": "@argv",
+          "type": "ThreadSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_source_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "message_id",
+          "source": "@argv",
+          "type": "MessageId"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "title",
+          "source": "@argv",
+          "type": "ThreadTitle"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "task-submit",
+      "input_schema": "in-task-submit-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-task-owner-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "bot-project-or-channel"
+          ],
+          "name": "owner",
+          "source": "@argv",
+          "type": "ScopeSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_scope_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "text",
+            "input-file",
+            "stdin",
+            "artifact-ref"
+          ],
+          "name": "intent",
+          "source": "@oneof",
+          "type": "ContentSource"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "delegate_to_bot",
+          "source": "@argv",
+          "type": "BotSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [
+            "operator-request-only"
+          ],
+          "name": "requested_sender_bot",
+          "source": "@argv",
+          "type": "BotSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "deadline",
+          "source": "@argv",
+          "type": "Deadline"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "budget",
+          "source": "@argv",
+          "type": "BudgetRef"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "task-list",
+      "input_schema": "in-task-list-v1",
+      "kind": "Q",
+      "output_schema": "out-task-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-scope-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "bot-project-or-channel"
+          ],
+          "name": "scope",
+          "source": "@argv",
+          "type": "ScopeSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "state",
+          "source": "@argv",
+          "type": "TaskState"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "task-show",
+      "input_schema": "in-task-show-v1",
+      "kind": "Q",
+      "output_schema": "out-task-v1",
+      "security_class": "read",
+      "target_schema": "tgt-task-selector-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "task",
+          "source": "@argv",
+          "type": "TaskSelector"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "task-watch",
+      "input_schema": "in-task-watch-v1",
+      "kind": "S",
+      "output_schema": "out-task-stream-v1",
+      "security_class": "read",
+      "target_schema": "tgt-task-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "task",
+          "source": "@argv",
+          "type": "TaskSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "follow"
+        ],
+        "default": "follow"
+      }
+    },
+    {
+      "command_key": "task-cancel",
+      "input_schema": "in-task-cancel-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "destructive",
+      "target_schema": "tgt-task-generation-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "task",
+          "source": "@argv",
+          "type": "TaskSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_execution_generation",
+          "source": "@argv",
+          "type": "Generation"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "reason",
+          "source": "@argv",
+          "type": "BoundedText"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed",
+          "applied"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "task-suspend",
+      "input_schema": "in-task-suspend-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-task-generation-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "task",
+          "source": "@argv",
+          "type": "TaskSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_execution_generation",
+          "source": "@argv",
+          "type": "Generation"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "reason",
+          "source": "@argv",
+          "type": "BoundedText"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed",
+          "applied"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "task-resume",
+      "input_schema": "in-task-resume-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-task-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "task",
+          "source": "@argv",
+          "type": "TaskSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed",
+          "applied"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "task-redirect",
+      "input_schema": "in-task-redirect-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "destructive",
+      "target_schema": "tgt-task-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "task",
+          "source": "@argv",
+          "type": "TaskSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "text",
+            "input-file",
+            "stdin",
+            "artifact-ref"
+          ],
+          "name": "replacement",
+          "source": "@oneof",
+          "type": "ContentSource"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed",
+          "applied"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "task-result",
+      "input_schema": "in-task-result-v1",
+      "kind": "Q",
+      "output_schema": "out-task-result-v1",
+      "security_class": "read",
+      "target_schema": "tgt-task-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "task",
+          "source": "@argv",
+          "type": "TaskSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "artifact_id",
+          "source": "@argv",
+          "type": "ArtifactId"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "output",
+          "source": "@local",
+          "type": "SafeOutputPath"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "memory-get",
+      "input_schema": "in-memory-get-v1",
+      "kind": "Q",
+      "output_schema": "out-memory-v1",
+      "security_class": "read",
+      "target_schema": "tgt-memory-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "memory",
+          "source": "@argv",
+          "type": "MemorySelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "scope",
+          "source": "@argv",
+          "type": "MemoryScopeSelector"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "memory-search",
+      "input_schema": "in-memory-search-v1",
+      "kind": "Q",
+      "output_schema": "out-memory-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-memory-scope-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "scope",
+          "source": "@argv",
+          "type": "MemoryScopeSelector"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "query",
+          "source": "@argv",
+          "type": "BoundedText"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "memory-history",
+      "input_schema": "in-memory-history-v1",
+      "kind": "Q",
+      "output_schema": "out-memory-history-v1",
+      "security_class": "read",
+      "target_schema": "tgt-memory-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "memory",
+          "source": "@argv",
+          "type": "MemorySelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "memory-propose",
+      "input_schema": "in-memory-propose-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-memory-scope-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "scope",
+          "source": "@argv",
+          "type": "MemoryScopeSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_scope_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "text",
+            "input-file",
+            "stdin",
+            "artifact-ref"
+          ],
+          "name": "statement",
+          "source": "@oneof",
+          "type": "ContentSource"
+        },
+        {
+          "cardinality": "zero-or-more",
+          "default": null,
+          "items": [],
+          "name": "evidence",
+          "source": "@argv",
+          "type": "EvidenceRef"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "memory-promote",
+      "input_schema": "in-memory-promote-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "high-risk",
+      "target_schema": "tgt-memory-promotion-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "proposal",
+          "source": "@argv",
+          "type": "MemorySelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_proposal_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "target_scope",
+          "source": "@argv",
+          "type": "MemoryScopeSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_target_scope_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "one-or-more",
+          "default": null,
+          "items": [],
+          "name": "evidence",
+          "source": "@argv",
+          "type": "EvidenceRef"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "declassification_ref",
+          "source": "@argv",
+          "type": "DecisionRef"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "project-create",
+      "input_schema": "in-project-create-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-instance-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "name",
+          "source": "@argv",
+          "type": "ProjectName"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "owner_bot",
+          "source": "@argv",
+          "type": "BotSelector"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "project-list",
+      "input_schema": "in-project-list-v1",
+      "kind": "Q",
+      "output_schema": "out-project-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-instance-v1",
+      "typed_fields": [
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "project-show",
+      "input_schema": "in-project-show-v1",
+      "kind": "Q",
+      "output_schema": "out-project-v1",
+      "security_class": "read",
+      "target_schema": "tgt-project-selector-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-visible-exact"
+          ],
+          "name": "project",
+          "source": "@argv",
+          "type": "ProjectSelector"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "project-archive",
+      "input_schema": "in-project-archive-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "destructive",
+      "target_schema": "tgt-project-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-visible-exact"
+          ],
+          "name": "project",
+          "source": "@argv",
+          "type": "ProjectSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "confirmation",
+          "source": "@local",
+          "type": "Confirmation"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "project-restore",
+      "input_schema": "in-project-restore-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-project-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-visible-exact"
+          ],
+          "name": "project",
+          "source": "@argv",
+          "type": "ProjectSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "project-member-set",
+      "input_schema": "in-project-member-set-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "high-risk",
+      "target_schema": "tgt-project-membership-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-visible-exact"
+          ],
+          "name": "project",
+          "source": "@argv",
+          "type": "ProjectSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_project_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "member_bot",
+          "source": "@argv",
+          "type": "BotSelector"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "role_ref",
+          "source": "@argv",
+          "type": "RoleRef"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_membership_generation",
+          "source": "@argv",
+          "type": "GenerationOrAbsent"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "project-member-remove",
+      "input_schema": "in-project-member-remove-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "high-risk",
+      "target_schema": "tgt-project-membership-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-visible-exact"
+          ],
+          "name": "project",
+          "source": "@argv",
+          "type": "ProjectSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_project_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "member_bot",
+          "source": "@argv",
+          "type": "BotSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_membership_generation",
+          "source": "@argv",
+          "type": "Generation"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "project-member-list",
+      "input_schema": "in-project-member-list-v1",
+      "kind": "Q",
+      "output_schema": "out-membership-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-project-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-visible-exact"
+          ],
+          "name": "project",
+          "source": "@argv",
+          "type": "ProjectSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "channel-create",
+      "input_schema": "in-channel-create-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "mutate",
+      "target_schema": "tgt-project-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-visible-exact"
+          ],
+          "name": "project",
+          "source": "@argv",
+          "type": "ProjectSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_project_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "name",
+          "source": "@argv",
+          "type": "ChannelName"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "channel-list",
+      "input_schema": "in-channel-list-v1",
+      "kind": "Q",
+      "output_schema": "out-channel-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-project-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-visible-exact"
+          ],
+          "name": "project",
+          "source": "@argv",
+          "type": "ProjectSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "channel-show",
+      "input_schema": "in-channel-show-v1",
+      "kind": "Q",
+      "output_schema": "out-channel-v1",
+      "security_class": "read",
+      "target_schema": "tgt-channel-project-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-project-exact"
+          ],
+          "name": "channel",
+          "source": "@argv",
+          "type": "ChannelSelector"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "channel-member-set",
+      "input_schema": "in-channel-member-set-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "high-risk",
+      "target_schema": "tgt-channel-membership-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-project-exact"
+          ],
+          "name": "channel",
+          "source": "@argv",
+          "type": "ChannelSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_channel_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "member_bot",
+          "source": "@argv",
+          "type": "BotSelector"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [],
+          "name": "role_ref",
+          "source": "@argv",
+          "type": "RoleRef"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_membership_generation",
+          "source": "@argv",
+          "type": "GenerationOrAbsent"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "channel-member-remove",
+      "input_schema": "in-channel-member-remove-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "high-risk",
+      "target_schema": "tgt-channel-membership-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-project-exact"
+          ],
+          "name": "channel",
+          "source": "@argv",
+          "type": "ChannelSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_channel_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "member_bot",
+          "source": "@argv",
+          "type": "BotSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_membership_generation",
+          "source": "@argv",
+          "type": "Generation"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "channel-member-list",
+      "input_schema": "in-channel-member-list-v1",
+      "kind": "Q",
+      "output_schema": "out-membership-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-channel-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-project-exact"
+          ],
+          "name": "channel",
+          "source": "@argv",
+          "type": "ChannelSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "channel-send",
+      "input_schema": "in-channel-send-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "high-risk",
+      "target_schema": "tgt-conversation-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-project-exact"
+          ],
+          "name": "channel",
+          "source": "@argv",
+          "type": "ChannelSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "text",
+            "input-file",
+            "stdin",
+            "artifact-ref"
+          ],
+          "name": "content",
+          "source": "@oneof",
+          "type": "ContentSource"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "channel-history",
+      "input_schema": "in-channel-history-v1",
+      "kind": "Q",
+      "output_schema": "out-message-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-conversation-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-project-exact"
+          ],
+          "name": "channel",
+          "source": "@argv",
+          "type": "ChannelSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "output",
+          "source": "@local",
+          "type": "SafeOutputPath"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "process-show",
+      "input_schema": "in-process-show-v1",
+      "kind": "Q",
+      "output_schema": "out-process-v1",
+      "security_class": "read",
+      "target_schema": "tgt-process-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "process",
+          "source": "@argv",
+          "type": "ProcessSelector"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "process-watch",
+      "input_schema": "in-process-watch-v1",
+      "kind": "S",
+      "output_schema": "out-process-stream-v1",
+      "security_class": "read",
+      "target_schema": "tgt-process-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-scoped-exact"
+          ],
+          "name": "process",
+          "source": "@argv",
+          "type": "ProcessSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "follow"
+        ],
+        "default": "follow"
+      }
+    },
+    {
+      "command_key": "operation-show",
+      "input_schema": "in-operation-show-v1",
+      "kind": "Q",
+      "output_schema": "out-receipt-v1",
+      "security_class": "recovery",
+      "target_schema": "tgt-operation-key-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "operation-command-or-idempotency"
+          ],
+          "name": "operation",
+          "source": "@argv",
+          "type": "OperationSelector"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "operation-reconcile",
+      "input_schema": "in-operation-reconcile-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "recovery",
+      "target_schema": "tgt-operation-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "operation-command-or-idempotency"
+          ],
+          "name": "operation",
+          "source": "@argv",
+          "type": "OperationSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_receipt_revision",
+          "source": "@argv",
+          "type": "Revision"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "approval-list",
+      "input_schema": "in-approval-list-v1",
+      "kind": "Q",
+      "output_schema": "out-approval-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-principal-scope-v1",
+      "typed_fields": [
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "scope",
+          "source": "@argv",
+          "type": "ScopeSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "state",
+          "source": "@argv",
+          "type": "ApprovalState"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "approval-show",
+      "input_schema": "in-approval-show-v1",
+      "kind": "Q",
+      "output_schema": "out-approval-v1",
+      "security_class": "read",
+      "target_schema": "tgt-approval-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-operation"
+          ],
+          "name": "approval",
+          "source": "@argv",
+          "type": "ApprovalSelector"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "approval-approve",
+      "input_schema": "in-approval-approve-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "security-decision",
+      "target_schema": "tgt-approval-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-operation"
+          ],
+          "name": "approval",
+          "source": "@argv",
+          "type": "ApprovalSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "approval-deny",
+      "input_schema": "in-approval-deny-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "security-decision",
+      "target_schema": "tgt-approval-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-operation"
+          ],
+          "name": "approval",
+          "source": "@argv",
+          "type": "ApprovalSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "reason",
+          "source": "@argv",
+          "type": "BoundedText"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    },
+    {
+      "command_key": "provider-list",
+      "input_schema": "in-provider-list-v1",
+      "kind": "Q",
+      "output_schema": "out-provider-page-v1",
+      "security_class": "read",
+      "target_schema": "tgt-instance-v1",
+      "typed_fields": [
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "capability",
+          "source": "@argv",
+          "type": "CapabilityId"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "page_size",
+          "source": "@argv",
+          "type": "PageSize"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "cursor",
+          "source": "@argv",
+          "type": "Cursor"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "all",
+          "source": "@local",
+          "type": "Bool"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "provider-show",
+      "input_schema": "in-provider-show-v1",
+      "kind": "Q",
+      "output_schema": "out-provider-v1",
+      "security_class": "read",
+      "target_schema": "tgt-provider-generation-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-exact"
+          ],
+          "name": "provider",
+          "source": "@argv",
+          "type": "ProviderSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_generation",
+          "source": "@argv",
+          "type": "Generation"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "immediate"
+        ],
+        "default": "immediate"
+      }
+    },
+    {
+      "command_key": "side-effect-reconcile",
+      "input_schema": "in-side-effect-reconcile-v1",
+      "kind": "C",
+      "output_schema": "out-operation-v1",
+      "security_class": "high-risk",
+      "target_schema": "tgt-side-effect-revision-v1",
+      "typed_fields": [
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "canonical-id-or-operation"
+          ],
+          "name": "side_effect",
+          "source": "@argv",
+          "type": "SideEffectSelector"
+        },
+        {
+          "cardinality": "optional-one",
+          "default": null,
+          "items": [],
+          "name": "if_revision",
+          "source": "@argv",
+          "type": "Revision"
+        },
+        {
+          "cardinality": "required-one",
+          "default": null,
+          "items": [
+            "confirm",
+            "fail",
+            "manual"
+          ],
+          "name": "action",
+          "source": "@argv",
+          "type": "ReconcileAction"
+        },
+        {
+          "cardinality": "one-or-more",
+          "default": null,
+          "items": [],
+          "name": "evidence",
+          "source": "@argv",
+          "type": "EvidenceRef"
+        }
+      ],
+      "wait": {
+        "allowed": [
+          "accepted",
+          "committed"
+        ],
+        "default": "committed"
+      }
+    }
+  ],
+  "generator": "application-contract::golden::generate_snapshot",
+  "snapshot_version": 1
+}

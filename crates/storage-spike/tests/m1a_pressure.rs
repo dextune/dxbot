@@ -6,7 +6,7 @@ use storage_spike::{
     SubmitOutcome,
 };
 
-use m1a_fixture::{database_path, effect, request};
+use m1a_fixture::{database_path, effect_for, request};
 
 #[test]
 fn runtime_profile_applies_wal_and_temp_bounds() -> Result<(), SpikeError> {
@@ -34,7 +34,7 @@ fn disk_full_preserves_committed_operation_and_rejects_new_work() -> Result<(), 
         "operation-committed",
     );
     assert!(matches!(
-        store.submit(&committed, &effect())?,
+        store.submit(&committed, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Created { .. }
     ));
 
@@ -72,7 +72,7 @@ fn disk_full_preserves_committed_operation_and_rejects_new_work() -> Result<(), 
         "operation-retry",
     );
     assert_eq!(
-        reopened.submit(&committed_retry, &effect())?,
+        reopened.submit(&committed_retry, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Existing {
             operation_id: "operation-committed".to_owned(),
             disposition: ReceiptDisposition::Committed,

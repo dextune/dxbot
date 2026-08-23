@@ -6,9 +6,9 @@ use crate::schema::{
     configure_connection, initialize_schema, initialize_writer_fence, verify_writer_fence,
 };
 use crate::{
-    CrashPoint, OperationArtifactCounts, OperationEffect, OperationRequest, ReceiptDisposition,
-    SpikeError, SubmitOutcome,
+    CrashPoint, OperationArtifactCounts, OperationEffect, OperationRequest, SpikeError, SubmitOutcome,
 };
+use dxbot_core::receipt::ReceiptDisposition;
 
 const CRASH_EXIT_BEFORE_COMMIT: i32 = 86;
 const CRASH_EXIT_AFTER_COMMIT: i32 = 87;
@@ -353,7 +353,7 @@ fn validate_existing_bindings(
             .ok_or(SpikeError::InvariantViolation(
                 "compacted binding is missing terminal disposition",
             ))
-            .and_then(ReceiptDisposition::parse)?
+            .and_then(|s| ReceiptDisposition::parse(s).map_err(Into::into))?
     } else {
         let receipt_disposition: Option<String> = transaction
             .query_row(

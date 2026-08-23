@@ -1,41 +1,6 @@
 use std::fmt;
 
-/// An operation receipt disposition used by the executable M1A storage proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReceiptDisposition {
-    Accepted,
-    Committed,
-    Rejected,
-    Superseded,
-    RecoveryRequired,
-}
-
-impl ReceiptDisposition {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Accepted => "accepted",
-            Self::Committed => "committed",
-            Self::Rejected => "rejected",
-            Self::Superseded => "superseded",
-            Self::RecoveryRequired => "recovery-required",
-        }
-    }
-
-    pub(crate) fn parse(value: &str) -> Result<Self, SpikeError> {
-        match value {
-            "accepted" => Ok(Self::Accepted),
-            "committed" => Ok(Self::Committed),
-            "rejected" => Ok(Self::Rejected),
-            "superseded" => Ok(Self::Superseded),
-            "recovery-required" => Ok(Self::RecoveryRequired),
-            _ => Err(SpikeError::InvariantViolation("unknown receipt disposition")),
-        }
-    }
-
-    pub(crate) const fn is_terminal(self) -> bool {
-        matches!(self, Self::Committed | Self::Rejected | Self::Superseded)
-    }
-}
+use dxbot_core::receipt::ReceiptDisposition;
 
 /// Deliberate process-termination boundary used only by the executable crash fixture.
 #[doc(hidden)]
@@ -150,6 +115,16 @@ impl From<rusqlite::Error> for SpikeError {
         } else {
             Self::Sqlite(error)
         }
+    }
+}
+
+impl From<dxbot_core::DxbotError> for SpikeError {
+    fn from(error: dxbot_core::DxbotError) -> Self {
+        Self::InvariantViolation(
+            Box::leak(
+                format!("core domain error in storage spike: {}", error.message).into_boxed_str()
+            )
+        )
     }
 }
 

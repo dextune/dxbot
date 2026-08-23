@@ -6,7 +6,7 @@ use storage_spike::{
     OperationArtifactCounts, ReceiptDisposition, ReferenceStore, SpikeError, SubmitOutcome,
 };
 
-use m1a_fixture::{database_path, effect, request};
+use m1a_fixture::{database_path, effect_for, request};
 
 #[test]
 fn atomic_submission_writes_all_required_artifacts() -> Result<(), SpikeError> {
@@ -21,7 +21,7 @@ fn atomic_submission_writes_all_required_artifacts() -> Result<(), SpikeError> {
     );
 
     assert_eq!(
-        store.submit(&operation, &effect())?,
+        store.submit(&operation, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Created {
             operation_id: "operation-a".to_owned()
         }
@@ -61,11 +61,11 @@ fn idempotency_same_key_same_digest_returns_existing_operation() -> Result<(), S
     );
 
     assert!(matches!(
-        store.submit(&first, &effect())?,
+        store.submit(&first, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Created { .. }
     ));
     assert_eq!(
-        store.submit(&retry, &effect())?,
+        store.submit(&retry, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Existing {
             operation_id: "operation-a".to_owned(),
             disposition: ReceiptDisposition::Committed,
@@ -95,9 +95,9 @@ fn idempotency_same_key_different_digest_conflicts_without_creation() -> Result<
         "operation-b",
     );
 
-    store.submit(&first, &effect())?;
+    store.submit(&first, &effect_for("bot-1", "state-v1"))?;
     assert!(matches!(
-        store.submit(&conflicting, &effect()),
+        store.submit(&conflicting, &effect_for("bot-1", "state-v1")),
         Err(SpikeError::IdempotencyConflict)
     ));
     assert_eq!(store.operation_count()?, 1);
@@ -123,9 +123,9 @@ fn idempotency_same_command_different_key_conflicts_without_creation() -> Result
         "operation-b",
     );
 
-    store.submit(&first, &effect())?;
+    store.submit(&first, &effect_for("bot-1", "state-v1"))?;
     assert!(matches!(
-        store.submit(&conflicting, &effect()),
+        store.submit(&conflicting, &effect_for("bot-1", "state-v1")),
         Err(SpikeError::IdempotencyConflict)
     ));
     assert_eq!(store.operation_count()?, 1);
@@ -151,9 +151,9 @@ fn idempotency_command_reuse_across_principals_conflicts() -> Result<(), SpikeEr
         "operation-b",
     );
 
-    store.submit(&first, &effect())?;
+    store.submit(&first, &effect_for("bot-1", "state-v1"))?;
     assert!(matches!(
-        store.submit(&conflicting, &effect()),
+        store.submit(&conflicting, &effect_for("bot-1", "state-v1")),
         Err(SpikeError::IdempotencyConflict)
     ));
     assert_eq!(store.operation_count()?, 1);
@@ -180,11 +180,11 @@ fn principal_scoped_same_key_digest_can_be_distinct() -> Result<(), SpikeError> 
     );
 
     assert!(matches!(
-        store.submit(&first, &effect())?,
+        store.submit(&first, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Created { .. }
     ));
     assert!(matches!(
-        store.submit(&second, &effect())?,
+        store.submit(&second, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Created { .. }
     ));
     assert_eq!(store.operation_count()?, 2);
@@ -211,9 +211,9 @@ fn idempotency_key_principal_scope_mismatch_conflicts_without_creation() -> Resu
     );
     conflicting.idempotency_key_principal_ref = "principal-a";
 
-    store.submit(&first, &effect())?;
+    store.submit(&first, &effect_for("bot-1", "state-v1"))?;
     assert!(matches!(
-        store.submit(&conflicting, &effect()),
+        store.submit(&conflicting, &effect_for("bot-1", "state-v1")),
         Err(SpikeError::IdempotencyConflict)
     ));
     assert_eq!(store.operation_count()?, 1);
@@ -239,9 +239,9 @@ fn idempotency_principal_key_reuse_with_new_command_conflicts() -> Result<(), Sp
         "operation-b",
     );
 
-    store.submit(&first, &effect())?;
+    store.submit(&first, &effect_for("bot-1", "state-v1"))?;
     assert!(matches!(
-        store.submit(&conflicting, &effect()),
+        store.submit(&conflicting, &effect_for("bot-1", "state-v1")),
         Err(SpikeError::IdempotencyConflict)
     ));
     assert_eq!(store.operation_count()?, 1);
@@ -259,7 +259,7 @@ fn one_sided_binding_index_is_conflict_not_absence() -> Result<(), SpikeError> {
         "request-a",
         "operation-a",
     );
-    store.submit(&first, &effect())?;
+    store.submit(&first, &effect_for("bot-1", "state-v1"))?;
     drop(store);
 
     {
@@ -280,7 +280,7 @@ fn one_sided_binding_index_is_conflict_not_absence() -> Result<(), SpikeError> {
         "operation-b",
     );
     assert!(matches!(
-        reopened.submit(&retry, &effect()),
+        reopened.submit(&retry, &effect_for("bot-1", "state-v1")),
         Err(SpikeError::IdempotencyConflict)
     ));
     assert_eq!(reopened.operation_count()?, 1);
@@ -301,7 +301,7 @@ fn idempotency_horizon_boundary_is_inclusive_then_expires() -> Result<(), SpikeE
     at_boundary.now = 100;
     at_boundary.key_expires_at = 100;
     assert!(matches!(
-        store.submit(&at_boundary, &effect())?,
+        store.submit(&at_boundary, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Created { .. }
     ));
 
@@ -315,7 +315,7 @@ fn idempotency_horizon_boundary_is_inclusive_then_expires() -> Result<(), SpikeE
     after_boundary.now = 101;
     after_boundary.key_expires_at = 100;
     assert_eq!(
-        store.submit(&after_boundary, &effect())?,
+        store.submit(&after_boundary, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::IdempotencyExpired
     );
     assert_eq!(store.operation_count()?, 1);
@@ -336,7 +336,7 @@ fn idempotency_expired_key_never_creates_operation() -> Result<(), SpikeError> {
     expired.now = 101;
 
     assert_eq!(
-        store.submit(&expired, &effect())?,
+        store.submit(&expired, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::IdempotencyExpired
     );
     assert_eq!(store.operation_count()?, 0);
@@ -357,7 +357,7 @@ fn stale_writer_generation_is_fenced() -> Result<(), SpikeError> {
     );
 
     assert!(matches!(
-        stale_store.submit(&operation, &effect()),
+        stale_store.submit(&operation, &effect_for("bot-1", "state-v1")),
         Err(SpikeError::StaleWriter)
     ));
     Ok(())

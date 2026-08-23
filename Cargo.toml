@@ -1,5 +1,18 @@
 [workspace]
-members = ["crates/storage-spike"]
+members = [
+    "crates/storage-spike",
+    "crates/dxbot-core",
+    "crates/application-contract",
+    "crates/control-client",
+    "crates/application",
+    "crates/cli",
+    "crates/runtime-bootstrap",
+    "crates/runtime-security",
+    "crates/runtime-audit",
+    "crates/runtime-host",
+    "crates/control-server",
+    "crates/provider-host",
+]
 resolver = "3"
 
 [workspace.package]

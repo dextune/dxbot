@@ -5,9 +5,9 @@ version: "0.8.10"
 status: "Accepted"
 normative: true
 priority: "P0"
-last_updated: "2026-08-23"
-depends_on: ["DXB-BASE-000", "DXB-GOV-005", "DXB-IFC-043", "DXB-DEL-061", "DXB-DEL-062", "DXB-ENG-052", "DXB-ENG-054"]
-review_revision: 10
+last_updated: "2026-08-23 (added DXB-DEL-065 review fix plan)"
+depends_on: ["DXB-BASE-000", "DXB-GOV-005", "DXB-IFC-043", "DXB-DEL-061", "DXB-DEL-062", "DXB-DEL-065", "DXB-ENG-052", "DXB-ENG-054"]
+review_revision: 11
 adversarial_review_rounds: 5
 final_rechecks: 2
 ---
@@ -19,7 +19,7 @@ plan_version: 0.8.10
 review_revision: 10
 adversarial_review_rounds: 5
 final_rechecks: 2
-markdown_count: 51
+markdown_count: 52
 parent_plan_commit: 4f42cfa9e413aa306dc9bcfc7538f00e6763b3e6
 source_baseline_commit: 5b55b67fbaaf0f3192c126865e8b665ff26fc5aa
 <!-- manifest-machine:end -->

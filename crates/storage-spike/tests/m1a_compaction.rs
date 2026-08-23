@@ -5,7 +5,7 @@ use storage_spike::{
     OperationArtifactCounts, ReceiptDisposition, ReferenceStore, SpikeError, SubmitOutcome,
 };
 
-use m1a_fixture::{database_path, effect, request};
+use m1a_fixture::{database_path, effect_for, request};
 
 #[test]
 fn compacted_receipt_keeps_two_binding_tombstones() -> Result<(), SpikeError> {
@@ -18,7 +18,7 @@ fn compacted_receipt_keeps_two_binding_tombstones() -> Result<(), SpikeError> {
         "request-a",
         "operation-a",
     );
-    store.submit(&operation, &effect())?;
+    store.submit(&operation, &effect_for("bot-1", "state-v1"))?;
 
     assert!(store.compact_terminal_receipt("operation-a")?);
     assert_eq!(
@@ -42,7 +42,7 @@ fn compacted_receipt_keeps_two_binding_tombstones() -> Result<(), SpikeError> {
         "operation-b",
     );
     assert_eq!(
-        store.submit(&retry, &effect())?,
+        store.submit(&retry, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Existing {
             operation_id: "operation-a".to_owned(),
             disposition: ReceiptDisposition::Committed,
@@ -64,7 +64,7 @@ fn stored_tombstone_horizon_is_inclusive_then_expires_without_new_mutation() -> 
         "request-a",
         "operation-a",
     );
-    store.submit(&operation, &effect())?;
+    store.submit(&operation, &effect_for("bot-1", "state-v1"))?;
     assert!(store.compact_terminal_receipt("operation-a")?);
 
     let mut boundary_retry = request(
@@ -77,7 +77,7 @@ fn stored_tombstone_horizon_is_inclusive_then_expires_without_new_mutation() -> 
     boundary_retry.now = 100;
     boundary_retry.key_expires_at = 200;
     assert_eq!(
-        store.submit(&boundary_retry, &effect())?,
+        store.submit(&boundary_retry, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Existing {
             operation_id: "operation-a".to_owned(),
             disposition: ReceiptDisposition::Committed,
@@ -95,7 +95,7 @@ fn stored_tombstone_horizon_is_inclusive_then_expires_without_new_mutation() -> 
     expired_retry.now = 101;
     expired_retry.key_expires_at = 200;
     assert_eq!(
-        store.submit(&expired_retry, &effect())?,
+        store.submit(&expired_retry, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::IdempotencyExpired
     );
     assert_eq!(store.operation_count()?, 1);

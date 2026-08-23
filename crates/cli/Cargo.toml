@@ -1,0 +1,25 @@
+[package]
+name = "cli"
+version = "0.1.0"
+description = "DXBOT CLI: local journal, single-writer takeover, hash chain, bounded retention."
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "dxb"
+path = "src/main.rs"
+
+[[bin]]
+name = "journal-helper"
+path = "src/bin/journal_helper.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+dxbot-core = { path = "../dxbot-core" }
+application-contract = { path = "../application-contract" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

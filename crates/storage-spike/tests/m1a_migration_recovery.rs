@@ -8,7 +8,7 @@ use storage_spike::{
     ReceiptDisposition, ReferenceStore, SnapshotBudget, SubmitOutcome,
 };
 
-use m1a_fixture::{database_path, effect, request};
+use m1a_fixture::{database_path, effect_for, request};
 
 #[test]
 fn v1_fixture_migrates_and_orphan_receipt_requires_recovery() -> Result<(), Box<dyn Error>> {
@@ -29,7 +29,7 @@ fn v1_fixture_migrates_and_orphan_receipt_requires_recovery() -> Result<(), Box<
         "operation-new",
     );
     assert_eq!(
-        store.submit(&retry, &effect())?,
+        store.submit(&retry, &effect_for("bot-1", "state-v1"))?,
         SubmitOutcome::Existing {
             operation_id: "operation-old".to_owned(),
             disposition: ReceiptDisposition::RecoveryRequired,

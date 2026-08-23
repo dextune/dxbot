@@ -1,0 +1,17 @@
+[package]
+name = "runtime-host"
+version = "0.1.0"
+description = "DXBOT runtime host: start/status/graceful stop/explicit host stop fencing."
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dxbot-core = { path = "../dxbot-core" }
+runtime-bootstrap = { path = "../runtime-bootstrap" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
