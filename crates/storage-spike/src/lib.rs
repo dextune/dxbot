@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod pressure;
 mod schema;
 mod snapshot;
 mod store;
@@ -10,7 +11,7 @@ use rusqlite::Connection;
 pub use store::ReferenceStore;
 pub use types::{
     CrashPoint, OperationArtifactCounts, OperationEffect, OperationRequest, ReceiptDisposition,
-    SnapshotBudget, SnapshotPage, SpikeError, SubmitOutcome,
+    SnapshotBudget, SnapshotPage, SpikeError, StorageRuntimeProfile, SubmitOutcome,
 };
 
 /// Opens an in-memory SQLite connection for the isolated M1A storage spike.

@@ -96,10 +96,21 @@ pub struct SnapshotPage {
     pub next_cursor: Option<i64>,
 }
 
+/// Effective SQLite settings that bound noncanonical storage growth in the M1A proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageRuntimeProfile {
+    pub journal_mode: String,
+    pub synchronous: i64,
+    pub wal_autocheckpoint_pages: i64,
+    pub journal_size_limit_bytes: i64,
+    pub temp_store_memory: bool,
+}
+
 /// Errors with stable semantic meaning inside the isolated M1A storage spike.
 #[derive(Debug)]
 pub enum SpikeError {
     Sqlite(rusqlite::Error),
+    StorageFull,
     IdempotencyConflict,
     StaleWriter,
     UnsupportedSchema(i64),
@@ -113,6 +124,7 @@ impl fmt::Display for SpikeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Sqlite(error) => write!(formatter, "sqlite error: {error}"),
+            Self::StorageFull => formatter.write_str("storage capacity exhausted"),
             Self::IdempotencyConflict => formatter.write_str("idempotency conflict"),
             Self::StaleWriter => formatter.write_str("stale writer fence"),
             Self::UnsupportedSchema(version) => {
@@ -132,7 +144,11 @@ impl std::error::Error for SpikeError {}
 
 impl From<rusqlite::Error> for SpikeError {
     fn from(error: rusqlite::Error) -> Self {
-        Self::Sqlite(error)
+        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
+            Self::StorageFull
+        } else {
+            Self::Sqlite(error)
+        }
     }
 }
 
