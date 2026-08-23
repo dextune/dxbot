@@ -1,8 +1,9 @@
 use std::fmt;
 
-/// A terminal or recoverable operation receipt disposition used by the M1A spike.
+/// An operation receipt disposition used by the executable M1A storage proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiptDisposition {
+    Accepted,
     Committed,
     Rejected,
     Superseded,
@@ -12,6 +13,7 @@ pub enum ReceiptDisposition {
 impl ReceiptDisposition {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::Accepted => "accepted",
             Self::Committed => "committed",
             Self::Rejected => "rejected",
             Self::Superseded => "superseded",
@@ -21,6 +23,7 @@ impl ReceiptDisposition {
 
     pub(crate) fn parse(value: &str) -> Result<Self, SpikeError> {
         match value {
+            "accepted" => Ok(Self::Accepted),
             "committed" => Ok(Self::Committed),
             "rejected" => Ok(Self::Rejected),
             "superseded" => Ok(Self::Superseded),
@@ -30,7 +33,7 @@ impl ReceiptDisposition {
     }
 
     pub(crate) const fn is_terminal(self) -> bool {
-        !matches!(self, Self::RecoveryRequired)
+        matches!(self, Self::Committed | Self::Rejected | Self::Superseded)
     }
 }
 
@@ -78,6 +81,21 @@ pub enum SubmitOutcome {
     IdempotencyExpired,
 }
 
+/// Hard request budget for a bounded materialized-keyset snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotBudget {
+    pub max_items: usize,
+    pub max_retained_bytes: usize,
+}
+
+/// One bounded page from a durable snapshot keyset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotPage {
+    pub projection_watermark: i64,
+    pub items: Vec<String>,
+    pub next_cursor: Option<i64>,
+}
+
 /// Errors with stable semantic meaning inside the isolated M1A storage spike.
 #[derive(Debug)]
 pub enum SpikeError {
@@ -85,6 +103,9 @@ pub enum SpikeError {
     IdempotencyConflict,
     StaleWriter,
     UnsupportedSchema(i64),
+    SnapshotLimitExceeded,
+    SnapshotExpired,
+    SnapshotNotFound,
     InvariantViolation(&'static str),
 }
 
@@ -97,6 +118,9 @@ impl fmt::Display for SpikeError {
             Self::UnsupportedSchema(version) => {
                 write!(formatter, "unsupported storage spike schema version: {version}")
             }
+            Self::SnapshotLimitExceeded => formatter.write_str("snapshot limit exceeded"),
+            Self::SnapshotExpired => formatter.write_str("snapshot expired"),
+            Self::SnapshotNotFound => formatter.write_str("snapshot not found"),
             Self::InvariantViolation(message) => {
                 write!(formatter, "storage spike invariant violation: {message}")
             }

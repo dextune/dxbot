@@ -32,9 +32,13 @@ pub const fn request<'a>(
 }
 
 pub const fn effect() -> OperationEffect<'static> {
+    effect_for("bot-1", "state-v1")
+}
+
+pub const fn effect_for<'a>(aggregate_id: &'a str, state_value: &'a str) -> OperationEffect<'a> {
     OperationEffect {
-        aggregate_id: "bot-1",
-        state_value: "state-v1",
+        aggregate_id,
+        state_value,
         event_payload: "event-v1",
         outbox_payload: "outbox-v1",
         audit_payload: "audit-v1",

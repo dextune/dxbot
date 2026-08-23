@@ -1,16 +1,13 @@
 use std::path::Path;
-use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
+use crate::schema::{configure_connection, initialize_schema, initialize_writer_fence, verify_writer_fence};
 use crate::{
     CrashPoint, OperationArtifactCounts, OperationEffect, OperationRequest, ReceiptDisposition,
     SpikeError, SubmitOutcome,
 };
 
-const SCHEMA_VERSION: i64 = 1;
-const WAL_AUTOCHECKPOINT_PAGES: i64 = 64;
-const JOURNAL_SIZE_LIMIT_BYTES: i64 = 262_144;
 const CRASH_EXIT_BEFORE_COMMIT: i32 = 86;
 const CRASH_EXIT_AFTER_COMMIT: i32 = 87;
 
@@ -30,9 +27,9 @@ struct BindingRecord {
 ///
 /// The type intentionally does not define DXBOT's future public persistence trait.
 pub struct ReferenceStore {
-    connection: Connection,
-    instance_id: String,
-    host_generation: i64,
+    pub(crate) connection: Connection,
+    pub(crate) instance_id: String,
+    pub(crate) host_generation: i64,
 }
 
 impl std::fmt::Debug for ReferenceStore {
@@ -52,10 +49,10 @@ impl ReferenceStore {
         instance_id: &str,
         host_generation: i64,
     ) -> Result<Self, SpikeError> {
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         configure_connection(&connection)?;
-        initialize_schema(&connection)?;
-        initialize_writer_fence(&connection, instance_id, host_generation)?;
+        initialize_schema(&mut connection)?;
+        initialize_writer_fence(&mut connection, instance_id, host_generation)?;
 
         Ok(Self {
             connection,
@@ -203,6 +200,26 @@ impl ReferenceStore {
             .query_row("SELECT COUNT(*) FROM command_bindings", [], |row| row.get(0))?)
     }
 
+    /// Deletes one projection row only for the concurrent snapshot fixture.
+    #[doc(hidden)]
+    pub fn delete_projection_row_for_fixture(
+        &mut self,
+        aggregate_id: &str,
+    ) -> Result<usize, SpikeError> {
+        let instance_id = self.instance_id.as_str();
+        let host_generation = self.host_generation;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_writer_fence(&transaction, instance_id, host_generation)?;
+        let deleted = transaction.execute(
+            "DELETE FROM aggregate_state WHERE aggregate_id = ?1",
+            [aggregate_id],
+        )?;
+        transaction.commit()?;
+        Ok(deleted)
+    }
+
     fn submit_internal(
         &mut self,
         request: &OperationRequest<'_>,
@@ -238,7 +255,7 @@ impl ReferenceStore {
                 }
             }
             (Some(command), Some(principal)) => {
-                validate_existing_bindings(request, &command, &principal)?
+                validate_existing_bindings(&transaction, request, &command, &principal)?
             }
             (Some(_), None) | (None, Some(_)) => return Err(SpikeError::IdempotencyConflict),
         };
@@ -248,144 +265,6 @@ impl ReferenceStore {
             std::process::exit(CRASH_EXIT_AFTER_COMMIT);
         }
         Ok(outcome)
-    }
-}
-
-fn configure_connection(connection: &Connection) -> Result<(), SpikeError> {
-    connection.busy_timeout(Duration::from_secs(2))?;
-    connection.execute_batch(&format!(
-        "PRAGMA foreign_keys = ON;\
-         PRAGMA journal_mode = WAL;\
-         PRAGMA synchronous = FULL;\
-         PRAGMA wal_autocheckpoint = {WAL_AUTOCHECKPOINT_PAGES};\
-         PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT_BYTES};\
-         PRAGMA temp_store = MEMORY;"
-    ))?;
-    Ok(())
-}
-
-fn initialize_schema(connection: &Connection) -> Result<(), SpikeError> {
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > SCHEMA_VERSION {
-        return Err(SpikeError::UnsupportedSchema(version));
-    }
-
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS runtime_metadata (\
-             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),\
-             instance_id TEXT NOT NULL,\
-             host_generation INTEGER NOT NULL\
-         );\
-         CREATE TABLE IF NOT EXISTS aggregate_state (\
-             aggregate_id TEXT PRIMARY KEY,\
-             revision INTEGER NOT NULL,\
-             state_value TEXT NOT NULL,\
-             last_operation_id TEXT NOT NULL\
-         );\
-         CREATE TABLE IF NOT EXISTS events (\
-             sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
-             operation_id TEXT NOT NULL,\
-             aggregate_id TEXT NOT NULL,\
-             payload TEXT NOT NULL\
-         );\
-         CREATE TABLE IF NOT EXISTS outbox (\
-             operation_id TEXT PRIMARY KEY,\
-             payload TEXT NOT NULL\
-         );\
-         CREATE TABLE IF NOT EXISTS receipts (\
-             operation_id TEXT PRIMARY KEY,\
-             disposition TEXT NOT NULL,\
-             result_ref TEXT NOT NULL,\
-             resolved_binding_digest TEXT NOT NULL\
-         );\
-         CREATE TABLE IF NOT EXISTS command_bindings (\
-             command_id TEXT PRIMARY KEY,\
-             principal_ref TEXT NOT NULL,\
-             key_digest TEXT NOT NULL,\
-             request_digest TEXT NOT NULL,\
-             operation_id TEXT NOT NULL UNIQUE,\
-             terminal_disposition TEXT,\
-             expires_at INTEGER NOT NULL,\
-             compacted INTEGER NOT NULL DEFAULT 0 CHECK (compacted IN (0, 1))\
-         );\
-         CREATE TABLE IF NOT EXISTS principal_bindings (\
-             principal_ref TEXT NOT NULL,\
-             key_digest TEXT NOT NULL,\
-             command_id TEXT NOT NULL,\
-             request_digest TEXT NOT NULL,\
-             operation_id TEXT NOT NULL UNIQUE,\
-             terminal_disposition TEXT,\
-             expires_at INTEGER NOT NULL,\
-             compacted INTEGER NOT NULL DEFAULT 0 CHECK (compacted IN (0, 1)),\
-             PRIMARY KEY (principal_ref, key_digest),\
-             FOREIGN KEY (command_id) REFERENCES command_bindings(command_id) ON DELETE CASCADE\
-         );\
-         CREATE TABLE IF NOT EXISTS audit_intents (\
-             operation_id TEXT PRIMARY KEY,\
-             payload TEXT NOT NULL\
-         );\
-         PRAGMA user_version = 1;",
-    )?;
-
-    Ok(())
-}
-
-fn initialize_writer_fence(
-    connection: &Connection,
-    instance_id: &str,
-    host_generation: i64,
-) -> Result<(), SpikeError> {
-    let current: Option<(String, i64)> = connection
-        .query_row(
-            "SELECT instance_id, host_generation FROM runtime_metadata WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-
-    match current {
-        None => {
-            connection.execute(
-                "INSERT INTO runtime_metadata(singleton, instance_id, host_generation) VALUES (1, ?1, ?2)",
-                params![instance_id, host_generation],
-            )?;
-        }
-        Some((stored_instance, _)) if stored_instance != instance_id => {
-            return Err(SpikeError::InvariantViolation("instance identity mismatch"));
-        }
-        Some((_, current_generation)) if host_generation > current_generation => {
-            connection.execute(
-                "UPDATE runtime_metadata SET host_generation = ?1 WHERE singleton = 1",
-                [host_generation],
-            )?;
-        }
-        Some(_) => {}
-    }
-
-    Ok(())
-}
-
-fn verify_writer_fence(
-    transaction: &Transaction<'_>,
-    instance_id: &str,
-    host_generation: i64,
-) -> Result<(), SpikeError> {
-    let current: Option<(String, i64)> = transaction
-        .query_row(
-            "SELECT instance_id, host_generation FROM runtime_metadata WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-
-    match current {
-        Some((stored_instance, stored_generation))
-            if stored_instance == instance_id && stored_generation == host_generation =>
-        {
-            Ok(())
-        }
-        Some(_) => Err(SpikeError::StaleWriter),
-        None => Err(SpikeError::InvariantViolation("writer fence is missing")),
     }
 }
 
@@ -435,6 +314,7 @@ fn binding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BindingRecord> 
 
 #[allow(clippy::similar_names)]
 fn validate_existing_bindings(
+    transaction: &Transaction<'_>,
     request: &OperationRequest<'_>,
     command: &BindingRecord,
     principal: &BindingRecord,
@@ -460,13 +340,26 @@ fn validate_existing_bindings(
         return Ok(SubmitOutcome::IdempotencyExpired);
     }
 
-    let disposition = command
-        .disposition
-        .as_deref()
-        .ok_or(SpikeError::InvariantViolation(
-            "binding is missing receipt disposition",
-        ))
-        .and_then(ReceiptDisposition::parse)?;
+    let disposition = if command.compacted {
+        command
+            .disposition
+            .as_deref()
+            .ok_or(SpikeError::InvariantViolation(
+                "compacted binding is missing terminal disposition",
+            ))
+            .and_then(ReceiptDisposition::parse)?
+    } else {
+        let receipt_disposition: Option<String> = transaction
+            .query_row(
+                "SELECT disposition FROM receipts WHERE operation_id = ?1",
+                [command.operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        ReceiptDisposition::parse(receipt_disposition.as_deref().ok_or(
+            SpikeError::InvariantViolation("full receipt is missing for active binding"),
+        )?)?
+    };
 
     Ok(SubmitOutcome::Existing {
         operation_id: command.operation_id.clone(),
@@ -502,27 +395,29 @@ fn insert_new_operation(
         params![request.new_operation_id, effect.outbox_payload],
     )?;
     transaction.execute(
-        "INSERT INTO receipts(operation_id, disposition, result_ref, resolved_binding_digest) \
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO receipts(\
+             operation_id, disposition, result_ref, resolved_binding_digest, owner_kind, \
+             lease_until, last_progress, reconciliation_policy\
+         ) VALUES (?1, ?2, ?3, ?4, 'none', NULL, ?5, 'none')",
         params![
             request.new_operation_id,
             ReceiptDisposition::Committed.as_str(),
             effect.result_ref,
-            effect.resolved_binding_digest
+            effect.resolved_binding_digest,
+            request.now
         ],
     )?;
     transaction.execute(
         "INSERT INTO command_bindings(\
              command_id, principal_ref, key_digest, request_digest, operation_id, \
              terminal_disposition, expires_at, compacted\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0)",
         params![
             request.command_id,
             request.principal_ref,
             request.idempotency_key_digest,
             request.request_digest,
             request.new_operation_id,
-            ReceiptDisposition::Committed.as_str(),
             request.key_expires_at
         ],
     )?;
@@ -530,14 +425,13 @@ fn insert_new_operation(
         "INSERT INTO principal_bindings(\
              principal_ref, key_digest, command_id, request_digest, operation_id, \
              terminal_disposition, expires_at, compacted\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0)",
         params![
             request.principal_ref,
             request.idempotency_key_digest,
             request.command_id,
             request.request_digest,
             request.new_operation_id,
-            ReceiptDisposition::Committed.as_str(),
             request.key_expires_at
         ],
     )?;

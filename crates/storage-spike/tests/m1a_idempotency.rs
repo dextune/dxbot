@@ -204,6 +204,6 @@ fn stale_writer_generation_is_fenced() -> Result<(), SpikeError> {
 fn schema_version_is_migrated_from_empty_file() -> Result<(), SpikeError> {
     let path = database_path("schema-version");
     let store = ReferenceStore::open_file(&path, "instance-1", 1)?;
-    assert_eq!(store.schema_version()?, 1);
+    assert_eq!(store.schema_version()?, 2);
     Ok(())
 }
