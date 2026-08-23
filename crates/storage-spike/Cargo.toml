@@ -1,9 +1,10 @@
 [package]
 name = "storage-spike"
 version = "0.1.0"
+description = "Internal executable storage semantics proof for DXBOT M1A."
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 publish = false
 
 [lints]
