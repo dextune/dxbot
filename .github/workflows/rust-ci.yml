@@ -1,3 +1,4 @@
+# ci-probe-only: validates the current main Rust tree through pull_request execution.
 name: rust-ci
 
 on:
