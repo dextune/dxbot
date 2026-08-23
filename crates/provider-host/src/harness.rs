@@ -11,8 +11,15 @@
 
 #![forbid(unsafe_code)]
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::expect_used)]
+
+use std::fmt;
 
 use dxbot_core::types::ProviderId;
+
+use crate::protocol::ProviderExecuteConfig;
+use crate::real_provider::RealProvider;
+use crate::transport::HttpTransport;
 
 /// A bounded task description executed by a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,19 +234,57 @@ impl HarnessAdapter {
     }
 }
 
-/// The provider host: owns the Reference Provider and the real Harness Adapter
-/// and executes bounded tasks through the provider chain.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// The provider host: owns the Reference Provider, the real Harness Adapter,
+/// common transport/protocol infrastructure, and registered real providers.
+///
+/// The execution chain is:
+/// 1. Real providers (registered extension providers)
+/// 2. HarnessAdapter (canary)
+/// 3. ReferenceProvider (deterministic fallback)
 pub struct ProviderHost {
     reference: Option<ReferenceProvider>,
     adapter: Option<HarnessAdapter>,
+    transport: Option<HttpTransport>,
+    protocol: Option<crate::protocol::ChatCompletionProtocol>,
+    real_providers: Vec<Box<dyn RealProvider>>,
+    rt: tokio::runtime::Runtime,
+}
+
+impl fmt::Debug for ProviderHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderHost")
+            .field("reference", &self.reference)
+            .field("adapter", &self.adapter)
+            .field("transport", &self.transport)
+            .field("protocol", &self.protocol)
+            .field("real_providers_count", &self.real_providers.len())
+            .finish()
+    }
+}
+
+impl Default for ProviderHost {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProviderHost {
-    /// Creates an empty host. Register the Reference Provider and at least one
-    /// real Harness Adapter before the canary test.
+    /// Creates an empty host with a single-threaded async runtime.
+    /// Register the Reference Provider and at least one real provider or
+    /// Harness Adapter before the canary test.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            reference: None,
+            adapter: None,
+            transport: None,
+            protocol: None,
+            real_providers: Vec::new(),
+            rt: tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .expect("tokio runtime must build"),
+        }
     }
 
     /// Registers the deterministic Reference Provider.
@@ -272,12 +317,116 @@ impl ProviderHost {
         Ok(())
     }
 
+    /// Sets the common HTTP transport and creates the chat completion
+    /// protocol handler with reasonable output bounds.
+    pub fn set_transport(&mut self, transport: HttpTransport) {
+        let protocol = crate::protocol::ChatCompletionProtocol::new(
+            transport.clone(),
+            1024 * 1024, // 1 MiB max output bytes
+            1000,        // max output items
+        );
+        self.transport = Some(transport);
+        self.protocol = Some(protocol);
+    }
+
+    /// Registers a real (extension) provider.
+    pub fn register_real_provider(
+        &mut self,
+        provider: Box<dyn RealProvider>,
+    ) -> Result<(), HarnessError> {
+        // Check for duplicate ID among real providers
+        for existing in &self.real_providers {
+            if existing.id() == provider.id() {
+                return Err(HarnessError::AlreadyRegistered {
+                    id: provider.id().clone(),
+                });
+            }
+        }
+        // Check for duplicate ID with reference and adapter
+        if let Some(r) = &self.reference {
+            if r.id == *provider.id() {
+                return Err(HarnessError::AlreadyRegistered {
+                    id: provider.id().clone(),
+                });
+            }
+        }
+        if let Some(a) = &self.adapter {
+            if a.id == *provider.id() {
+                return Err(HarnessError::AlreadyRegistered {
+                    id: provider.id().clone(),
+                });
+            }
+        }
+        validate_provider(provider.id(), provider.capability())?;
+        self.real_providers.push(provider);
+        Ok(())
+    }
+
     /// Executes a task through the provider chain.
     ///
-    /// The real Harness Adapter is preferred (the canary). When it is not
-    /// registered or is temporarily unavailable, execution falls back to the
-    /// always-available Reference Provider.
+    /// Chain order:
+    /// 1. Real providers (registered extension providers)
+    /// 2. HarnessAdapter (canary)
+    /// 3. ReferenceProvider (deterministic fallback)
     pub fn execute_task(&self, task: &TaskDescription) -> Result<TaskResult, HarnessError> {
+        // 1. Try real providers first
+        for provider in &self.real_providers {
+            let protocol = self
+                .protocol
+                .as_ref()
+                .ok_or(HarnessError::NoReferenceProvider)?;
+            let request = provider.build_request(task);
+            let config = ProviderExecuteConfig {
+                deadline: task
+                    .deadline
+                    .map(|d| tokio::time::Instant::now() + std::time::Duration::from_secs(d as u64)),
+                cancel_notify: None,
+                max_output_bytes: protocol.max_output_bytes,
+                max_output_items: protocol.max_output_items,
+            };
+
+            match self.rt.block_on(protocol.execute(&request, &config)) {
+                Ok(events) => {
+                    let output = events
+                        .iter()
+                        .filter_map(|e| match e {
+                            crate::protocol::ProviderEvent::ContentDelta { text, .. } => {
+                                Some(text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    if !output.is_empty() {
+                        return Ok(TaskResult {
+                            output,
+                            evidence: vec![Evidence {
+                                provider: provider.id().clone(),
+                                observation: format!(
+                                    "real-provider:{}",
+                                    provider.capability()
+                                ),
+                            }],
+                            status: TaskStatus::Completed,
+                        });
+                    }
+                    // Fall through if empty output
+                }
+                Err(crate::protocol::ProviderError::TransportUnavailable { .. })
+                | Err(crate::protocol::ProviderError::UpstreamUnavailable { .. }) => {
+                    // Fall through to next provider
+                    continue;
+                }
+                Err(e) => {
+                    return Err(HarnessError::ExecutionFailed {
+                        id: provider.id().clone(),
+                        reason: format!("{e:?}"),
+                    });
+                }
+            }
+        }
+
+        // 2. Try HarnessAdapter
         let reference = self
             .reference
             .as_ref()
@@ -291,6 +440,8 @@ impl ProviderHost {
                 Err(err) => return Err(err),
             }
         }
+
+        // 3. Fall back to ReferenceProvider
         reference.execute(task)
     }
 
@@ -307,6 +458,17 @@ impl ProviderHost {
                 out.push(adapter.info());
             }
         }
+        for provider in &self.real_providers {
+            let cap = provider.capability();
+            if capability.is_none_or(|c| cap == c) {
+                out.push(ProviderInfo {
+                    id: provider.id().clone(),
+                    capability: cap.to_string(),
+                    generation: provider.generation(),
+                    status: ProviderStatus::Ready,
+                });
+            }
+        }
         out
     }
 
@@ -320,6 +482,16 @@ impl ProviderHost {
         if let Some(adapter) = &self.adapter {
             if &adapter.id == provider_id {
                 return Ok(adapter.info());
+            }
+        }
+        for provider in &self.real_providers {
+            if provider.id() == provider_id {
+                return Ok(ProviderInfo {
+                    id: provider.id().clone(),
+                    capability: provider.capability().to_string(),
+                    generation: provider.generation(),
+                    status: ProviderStatus::Ready,
+                });
             }
         }
         Err(HarnessError::ProviderNotFound {
