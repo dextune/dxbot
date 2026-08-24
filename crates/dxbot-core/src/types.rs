@@ -256,6 +256,8 @@ pub struct JournalRecord {
     pub state: JournalState,
     pub instance_id: InstanceId,
     pub command_id: CommandId,
+    /// Original OperationId allocated before the durable Prepared record.
+    pub operation_id: OperationId,
     pub idempotency_key: IdempotencyKey,
     pub request_digest: RequestDigest,
     pub sequence: i64,
