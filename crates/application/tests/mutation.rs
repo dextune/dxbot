@@ -1,5 +1,5 @@
-//! Acceptance tests for AT-APP-005: mutation materialization, binding identity,
-//! receipt, and domain-outcome semantics.
+//! Acceptance tests for AT-APP-005: mutation materialization, complete binding
+//! identity, receipt, and domain-outcome semantics.
 
 #![allow(clippy::expect_used)]
 
@@ -7,8 +7,8 @@ use application::mutation::AppError;
 use application::{ApplicationMutator, DomainOutcome, cas_if_revision, resolve_outcome};
 use dxbot_core::receipt::ReceiptDisposition;
 use dxbot_core::types::{
-    CanonicalTarget, CommandId, CommandPayload, IdempotencyKey, InstanceId, OperationId,
-    OperationRequest, PrincipalRef, RequestDigest,
+    CanonicalTarget, CommandId, CommandPayload, ConversationId, IdempotencyKey, InstanceId,
+    OperationId, OperationRequest, PrincipalRef, RequestDigest, ThreadId,
 };
 
 fn principal() -> PrincipalRef {
@@ -62,6 +62,28 @@ fn update_request(command_id: &str, operation_id: &str, revision: i64) -> Operat
                 revision,
             },
             cas: Some(cas_if_revision(revision)),
+            content: None,
+            semantic_options: serde_json::Value::Null,
+        },
+    }
+}
+
+fn relation_request(command_id: &str, target: CanonicalTarget) -> OperationRequest {
+    OperationRequest {
+        command_id: CommandId(command_id.to_owned()),
+        idempotency_key: IdempotencyKey {
+            principal_ref: principal(),
+            key_digest: format!("key-{command_id}"),
+            expires_at: i64::MAX,
+        },
+        request_digest: RequestDigest(format!("digest-{command_id}")),
+        new_operation_id: OperationId(format!("operation-{command_id}")),
+        payload: CommandPayload {
+            command_key: "create".to_owned(),
+            principal_ref: principal(),
+            instance_id: InstanceId("instance-1".to_owned()),
+            canonical_target: target,
+            cas: None,
             content: None,
             semantic_options: serde_json::Value::Null,
         },
@@ -194,11 +216,52 @@ fn mutation_same_command_different_digest_conflicts() -> Result<(), AppError> {
 
     let mut conflicting = original.clone();
     conflicting.request_digest = RequestDigest("digest-other".to_string());
-    conflicting.new_operation_id = OperationId("operation-other".to_string());
     assert!(matches!(
         mutator.mutate(&conflicting).err(),
         Some(AppError::Conflict(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn mutation_same_binding_different_operation_id_conflicts() -> Result<(), AppError> {
+    let mutator = ApplicationMutator::new();
+    let original = create_bot_request(
+        "command-1",
+        "key-1",
+        "digest-1",
+        "operation-1",
+        "alpha-bot",
+    );
+    mutator.mutate(&original)?;
+
+    let mut conflicting = original.clone();
+    conflicting.new_operation_id = OperationId("operation-other".to_owned());
+    assert!(matches!(
+        mutator.mutate(&conflicting),
+        Err(AppError::Conflict(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn mutation_same_key_digest_different_expiry_is_not_same_binding() -> Result<(), AppError> {
+    let mutator = ApplicationMutator::new();
+    let original = create_bot_request(
+        "command-1",
+        "key-1",
+        "digest-1",
+        "operation-1",
+        "alpha-bot",
+    );
+    mutator.mutate(&original)?;
+
+    let mut changed = original.clone();
+    changed.command_id = CommandId("command-2".to_owned());
+    changed.new_operation_id = OperationId("operation-2".to_owned());
+    changed.idempotency_key.expires_at = i64::MAX - 1;
+    changed.request_digest = RequestDigest("digest-2".to_owned());
+    changed.semantic_options_mut_for_test();
     Ok(())
 }
 
@@ -238,6 +301,33 @@ fn mutation_single_sided_binding_conflicts() -> Result<(), AppError> {
         Some(AppError::Conflict(_))
     ));
     Ok(())
+}
+
+#[test]
+fn mutation_does_not_fabricate_missing_relationships() {
+    let mutator = ApplicationMutator::new();
+
+    let conversation = relation_request(
+        "conversation-create",
+        CanonicalTarget::Conversation {
+            id: ConversationId("conversation-orphan".to_owned()),
+            revision: 0,
+        },
+    );
+    assert!(matches!(
+        mutator.mutate(&conversation),
+        Err(AppError::NotFound(_))
+    ));
+
+    let thread = relation_request(
+        "thread-create",
+        CanonicalTarget::Thread {
+            id: ThreadId("thread-orphan".to_owned()),
+            parent_id: None,
+            revision: 0,
+        },
+    );
+    assert!(matches!(mutator.mutate(&thread), Err(AppError::NotFound(_))));
 }
 
 #[test]
