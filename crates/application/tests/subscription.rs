@@ -1,11 +1,4 @@
 //! Acceptance tests for AT-APP-007: cursor-based application subscription.
-//!
-//! Covered in-process with the in-memory [`DomainState`] fixture (no external
-//! I/O): event creation/receipt, cursor resume, reconnect-without-gap, gap
-//! detection with resync hint, explicit resync from current state, and bounded
-//! buffer pruning.
-//!
-//! `cargo test -p application subscription` runs every test below.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,10 +8,8 @@ use application::subscription::{StreamEvent, SubscriptionManager, TaskResult};
 use application::AppError;
 use dxbot_core::types::{ProcessId, TaskId};
 
-/// A short poll window sufficient for drained-stream Timeout signalling.
 const POLL: Duration = Duration::from_millis(150);
 
-/// A manager over a fresh, empty domain state.
 fn manager_over(state: DomainState) -> SubscriptionManager {
     SubscriptionManager::new(Arc::new(Mutex::new(state)))
 }
@@ -32,7 +23,6 @@ fn subscription_creates_and_receives_events() {
     assert_eq!(sub.target_id, "task-1");
     assert_eq!(sub.cursor, None);
 
-    // Emit events after subscribing; the subscription receives them in order.
     manager
         .emit_task(
             &task_id,
@@ -60,7 +50,9 @@ fn subscription_creates_and_receives_events() {
     );
     assert_eq!(
         manager.next_event(&sub, POLL).unwrap(),
-        StreamEvent::Output { data: "hello".into() }
+        StreamEvent::Output {
+            data: "hello".into()
+        }
     );
     assert_eq!(manager.last_delivered_cursor(&sub), Some("2".into()));
 }
@@ -70,22 +62,25 @@ fn subscription_cursor_resumes_from_last_position() {
     let mut manager = manager_over(DomainState::new());
     let task_id = TaskId("task-1".to_owned());
 
-    // Seed three events so cursors 1, 2, 3 exist.
     for n in 1..=3 {
         manager
-            .emit_task(&task_id, StreamEvent::Output { data: format!("m{n}") })
+            .emit_task(
+                &task_id,
+                StreamEvent::Output {
+                    data: format!("m{n}"),
+                },
+            )
             .unwrap();
     }
 
-    // A new subscriber resuming from cursor "2" only sees events after it,
-    // i.e. cursor 3 — never a replay of 1 or 2.
-    let sub = manager.subscribe_task(&task_id, Some("2".into())).unwrap();
+    let sub = manager
+        .subscribe_task(&task_id, Some("2".into()))
+        .unwrap();
     assert_eq!(sub.cursor, Some("2".into()));
     assert_eq!(
         manager.next_event(&sub, POLL).unwrap(),
         StreamEvent::Output { data: "m3".into() }
     );
-    // The resumed subscription is now caught up.
     assert!(matches!(
         manager.next_event(&sub, POLL),
         Err(AppError::Timeout(_))
@@ -98,18 +93,20 @@ fn subscription_reconnect_with_cursor_no_gap() {
     let task_id = TaskId("task-1".to_owned());
 
     let sub = manager.subscribe_task(&task_id, None).unwrap();
-
-    // Emit five events and consume the first two (delivered cursor -> 2).
     for n in 1..=5 {
         manager
-            .emit_task(&task_id, StreamEvent::Output { data: format!("m{n}") })
+            .emit_task(
+                &task_id,
+                StreamEvent::Output {
+                    data: format!("m{n}"),
+                },
+            )
             .unwrap();
     }
     for _ in 0..2 {
         manager.next_event(&sub, POLL).unwrap();
     }
 
-    // More events arrive after a "disconnect".
     manager
         .emit_task(
             &task_id,
@@ -120,8 +117,6 @@ fn subscription_reconnect_with_cursor_no_gap() {
         )
         .unwrap();
 
-    // Reconnect from the last delivered cursor: delivers 3, 4, 5 then the
-    // new event — no gap, no replay of 1 or 2.
     let resumed = manager.reconnect(&sub.id, "2").unwrap();
     assert_eq!(resumed.cursor, Some("2".into()));
 
@@ -147,60 +142,80 @@ fn subscription_reconnect_with_cursor_no_gap() {
 }
 
 #[test]
-fn subscription_gap_detection_returns_error() {
-    let manager = manager_over(DomainState::new());
+fn subscription_gap_detection_distinguishes_missing_from_predecessor() {
+    let mut manager = manager_over(DomainState::new());
     let task_id = TaskId("task-1".to_owned());
 
-    // Overflow the bounded buffer so only the newest events are retained:
-    // cursors 1..=1000+5 -> oldest retained is 6.
     for n in 1..=1005 {
         manager
-            .emit_task(&task_id, StreamEvent::Progress {
-                message: format!("m{n}"),
-                percent: None,
-            })
+            .emit_task(
+                &task_id,
+                StreamEvent::Progress {
+                    message: format!("m{n}"),
+                    percent: None,
+                },
+            )
             .unwrap();
     }
 
-    // Resuming from a cursor behind the oldest retained event is a gap.
-    let err = manager.subscribe_task(&task_id, Some("2".into())).unwrap_err();
-    match err {
+    let error = manager
+        .subscribe_task(&task_id, Some("2".into()))
+        .unwrap_err();
+    match error {
         AppError::GapDetected(hint) => {
-            // The hint names the resync position.
             assert!(hint.contains("oldest retained is 6"), "hint: {hint}");
             assert!(hint.contains("resync"), "hint: {hint}");
         }
         other => panic!("expected GapDetected, got {other:?}"),
     }
 
-    // The same gap is reported on reconnect.
-    let sub = manager.subscribe_task(&task_id, None).unwrap();
-    let err = manager.reconnect(&sub.id, "3").unwrap_err();
-    assert!(matches!(err, AppError::GapDetected(_)));
+    // Cursor 5 is exactly the predecessor of oldest retained cursor 6, so no
+    // event is missing and delivery may continue with event 6.
+    let predecessor = manager
+        .subscribe_task(&task_id, Some("5".into()))
+        .unwrap();
+    assert_eq!(
+        manager.next_event(&predecessor, POLL).unwrap(),
+        StreamEvent::Progress {
+            message: "m6".into(),
+            percent: None,
+        }
+    );
+
+    // A claimed cursor that has not been emitted yet is rejected rather than
+    // silently suppressing future events until the stream catches up.
+    assert!(matches!(
+        manager.subscribe_task(&task_id, Some("1006".into())),
+        Err(AppError::Conflict(_))
+    ));
 }
 
 #[test]
-fn subscription_explicit_resync_from_current_state() {
+fn subscription_explicit_resync_from_current_retained_state() {
     let mut manager = manager_over(DomainState::new());
     let task_id = TaskId("task-1".to_owned());
 
-    // Seed the current state with some retained events.
     for n in 1..=3 {
         manager
-            .emit_task(&task_id, StreamEvent::Output { data: format!("m{n}") })
+            .emit_task(
+                &task_id,
+                StreamEvent::Output {
+                    data: format!("m{n}"),
+                },
+            )
             .unwrap();
     }
 
-    // An explicit resync replays the entire current retained window.
     let sub = manager.explicit_resync(&task_id.0).unwrap();
     assert_eq!(sub.cursor, None);
     for n in 1..=3 {
         assert_eq!(
             manager.next_event(&sub, POLL).unwrap(),
-            StreamEvent::Output { data: format!("m{n}") }
+            StreamEvent::Output {
+                data: format!("m{n}")
+            }
         );
     }
-    // Caught up after a resync.
     assert!(matches!(
         manager.next_event(&sub, POLL),
         Err(AppError::Timeout(_))
@@ -208,37 +223,42 @@ fn subscription_explicit_resync_from_current_state() {
 }
 
 #[test]
-fn subscription_bounded_buffer_prunes_oldest_events() {
+fn subscription_active_reader_detects_pruning_gap_then_resyncs() {
     let mut manager = manager_over(DomainState::new());
     let process_id = ProcessId("proc-1".to_owned());
 
-    let sub = manager.subscribe_process(&process_id, None).unwrap();
+    // This subscription begins before any event. It must not silently jump
+    // forward if the retained window later prunes events before it reads them.
+    let lagging = manager.subscribe_process(&process_id, None).unwrap();
 
-    // Emit more events than the per-target bound allows.
-    let excess = 1200;
-    for n in 0..excess {
+    for n in 0..1200 {
         manager
             .emit_process(
                 &process_id,
                 StreamEvent::Progress {
-                    message: format!("step-{n}"), // distinct label = cursor + 1
+                    message: format!("step-{n}"),
                     percent: None,
                 },
             )
             .unwrap();
     }
 
-    // Drain the stream: exactly MAX events remain, oldest pruned.
+    assert!(matches!(
+        manager.next_event(&lagging, POLL),
+        Err(AppError::GapDetected(_))
+    ));
+
+    // Explicit resync is the only path that intentionally starts at the oldest
+    // currently retained event.
+    let resynced = manager.explicit_resync(&process_id.0).unwrap();
     let mut received = Vec::new();
-    while let Ok(event) = manager.next_event(&sub, POLL) {
+    while let Ok(event) = manager.next_event(&resynced, POLL) {
         if let StreamEvent::Progress { message, .. } = event {
             received.push(message);
         }
     }
 
     assert_eq!(received.len(), application::subscription::MAX_EVENTS_PER_STREAM);
-    // Cursors 1..=1000+200 -> retained are 201..=1200. The oldest (step-0)
-    // was pruned; the first retained event is step-200.
     assert_eq!(received.first().map(String::as_str), Some("step-200"));
     assert_eq!(received.last().map(String::as_str), Some("step-1199"));
 }
