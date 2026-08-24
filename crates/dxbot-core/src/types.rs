@@ -4,46 +4,32 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InstanceId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BotId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConversationId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ThreadId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProjectId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChannelId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OperationId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommandId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ApprovalId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MemoryId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProviderId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcessId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageId(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipalRef(pub String);
 
@@ -55,49 +41,42 @@ pub enum BotSelector {
     CanonicalId(BotId),
     ScopedExact(String),
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ConversationSelector {
     ConversationId(ConversationId),
     BotMain(BotSelector),
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ThreadSelector {
     CanonicalId(ThreadId),
     ScopedExact(String),
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum TaskSelector {
     CanonicalId(TaskId),
     ScopedExact(String),
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProjectSelector {
     CanonicalId(ProjectId),
     VisibleExact(String),
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ChannelSelector {
     CanonicalId(ChannelId),
     ProjectExact { project: String, name: String },
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum OperationSelector {
     OperationId(OperationId),
     CommandIdKey { command_id: CommandId, key_digest: String },
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ScopeSelector {
@@ -105,41 +84,35 @@ pub enum ScopeSelector {
     Project(ProjectSelector),
     Channel(ChannelSelector),
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ApprovalSelector {
     CanonicalId(ApprovalId),
     Operation(OperationSelector),
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProviderSelector {
     CanonicalId(ProviderId),
     Exact(String),
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProcessSelector {
     CanonicalId(ProcessId),
     ScopedExact(String),
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum MemorySelector {
     CanonicalId(MemoryId),
     ScopedExact(String),
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryScopeSelector {
     pub scope: ScopeSelector,
     pub namespace: Option<String>,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SideEffectSelector {
@@ -170,7 +143,6 @@ pub struct CommandPayload {
     pub content: Option<ContentSource>,
     pub semantic_options: serde_json::Value,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum CanonicalTarget {
@@ -189,7 +161,6 @@ pub enum CanonicalTarget {
     SideEffect { id: String, revision: i64 },
     Membership { scope: ScopeSelector, member_bot: BotSelector },
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CasConditions {
     pub if_revision: Option<i64>,
@@ -210,14 +181,12 @@ pub struct CasConditions {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestDigest(pub String);
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyKey {
     pub principal_ref: PrincipalRef,
     pub key_digest: String,
     pub expires_at: i64,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationRequest {
     pub command_id: CommandId,
@@ -226,7 +195,6 @@ pub struct OperationRequest {
     pub new_operation_id: OperationId,
     pub payload: CommandPayload,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationResult {
     pub operation_id: OperationId,
@@ -250,12 +218,13 @@ pub enum JournalState {
     Terminal,
     Abandoned,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalRecord {
     pub state: JournalState,
     pub instance_id: InstanceId,
     pub command_id: CommandId,
+    /// Original OperationId allocated before the durable Prepared record.
+    pub operation_id: OperationId,
     pub idempotency_key: IdempotencyKey,
     pub request_digest: RequestDigest,
     pub sequence: i64,
@@ -272,7 +241,6 @@ pub enum OutputFormat {
     Json,
     Jsonl,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ColorMode {
@@ -290,7 +258,6 @@ pub struct VersionInfo {
     pub supported_schema_versions: Vec<String>,
     pub remote_compatibility: Option<RemoteVersionInfo>,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteVersionInfo {
     pub runtime_version: String,
@@ -311,7 +278,6 @@ pub struct CliGlobalOptions {
     pub timeout: Option<String>,
     pub yes: bool,
 }
-
 impl Default for CliGlobalOptions {
     fn default() -> Self {
         Self {
