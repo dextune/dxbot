@@ -1,39 +1,58 @@
-//! Multi-process journal probe used by `tests/journal.rs`.
+//! Multi-process probe for the real [`cli::journal::LocalJournal`] ownership path.
 //!
-//! Usage: `journal-helper <output_base> <command_id>`
-//!
-//! Attempts an OS-atomic exclusive create of `<output_base>/<command_id>.jsonl`
-//! (the same layout the local journal uses). Exits `0` if this process became
-//! the exclusive creator, `2` if the file already exists (another process
-//! owns it), and `3` on any other error.
+//! Usage: `journal-helper <base> <command-id> [hold-ms]`.
 
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
+
+use cli::journal::{JournalError, LocalJournal};
+use dxbot_core::types::{
+    CommandId, IdempotencyKey, InstanceId, JournalRecord, JournalState, PrincipalRef, RequestDigest,
+};
 
 fn main() -> ExitCode {
-    let mut args = std::env::args_os();
+    let mut args = std::env::args();
     let _program = args.next();
     let Some(base) = args.next() else {
-        eprintln!("usage: journal-helper <output_base> <command_id>");
         return ExitCode::from(3);
     };
-    let Some(command_id) = args.next() else {
-        eprintln!("usage: journal-helper <output_base> <command_id>");
+    let Some(command) = args.next() else {
         return ExitCode::from(3);
+    };
+    let hold_ms = args
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let instance = InstanceId("multi-process".to_owned());
+    let mut journal = match LocalJournal::open(instance.clone(), Path::new(&base)) {
+        Ok(journal) => journal,
+        Err(_) => return ExitCode::from(3),
+    };
+    let record = JournalRecord {
+        state: JournalState::Prepared,
+        instance_id: instance,
+        command_id: CommandId(command.clone()),
+        idempotency_key: IdempotencyKey {
+            principal_ref: PrincipalRef("probe".to_owned()),
+            key_digest: format!("key-{command}"),
+            expires_at: 0,
+        },
+        request_digest: RequestDigest(format!("request-{command}")),
+        sequence: 0,
+        previous_digest: String::new(),
+        record_digest: String::new(),
     };
 
-    let path = PathBuf::from(base)
-        .join(command_id)
-        .with_extension("jsonl");
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            let _ = file.write_all(b"winner\n");
-            let _ = file.sync_all();
-            ExitCode::from(0)
+    match journal.append_prepared(&record) {
+        Ok(()) => {
+            if hold_ms > 0 {
+                std::thread::sleep(Duration::from_millis(hold_ms));
+            }
+            ExitCode::SUCCESS
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => ExitCode::from(2),
+        Err(JournalError::LockBusy(_) | JournalError::AlreadyExists(_)) => ExitCode::from(2),
         Err(_) => ExitCode::from(3),
     }
 }
