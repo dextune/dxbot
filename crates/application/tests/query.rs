@@ -5,10 +5,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use application::{
-    AllLoopResult, ApplicationQuery, BotSummary, Page, all_loop, resync,
-};
 use application::state::{BotState, DomainState, LifecycleState};
+use application::{
+    AllLoopResult, AppError, ApplicationQuery, BotSummary, Page, all_loop, resync,
+};
 use dxbot_core::types::BotId;
 
 /// Build a bot state with a lexicographically stable id for cursor ordering.
@@ -42,7 +42,6 @@ fn query_pagination_returns_bounded_page() {
 
     let page: Page<BotSummary> = query.list_bots(2, None).unwrap();
 
-    // The page respects the requested page_size and signals continuation.
     assert_eq!(page.items.len(), 2);
     assert!(page.has_more);
     assert!(page.next_cursor.is_some());
@@ -58,15 +57,14 @@ fn query_pagination_cursor_continues_from_previous() {
     let page2: Page<BotSummary> = query.list_bots(2, page1.next_cursor.clone()).unwrap();
     let page3: Page<BotSummary> = query.list_bots(2, page2.next_cursor.clone()).unwrap();
 
-    // Each page resumes exactly after the previous one — no overlap, no gap.
     assert_eq!(
-        page2.items
+        page2
+            .items
             .iter()
-            .map(|b| b.id.clone())
+            .map(|bot| bot.id.clone())
             .collect::<Vec<_>>(),
         vec![BotId("bot-02".to_owned()), BotId("bot-03".to_owned())]
     );
-    // The final page is short and reports exhaustion.
     assert_eq!(page3.items.len(), 1);
     assert_eq!(page3.items[0].id, BotId("bot-04".to_owned()));
     assert!(!page3.has_more);
@@ -74,10 +72,9 @@ fn query_pagination_cursor_continues_from_previous() {
 }
 
 #[test]
-fn query_all_loop_returns_partial_when_ceiling_reached() {
+fn query_all_loop_never_exceeds_local_ceiling() {
     let query = query_over(state_with_bots(8));
 
-    // Local ceiling of 3 is hit before all 8 bots are drained -> Partial.
     let result = all_loop(
         |page_size, cursor| query.list_bots(page_size, cursor),
         2,
@@ -90,8 +87,8 @@ fn query_all_loop_returns_partial_when_ceiling_reached() {
             items,
             next_cursor,
         } => {
-            assert!(items.len() >= 3, "ceiling reached with partial page");
-            assert!(next_cursor.is_some(), "partial exposes a resync cursor");
+            assert_eq!(items.len(), 3, "local ceiling is a hard upper bound");
+            assert!(next_cursor.is_some(), "partial exposes a resume cursor");
         }
         AllLoopResult::Complete { .. } => {
             panic!("local ceiling must be reached before the source is exhausted")
@@ -100,14 +97,67 @@ fn query_all_loop_returns_partial_when_ceiling_reached() {
 }
 
 #[test]
+fn query_exact_ceiling_is_complete_when_source_is_exhausted() {
+    let query = query_over(state_with_bots(4));
+
+    let result = all_loop(
+        |page_size, cursor| query.list_bots(page_size, cursor),
+        3,
+        4,
+    )
+    .unwrap();
+
+    match result {
+        AllLoopResult::Complete { items } => assert_eq!(items.len(), 4),
+        AllLoopResult::Partial { .. } => {
+            panic!("exhausting the source exactly at the ceiling is complete")
+        }
+    }
+}
+
+#[test]
+fn query_all_loop_rejects_fetch_that_breaks_requested_bound() {
+    let error = all_loop::<usize>(
+        |requested, _| {
+            Ok(Page {
+                items: vec![0; requested + 1],
+                next_cursor: Some("next".to_owned()),
+                has_more: true,
+            })
+        },
+        4,
+        1,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, AppError::Internal(_)));
+}
+
+#[test]
+fn query_all_loop_rejects_non_progressing_page() {
+    let error = all_loop::<usize>(
+        |_, _| {
+            Ok(Page {
+                items: Vec::new(),
+                next_cursor: Some("next".to_owned()),
+                has_more: true,
+            })
+        },
+        2,
+        5,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, AppError::Internal(_)));
+}
+
+#[test]
 fn query_resync_from_cursor_restarts() {
     let query = query_over(state_with_bots(5));
 
-    // Capture a cursor mid-stream.
     let first: Page<BotSummary> = query.list_bots(2, None).unwrap();
     assert!(first.next_cursor.is_some());
 
-    // Resync restarts from that cursor and drains the rest to completion.
     let result = resync(
         |page_size, cursor| query.list_bots(page_size, cursor),
         first.next_cursor,
@@ -118,8 +168,6 @@ fn query_resync_from_cursor_restarts() {
 
     match result {
         AllLoopResult::Complete { items } => {
-            // Remaining bots bot-02, bot-03, bot-04 — no overlap with the
-            // items already covered by the earlier page.
             assert_eq!(items.len(), 3);
             assert_eq!(items[0].id, BotId("bot-02".to_owned()));
         }

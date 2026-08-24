@@ -1,11 +1,9 @@
 //! Domain query: bounded pagination, cursor continuation, `--all` bounding and
 //! resync over the in-memory [`DomainState`].
 //!
-//! Every listing here is a *snapshot page*: a stable sort key (the canonical
-//! id) gives a deterministic, foreign-cursor-safe ordering, and an opaque
-//! cursor (the last id of the previous page) resumes exactly where the caller
-//! left off, so concurrent mutation between pages cannot silently drop or
-//! duplicate rows the way an offset-based query would.
+//! Every listing uses a stable canonical-id keyset order. Each page is a
+//! bounded observation of current state; continuation resumes strictly after
+//! the prior key and never relies on an offset that would shift under mutation.
 
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
@@ -67,10 +65,10 @@ pub struct TaskSummary {
 /// Result of a bounded `--all` traversal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AllLoopResult<T> {
-    /// The full snapshot fit within the local ceiling.
+    /// The source was exhausted without exceeding the local ceiling.
     Complete { items: Vec<T> },
     /// The local ceiling was reached before the source was exhausted; the
-    /// caller should resync from [`AllLoopResult::Partial`]'s next_cursor.
+    /// caller should resume from `next_cursor`.
     Partial {
         items: Vec<T>,
         next_cursor: Option<String>,
@@ -97,8 +95,13 @@ impl ApplicationQuery {
     ) -> Result<Page<BotSummary>, AppError> {
         let guard = self.lock()?;
         let bots: Vec<BotState> = guard.bots.values().cloned().collect();
-        let page = paginate(bots, |b| b.id.0.clone(), to_bot_summary, page_size, cursor.as_deref());
-        Ok(page)
+        Ok(paginate(
+            bots,
+            |bot| bot.id.0.clone(),
+            to_bot_summary,
+            page_size,
+            cursor.as_deref(),
+        ))
     }
 
     /// List conversations scoped to one bot as a bounded, cursor-ordered page.
@@ -112,17 +115,16 @@ impl ApplicationQuery {
         let conversations: Vec<ConversationState> = guard
             .conversations
             .values()
-            .filter(|c| c.bot_id == *bot_id)
+            .filter(|conversation| conversation.bot_id == *bot_id)
             .cloned()
             .collect();
-        let page = paginate(
+        Ok(paginate(
             conversations,
-            |c| c.id.0.clone(),
+            |conversation| conversation.id.0.clone(),
             to_conversation_summary,
             page_size,
             cursor.as_deref(),
-        );
-        Ok(page)
+        ))
     }
 
     /// List threads scoped to one conversation as a bounded, cursor-ordered page.
@@ -136,17 +138,16 @@ impl ApplicationQuery {
         let threads: Vec<ThreadState> = guard
             .threads
             .values()
-            .filter(|t| t.conversation_id == *conversation_id)
+            .filter(|thread| thread.conversation_id == *conversation_id)
             .cloned()
             .collect();
-        let page = paginate(
+        Ok(paginate(
             threads,
-            |t| t.id.0.clone(),
+            |thread| thread.id.0.clone(),
             to_thread_summary,
             page_size,
             cursor.as_deref(),
-        );
-        Ok(page)
+        ))
     }
 
     /// List tasks scoped to a bot/project/channel as a bounded, cursor-ordered page.
@@ -162,17 +163,16 @@ impl ApplicationQuery {
         let tasks: Vec<TaskState> = guard
             .tasks
             .values()
-            .filter(|t| t.owner == owner)
+            .filter(|task| task.owner == owner)
             .cloned()
             .collect();
-        let page = paginate(
+        Ok(paginate(
             tasks,
-            |t| t.id.0.clone(),
+            |task| task.id.0.clone(),
             to_task_summary,
             page_size,
             cursor.as_deref(),
-        );
-        Ok(page)
+        ))
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, DomainState>, AppError> {
@@ -184,11 +184,8 @@ impl ApplicationQuery {
 
 /// Bounded `--all` traversal over a paged fetch.
 ///
-/// Drains pages until either the source reports no more items — yielding
-/// [`AllLoopResult::Complete`] — or the number of collected items reaches the
-/// local ceiling, in which case it yields [`AllLoopResult::Partial`] carrying
-/// the cursor to resume/resync from, so an unbounded remote never runs a local
-/// process out of memory.
+/// Every request is clamped to the remaining local capacity, so a remote page
+/// can never cause the accumulator to overshoot `local_ceiling`.
 pub fn all_loop<T: Debug + Clone + PartialEq>(
     mut fetch: impl FnMut(usize, Option<String>) -> Result<Page<T>, AppError>,
     page_size: usize,
@@ -213,22 +210,63 @@ fn drain_all<T: Debug + Clone + PartialEq>(
     local_ceiling: usize,
     mut cursor: Option<String>,
 ) -> Result<AllLoopResult<T>, AppError> {
-    let mut items = Vec::new();
+    let page_size = page_size.max(1);
+    let mut items = Vec::with_capacity(local_ceiling.min(page_size));
+    if local_ceiling == 0 {
+        return Ok(AllLoopResult::Partial {
+            items,
+            next_cursor: cursor,
+        });
+    }
+
     loop {
-        let page = fetch(page_size, cursor)?;
-        let next_cursor = page.next_cursor;
-        let has_more = page.has_more;
-        items.extend(page.items);
-        if items.len() >= local_ceiling {
+        let remaining = local_ceiling.saturating_sub(items.len());
+        if remaining == 0 {
             return Ok(AllLoopResult::Partial {
                 items,
-                next_cursor,
+                next_cursor: cursor,
             });
         }
+
+        let request_size = page_size.min(remaining);
+        let request_cursor = cursor.clone();
+        let page = fetch(request_size, request_cursor.clone())?;
+        if page.items.len() > request_size {
+            return Err(AppError::Internal(format!(
+                "paged fetch exceeded requested bound: requested {request_size}, received {}",
+                page.items.len()
+            )));
+        }
+        if page.has_more && page.items.is_empty() {
+            return Err(AppError::Internal(
+                "paged fetch reported has_more without making item progress".to_owned(),
+            ));
+        }
+
+        let has_more = page.has_more;
+        let next_cursor = page.next_cursor;
+        items.extend(page.items);
+
         if !has_more {
             return Ok(AllLoopResult::Complete { items });
         }
-        cursor = next_cursor;
+
+        let next_cursor = next_cursor.ok_or_else(|| {
+            AppError::Internal("paged fetch reported has_more without next_cursor".to_owned())
+        })?;
+        if request_cursor.as_ref() == Some(&next_cursor) {
+            return Err(AppError::Internal(
+                "paged fetch returned a non-advancing cursor".to_owned(),
+            ));
+        }
+        cursor = Some(next_cursor);
+
+        if items.len() == local_ceiling {
+            return Ok(AllLoopResult::Partial {
+                items,
+                next_cursor: cursor,
+            });
+        }
     }
 }
 
@@ -292,7 +330,7 @@ pub(crate) fn paginate<S, T>(
     cursor: Option<&str>,
 ) -> Page<T> {
     let page_size = page_size.max(1);
-    source.sort_by_key(|a| key_of(a));
+    source.sort_by_key(|item| key_of(item));
     if let Some(cursor) = cursor {
         source.retain(|item| key_of(item).as_str() > cursor);
     }
