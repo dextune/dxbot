@@ -1,16 +1,16 @@
 //! Submission client: durable `Prepared`/`Dispatching` before send, binding
 //! lookup recovery, and replay from an in-memory journal.
 //!
-//! Request identity is validated before reuse or dispatch: a matching
-//! CommandId/IdempotencyKey is reusable only when its RequestDigest also
-//! matches the durable journal record.
+//! CommandId, OperationId, IdempotencyKey, RequestDigest, PrincipalRef, and
+//! InstanceId form one replay identity. No component is regenerated or silently
+//! replaced after the Prepared boundary.
 
 use std::cell::RefCell;
 use std::fmt;
 
 use dxbot_core::receipt::{ReceiptDisposition, ReceiptRecord};
 use dxbot_core::types::{
-    CommandId, IdempotencyKey, InstanceId, JournalRecord, JournalState, OperationId,
+    CanonicalTarget, CommandId, IdempotencyKey, InstanceId, JournalRecord, JournalState,
     OperationRequest, OperationResult, VersionInfo,
 };
 
@@ -28,6 +28,9 @@ pub enum ClientError {
     RecoveryRequired(CommandId),
     IdempotencyKeyConflict(CommandId),
     RequestDigestConflict(CommandId),
+    OperationIdConflict(CommandId),
+    RequestIdentityConflict(CommandId),
+    TransportIdentityConflict(CommandId),
     InstanceMismatch {
         client: InstanceId,
         request: InstanceId,
@@ -56,6 +59,21 @@ impl fmt::Display for ClientError {
             Self::RequestDigestConflict(command_id) => write!(
                 formatter,
                 "command id {} is already bound to a different request digest",
+                command_id.0
+            ),
+            Self::OperationIdConflict(command_id) => write!(
+                formatter,
+                "command id {} is already bound to a different operation id",
+                command_id.0
+            ),
+            Self::RequestIdentityConflict(command_id) => write!(
+                formatter,
+                "request identity is internally inconsistent for command {}",
+                command_id.0
+            ),
+            Self::TransportIdentityConflict(command_id) => write!(
+                formatter,
+                "transport returned an operation identity inconsistent with command {}",
                 command_id.0
             ),
             Self::InstanceMismatch { client, request } => write!(
@@ -114,22 +132,18 @@ impl SubmissionClientBuilder {
         self.hard_crash = hard_crash;
         self
     }
-
     pub fn with_transport(mut self, transport: Transport) -> Self {
         self.transport = Some(transport);
         self
     }
-
     pub fn with_journal(mut self, journal: JournalStore) -> Self {
         self.journal = journal;
         self
     }
-
     pub fn with_version(mut self, version: VersionInfo) -> Self {
         self.version = version;
         self
     }
-
     pub fn build(self) -> SubmissionClient {
         let default_instance = self.instance_id.clone();
         let transport = self.transport.unwrap_or_else(|| {
@@ -149,7 +163,6 @@ impl SubmissionClient {
     pub fn new(instance_id: InstanceId) -> Self {
         Self::builder(instance_id).build()
     }
-
     pub fn builder(instance_id: InstanceId) -> SubmissionClientBuilder {
         SubmissionClientBuilder {
             instance_id,
@@ -159,23 +172,18 @@ impl SubmissionClient {
             version: default_version(),
         }
     }
-
     pub fn get_version_compatibility(&self) -> Result<VersionInfo, ClientError> {
         Ok(self.version.clone())
     }
-
     pub fn hard_crash_enabled(&self) -> bool {
         self.hard_crash
     }
-
     pub fn journal_len(&self) -> usize {
         self.journal.borrow().len()
     }
-
     pub fn submit(&self, request: &OperationRequest) -> Result<OperationResult, ClientError> {
         self.submit_internal(request, None)
     }
-
     pub fn submit_with_crash_point(
         &self,
         request: &OperationRequest,
@@ -184,8 +192,6 @@ impl SubmissionClient {
         self.submit_internal(request, Some(crash_point))
     }
 
-    /// Binding lookup intentionally does not require a RequestDigest because it
-    /// is read-only recovery discovery; any replay still validates the digest.
     pub fn lookup_operation(
         &self,
         command_id: &CommandId,
@@ -206,12 +212,21 @@ impl SubmissionClient {
         let command_id = request.command_id.clone();
         match self.bind(&command_id, &request.idempotency_key) {
             Some((record, Some(result))) => {
-                ensure_request_digest(&record, request)?;
+                ensure_replay_identity(&record, request)?;
+                validate_result_identity(request, &result)?;
                 Ok(result)
             }
             Some((record, None)) => {
-                ensure_request_digest(&record, request)?;
+                ensure_replay_identity(&record, request)?;
+                match record.state {
+                    JournalState::Prepared => self.journal.borrow_mut().dispatch(&command_id)?,
+                    JournalState::Dispatching => {}
+                    JournalState::Observed | JournalState::Terminal | JournalState::Abandoned => {
+                        return Err(ClientError::RecoveryRequired(command_id));
+                    }
+                }
                 let result = self.send(request);
+                validate_result_identity(request, &result)?;
                 let mut store = self.journal.borrow_mut();
                 store.observe(&command_id, &result)?;
                 store.terminate(&command_id, &result)?;
@@ -230,26 +245,26 @@ impl SubmissionClient {
         let command_id = request.command_id.clone();
 
         if let Some((record, result)) = self.bind(&command_id, &request.idempotency_key) {
-            ensure_request_digest(&record, request)?;
+            ensure_replay_identity(&record, request)?;
             return match result {
-                Some(result) => Ok(result),
+                Some(result) => {
+                    validate_result_identity(request, &result)?;
+                    Ok(result)
+                }
                 None => Ok(recoverable_result(&command_id, &record)),
             };
         }
-
         if self.journal.borrow().lookup(&command_id).is_some() {
             return Err(ClientError::IdempotencyKeyConflict(command_id));
         }
 
         self.crash_at(crash, CrashPoint::BeforeCommit)?;
         self.journal.borrow_mut().prepare(self.prepared_base(request))?;
-
         self.crash_at(crash, CrashPoint::BeforeDispatching)?;
         self.journal.borrow_mut().dispatch(&command_id)?;
-
         self.crash_at(crash, CrashPoint::AfterDispatchingBeforeSend)?;
         let result = self.send(request);
-
+        validate_result_identity(request, &result)?;
         self.crash_at(crash, CrashPoint::AfterCommitBeforeResponse)?;
         let mut store = self.journal.borrow_mut();
         store.observe(&command_id, &result)?;
@@ -275,7 +290,6 @@ impl SubmissionClient {
         let transport = self.transport.borrow();
         (transport)(request)
     }
-
     fn bind(
         &self,
         command_id: &CommandId,
@@ -283,12 +297,12 @@ impl SubmissionClient {
     ) -> Option<(JournalRecord, Option<OperationResult>)> {
         self.journal.borrow().find_binding(command_id, key)
     }
-
     fn prepared_base(&self, request: &OperationRequest) -> JournalRecord {
         JournalRecord {
             state: JournalState::Prepared,
             instance_id: self.instance_id.clone(),
             command_id: request.command_id.clone(),
+            operation_id: request.new_operation_id.clone(),
             idempotency_key: request.idempotency_key.clone(),
             request_digest: request.request_digest.clone(),
             sequence: 0,
@@ -296,7 +310,6 @@ impl SubmissionClient {
             record_digest: String::new(),
         }
     }
-
     fn validate_request(&self, request: &OperationRequest) -> Result<(), ClientError> {
         if request.payload.instance_id != self.instance_id {
             return Err(ClientError::InstanceMismatch {
@@ -304,16 +317,46 @@ impl SubmissionClient {
                 request: request.payload.instance_id.clone(),
             });
         }
+        if request.idempotency_key.principal_ref != request.payload.principal_ref {
+            return Err(ClientError::RequestIdentityConflict(
+                request.command_id.clone(),
+            ));
+        }
+        if let CanonicalTarget::Instance(target_instance) = &request.payload.canonical_target {
+            if target_instance != &request.payload.instance_id {
+                return Err(ClientError::RequestIdentityConflict(
+                    request.command_id.clone(),
+                ));
+            }
+        }
         Ok(())
     }
 }
 
-fn ensure_request_digest(
+fn ensure_replay_identity(
     record: &JournalRecord,
     request: &OperationRequest,
 ) -> Result<(), ClientError> {
     if record.request_digest != request.request_digest {
-        return Err(ClientError::RequestDigestConflict(
+        return Err(ClientError::RequestDigestConflict(request.command_id.clone()));
+    }
+    if record.operation_id != request.new_operation_id {
+        return Err(ClientError::OperationIdConflict(request.command_id.clone()));
+    }
+    Ok(())
+}
+
+fn validate_result_identity(
+    request: &OperationRequest,
+    result: &OperationResult,
+) -> Result<(), ClientError> {
+    if result.command_id != request.command_id
+        || result.operation_id != request.new_operation_id
+        || result.instance_id != request.payload.instance_id
+        || result.receipt.operation_id != request.new_operation_id.0
+        || result.receipt.resolved_binding_digest != request.request_digest.0
+    {
+        return Err(ClientError::TransportIdentityConflict(
             request.command_id.clone(),
         ));
     }
@@ -354,13 +397,13 @@ fn committed_result(request: &OperationRequest, instance_id: &InstanceId) -> Ope
 
 fn recoverable_result(command_id: &CommandId, record: &JournalRecord) -> OperationResult {
     OperationResult {
-        operation_id: OperationId(format!("recovery:{}", command_id.0)),
+        operation_id: record.operation_id.clone(),
         command_id: command_id.clone(),
         instance_id: record.instance_id.clone(),
         receipt: ReceiptRecord {
-            operation_id: String::new(),
+            operation_id: record.operation_id.0.clone(),
             disposition: ReceiptDisposition::RecoveryRequired,
-            result_ref: String::new(),
+            result_ref: format!("operation:{}", record.operation_id.0),
             resolved_binding_digest: record.request_digest.0.clone(),
             owner_kind: "instance".to_owned(),
             lease_until: None,
