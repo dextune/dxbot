@@ -1,19 +1,15 @@
-//! In-memory domain state store.
-//!
-//! This is the plain state fixture backing [`crate::ApplicationMutator`]. It holds
-//! canonical domain entities plus operation/binding state. Everything here is
-//! in-memory only; there is no external I/O.
+//! In-memory domain state for the application fixture.
 
 use std::collections::HashMap;
 
 use dxbot_core::receipt::ReceiptRecord;
 use dxbot_core::types::{
-    BotId, CommandId, ConversationId, MessageId, OperationId, OperationResult, RequestDigest,
-    TaskId, ThreadId,
+    BotId, CommandId, ConversationId, OperationId, RequestDigest, TaskId, ThreadId,
 };
 
 use crate::delegation::DelegationRecord;
-use crate::membership::{AuthorityBinding, MembershipRecord};
+use crate::membership::MembershipRecord;
+use crate::subscription::SubscriptionRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleState {
@@ -21,15 +17,6 @@ pub enum LifecycleState {
     Inactive,
     Degraded,
     Terminated,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskStatus {
-    Pending,
-    Running,
-    Succeeded,
-    Failed,
-    Rejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +32,7 @@ pub struct ConversationState {
     pub id: ConversationId,
     pub bot_id: BotId,
     pub revision: i64,
-    pub messages: Vec<MessageId>,
+    pub messages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,38 +40,46 @@ pub struct ThreadState {
     pub id: ThreadId,
     pub conversation_id: ConversationId,
     pub revision: i64,
-    pub parent_message_id: Option<MessageId>,
+    pub parent_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatus {
+    Pending,
+    Running,
+    Suspended,
+    Succeeded,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskState {
     pub id: TaskId,
     pub owner: String,
+    pub status: TaskStatus,
     pub revision: i64,
     pub execution_generation: i64,
-    pub status: TaskStatus,
 }
 
-/// In-memory domain state store. Binding indexes deliberately mirror the two
-/// independent lookup dimensions required by the control protocol.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DomainState {
     pub bots: HashMap<BotId, BotState>,
     pub conversations: HashMap<ConversationId, ConversationState>,
     pub threads: HashMap<ThreadId, ThreadState>,
     pub tasks: HashMap<TaskId, TaskState>,
     pub receipts: HashMap<OperationId, ReceiptRecord>,
-    pub results: HashMap<OperationId, OperationResult>,
-    /// `CommandId -> OperationId` binding index.
+    pub results: HashMap<OperationId, dxbot_core::types::OperationResult>,
     pub command_bindings: HashMap<CommandId, OperationId>,
-    /// `CommandId -> RequestDigest`, used to reject same-command/different-request replay.
     pub command_request_digests: HashMap<CommandId, RequestDigest>,
-    /// `(PrincipalRef, IdempotencyKey digest) -> CommandId` second binding index.
-    pub idempotency_bindings: HashMap<(String, String), CommandId>,
+    /// Principal/key_digest identify the lookup index; expiry metadata is kept
+    /// in the value so changing it cannot silently mint a new binding.
+    pub idempotency_bindings: HashMap<(String, String), (i64, CommandId)>,
+    /// Membership owns membership facts only. Security authority remains owned
+    /// by runtime-security::AuthorityManager.
     pub memberships: HashMap<String, MembershipRecord>,
-    pub authority_bindings: HashMap<String, AuthorityBinding>,
     pub delegations: Vec<DelegationRecord>,
-    pub subscriptions: crate::subscription::SubscriptionRegistry,
+    pub subscriptions: SubscriptionRegistry,
 }
 
 impl DomainState {
