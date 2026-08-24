@@ -12,6 +12,7 @@ use dxbot_core::types::{
     BotId, BotSelector, CanonicalTarget, CommandId, CommandPayload, IdempotencyKey, InstanceId,
     OperationId, OperationRequest, PrincipalRef, RequestDigest, ScopeSelector,
 };
+use runtime_security::PrincipalStatus;
 
 fn create_bot_request(principal: &str, bot_id: &str, command_id: &str) -> OperationRequest {
     let principal_ref = PrincipalRef(format!("http:{principal}"));
@@ -73,6 +74,18 @@ fn grant(
     Ok(())
 }
 
+fn set_status(
+    security: &Arc<Mutex<SecurityState>>,
+    principal: &PrincipalRef,
+    status: PrincipalStatus,
+) -> Result<(), Box<dyn Error>> {
+    let mut guard = security
+        .lock()
+        .map_err(|_| "security state lock unavailable")?;
+    guard.principals.set_status(principal, status)?;
+    Ok(())
+}
+
 #[test]
 fn security_authenticate_resolves_principal() -> Result<(), Box<dyn Error>> {
     let (server, security) = server();
@@ -81,7 +94,7 @@ fn security_authenticate_resolves_principal() -> Result<(), Box<dyn Error>> {
     grant(&security, &alice, &bot_scope("bot-1"))?;
 
     let request = create_bot_request("alice", "bot-1", "cmd-1");
-    let result = server.handle_request(&request)?;
+    let result = server.handle_request(&alice, &request)?;
     assert_eq!(result.status, "committed");
     assert_eq!(result.command_id, request.command_id);
     assert_eq!(result.operation_id, request.new_operation_id);
@@ -94,12 +107,50 @@ fn security_authenticate_resolves_principal() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn security_client_principal_cannot_spoof_authenticated_peer() -> Result<(), Box<dyn Error>> {
+    let (server, security) = server();
+    let alice = PrincipalRef("http:alice".to_string());
+    register(&security, &alice)?;
+    grant(&security, &alice, &bot_scope("bot-1"))?;
+
+    let request = create_bot_request("mallory", "bot-1", "cmd-spoof");
+    assert!(matches!(
+        server.handle_request(&alice, &request),
+        Err(ServerError::PermissionDenied(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn security_inactive_principal_is_fenced() -> Result<(), Box<dyn Error>> {
+    let (server, security) = server();
+    let alice = PrincipalRef("http:alice".to_string());
+    register(&security, &alice)?;
+    grant(&security, &alice, &bot_scope("bot-1"))?;
+    let request = create_bot_request("alice", "bot-1", "cmd-inactive");
+
+    set_status(&security, &alice, PrincipalStatus::Suspended)?;
+    assert!(matches!(
+        server.handle_request(&alice, &request),
+        Err(ServerError::PermissionDenied(_))
+    ));
+
+    set_status(&security, &alice, PrincipalStatus::Revoked)?;
+    assert!(matches!(
+        server.handle_request(&alice, &request),
+        Err(ServerError::PermissionDenied(_))
+    ));
+    Ok(())
+}
+
+#[test]
 fn security_unauthorized_operation_is_denied() -> Result<(), Box<dyn Error>> {
     let (server, security) = server();
-    register(&security, &PrincipalRef("http:eve".to_string()))?;
+    let eve = PrincipalRef("http:eve".to_string());
+    register(&security, &eve)?;
 
     assert!(matches!(
-        server.handle_request(&create_bot_request("eve", "bot-1", "cmd-1")),
+        server.handle_request(&eve, &create_bot_request("eve", "bot-1", "cmd-1")),
         Err(ServerError::PermissionDenied(_))
     ));
     Ok(())
@@ -108,15 +159,17 @@ fn security_unauthorized_operation_is_denied() -> Result<(), Box<dyn Error>> {
 #[test]
 fn security_information_flow_is_fail_closed() -> Result<(), Box<dyn Error>> {
     let (server, security) = server();
+    let mallory = PrincipalRef("http:mallory".to_string());
     let request = create_bot_request("mallory", "bot-1", "cmd-1");
     assert!(matches!(
-        server.handle_request(&request),
+        server.handle_request(&mallory, &request),
         Err(ServerError::PermissionDenied(_))
     ));
 
-    register(&security, &PrincipalRef("http:eve".to_string()))?;
+    let eve = PrincipalRef("http:eve".to_string());
+    register(&security, &eve)?;
     assert!(matches!(
-        server.handle_request(&create_bot_request("eve", "bot-1", "cmd-2")),
+        server.handle_request(&eve, &create_bot_request("eve", "bot-1", "cmd-2")),
         Err(ServerError::PermissionDenied(_))
     ));
     Ok(())
@@ -128,15 +181,35 @@ fn security_nonexistent_target_does_not_disclose_existence() -> Result<(), Box<d
     let alice = PrincipalRef("http:alice".to_string());
     register(&security, &alice)?;
     grant(&security, &alice, &bot_scope("ghost-bot"))?;
-    assert!(
-        server
-            .handle_request(&create_bot_request("alice", "ghost-bot", "cmd-ghost"))
-            .is_ok()
-    );
+    assert!(server
+        .handle_request(
+            &alice,
+            &create_bot_request("alice", "ghost-bot", "cmd-ghost")
+        )
+        .is_ok());
 
-    register(&security, &PrincipalRef("http:carol".to_string()))?;
+    let carol = PrincipalRef("http:carol".to_string());
+    register(&security, &carol)?;
     assert!(matches!(
-        server.handle_request(&create_bot_request("carol", "other-ghost", "cmd-ghost2")),
+        server.handle_request(
+            &carol,
+            &create_bot_request("carol", "other-ghost", "cmd-ghost2")
+        ),
+        Err(ServerError::PermissionDenied(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn security_unknown_target_scope_fails_closed() -> Result<(), Box<dyn Error>> {
+    let (server, security) = server();
+    let alice = PrincipalRef("http:alice".to_string());
+    register(&security, &alice)?;
+    let mut request = create_bot_request("alice", "bot-1", "cmd-instance");
+    request.payload.canonical_target = CanonicalTarget::Instance(InstanceId("instance-1".into()));
+
+    assert!(matches!(
+        server.handle_request(&alice, &request),
         Err(ServerError::PermissionDenied(_))
     ));
     Ok(())
@@ -151,12 +224,12 @@ fn security_same_command_id_with_changed_digest_conflicts_after_authorization(
     grant(&security, &alice, &bot_scope("bot-1"))?;
 
     let request = create_bot_request("alice", "bot-1", "cmd-1");
-    server.handle_request(&request)?;
+    server.handle_request(&alice, &request)?;
     let mut conflicting = request.clone();
     conflicting.request_digest = RequestDigest("changed-digest".to_string());
     conflicting.new_operation_id = OperationId("changed-operation".to_string());
     assert!(matches!(
-        server.handle_request(&conflicting),
+        server.handle_request(&alice, &conflicting),
         Err(ServerError::Conflict(_))
     ));
     Ok(())
