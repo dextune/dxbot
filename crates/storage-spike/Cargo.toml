@@ -1,7 +1,7 @@
 [package]
 name = "storage-spike"
 version = "0.1.0"
-description = "Internal executable storage semantics proof for DXBOT M1A."
+description = "Internal executable storage semantics and recovery backstop proof for DXBOT M1A."
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 dxbot-core = { path = "../dxbot-core" }
+runtime-audit = { path = "../runtime-audit" }
+sha2 = "0.10"
 
 [[bin]]
 name = "storage-crash-probe"

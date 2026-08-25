@@ -208,8 +208,6 @@ impl AuditLogger {
             return Err(Error::CorruptLog);
         }
 
-        // Sequence allocation is inside the same critical section as append,
-        // so record order and monotonically increasing IDs cannot diverge.
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         record.id = format!("audit-{sequence:016x}");
         store.push(record.clone());
@@ -301,6 +299,11 @@ fn classify(payload: &str) -> RedactionLevel {
 fn is_secret_like(token: &str) -> bool {
     let lower = token.to_lowercase();
     SECRET_HINTS.iter().any(|hint| lower.contains(hint))
+}
+
+pub(crate) fn redact_diagnostic_value(value: &str) -> String {
+    let level = classify(value);
+    redact_payload(value, level)
 }
 
 fn now_unix_secs() -> i64 {
