@@ -19,7 +19,8 @@ path = "src/bin/journal_helper.rs"
 workspace = true
 
 [dependencies]
-dxbot-core = { path = "../dxbot-core" }
 application-contract = { path = "../application-contract" }
+dxbot-core = { path = "../dxbot-core" }
+fs2 = "0.4.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

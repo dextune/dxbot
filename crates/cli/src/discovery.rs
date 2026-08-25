@@ -1,20 +1,10 @@
-//! CLI discovery: local help/version, first-run bootstrap, exact Instance
-//! selection, and provider doctor.
+//! CLI discovery: local help/version, exact Instance selection, and provider
+//! descriptor diagnostics.
 //!
-//! Local Instance selection follows the [`DXB-RUN-035`] precedence order:
-//!
-//! ```text
-//! explicit --instance
-//! → explicit/selected profile binding
-//! → exactly one verified local endpoint
-//! ```
-//!
-//! Selection is exact: it never silently falls back, never auto-starts a
-//! Runtime, and never bootstraps except through [`Discovery::first_run_bootstrap`].
-//! A missing candidate is `runtime-unavailable` (exit 10); multiple candidates
-//! are `ambiguous-target` (exit 5).
-//!
-//! [`DXB-RUN-035`]: https://dxbot.local/docs/plan/35-configuration-deployment
+//! Discovery is a read/selection boundary, not a Runtime Host. It never
+//! fabricates a Runtime endpoint, authenticated peer, provider readiness, or
+//! first-Instance state. First-run bootstrap remains owned by the Runtime Host
+//! coordinator defined by DXB-RUN-035.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::module_name_repetitions)]
@@ -28,125 +18,91 @@ use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
 use dxbot_core::types::{InstanceId, VersionInfo};
 use serde::{Deserialize, Serialize};
 
-/// Name of the discovery state file inside the CLI state directory.
 pub const DISCOVERY_STATE_FILE: &str = "discovery.json";
-
-/// Capabilities a ready production provider must expose. Reported by
-/// [`Discovery::doctor_provider`] as the required capability surface.
 pub const REQUIRED_PROVIDER_CAPABILITIES: &[&str] = &["llm-chat", "embeddings", "auth"];
 
-/// A verified local endpoint for a Runtime Instance.
-///
-/// Persisted in [`DiscoveryState`]. `profile` is a discovery hint only and is
-/// not an Authority; instance identity is owned by the InstanceId.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryEndpoint {
-    /// The Instance this endpoint serves.
     pub instance_id: InstanceId,
-    /// Optional profile binding hint (discovery hint, not Authority).
     pub profile: Option<String>,
-    /// Local endpoint address (scheme + path) used to reach the Runtime.
     pub endpoint: String,
-    /// HostGeneration fencing this endpoint's process incarnation.
     pub host_generation: i64,
-    /// Representative provider id reported by [`Discovery::doctor_provider`].
     pub provider_id: String,
-    /// Whether the configured production provider is ready on this Instance.
     pub provider_ready: bool,
 }
 
-/// Result of [`Discovery::doctor_provider`] for a single Instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderDiagnostic {
-    /// The provider id being diagnosed.
     pub provider_id: String,
-    /// `"ready"` when the provider is available, `"unavailable"` otherwise.
     pub status: String,
-    /// Capabilities the provider is required to expose.
     pub required_capabilities: Vec<String>,
-    /// Whether the provider is currently available on this Instance.
     pub available: bool,
 }
 
-/// Discovery state persisted under the CLI state directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryState {
-    /// Known Instance endpoints keyed by InstanceId.
     pub instance_endpoints: HashMap<InstanceId, DiscoveryEndpoint>,
 }
 
 impl DiscoveryState {
-    /// Loads discovery state from `base_path` (the `…/dxbot/cli/` directory).
-    ///
-    /// A missing or empty state file yields an empty [`DiscoveryState`] rather
-    /// than an error, so a fresh install reports "no Instance" instead of
-    /// failing on I/O.
     pub fn load_state(base_path: &Path) -> Result<Self, DiscoveryError> {
         let path = base_path.join(DISCOVERY_STATE_FILE);
         let data = match fs::read(&path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == ErrorKind::NotFound => {
+            Ok(data) => data,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
                 return Ok(Self {
                     instance_endpoints: HashMap::new(),
                 });
             }
-            Err(e) => {
-                return Err(DiscoveryError::state_io(&path, e));
-            }
+            Err(error) => return Err(DiscoveryError::state_io(&path, error)),
         };
-        match serde_json::from_slice(&data) {
-            Ok(state) => Ok(state),
-            Err(e) => Err(DiscoveryError::state_io(&path, e.into())),
-        }
+        serde_json::from_slice(&data).map_err(|error| DiscoveryError::StateIo {
+            path,
+            message: error.to_string(),
+        })
     }
 
-    /// Persists `self` to `base_path` using a temp file + fsync + atomic
-    /// rename so a failed write never leaves a half-written state file.
+    /// Persists only already-verified descriptors supplied by the Runtime Host
+    /// integration boundary. This method does not discover or verify peers.
     pub fn save_state(&self, base_path: &Path) -> Result<(), DiscoveryError> {
         fs::create_dir_all(base_path)
-            .map_err(|e| DiscoveryError::state_io(base_path, e))?;
+            .map_err(|error| DiscoveryError::state_io(base_path, error))?;
         let path = base_path.join(DISCOVERY_STATE_FILE);
         let tmp = base_path.join(format!("{DISCOVERY_STATE_FILE}.tmp"));
-        let bytes =
-            serde_json::to_vec(self).map_err(|e| DiscoveryError::state_io(&path, e.into()))?;
+        let bytes = serde_json::to_vec(self).map_err(|error| DiscoveryError::StateIo {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
         {
-            let mut file =
-                File::create(&tmp).map_err(|e| DiscoveryError::state_io(&tmp, e))?;
+            let mut file = File::create(&tmp)
+                .map_err(|error| DiscoveryError::state_io(&tmp, error))?;
             file.write_all(&bytes)
-                .map_err(|e| DiscoveryError::state_io(&tmp, e))?;
-            file.sync_all().map_err(|e| DiscoveryError::state_io(&tmp, e))?;
+                .map_err(|error| DiscoveryError::state_io(&tmp, error))?;
+            file.sync_all()
+                .map_err(|error| DiscoveryError::state_io(&tmp, error))?;
         }
-        fs::rename(&tmp, &path).map_err(|e| DiscoveryError::state_io(&tmp, e))?;
+        fs::rename(&tmp, &path).map_err(|error| DiscoveryError::state_io(&tmp, error))?;
         Ok(())
     }
 }
 
-/// Errors produced by the CLI discovery module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryError {
-    /// No Instance matched the selection hints. Maps to `runtime-unavailable`
-    /// (exit 10).
     NoInstance { message: String },
-    /// More than one candidate matched. Maps to `ambiguous-target` (exit 5).
     Ambiguous { candidates: Vec<InstanceId> },
-    /// A requested Instance id is not present.
     NotFound { instance_id: InstanceId },
-    /// Cannot read/write discovery state.
     StateIo { path: PathBuf, message: String },
-    /// First-run bootstrap attempted while Instances already exist.
     BootstrapConflict { existing: Vec<InstanceId> },
 }
 
 impl DiscoveryError {
-    fn state_io(path: &Path, e: std::io::Error) -> Self {
+    fn state_io(path: &Path, error: std::io::Error) -> Self {
         Self::StateIo {
             path: path.to_path_buf(),
-            message: e.to_string(),
+            message: error.to_string(),
         }
     }
 
-    /// Projects this error onto the canonical [`DxbotError`] surface so the
-    /// CLI can fall through to the standard error/exit-code contract.
     pub fn to_dxbot_error(&self) -> DxbotError {
         match self {
             Self::NoInstance { message } => dxbot_error(
@@ -155,8 +111,7 @@ impl DiscoveryError {
                 message.clone(),
             ),
             Self::Ambiguous { candidates } => {
-                let names: Vec<String> =
-                    candidates.iter().map(|id| id.0.clone()).collect();
+                let names: Vec<String> = candidates.iter().map(|id| id.0.clone()).collect();
                 dxbot_error(
                     ErrorCode::AmbiguousTarget,
                     ErrorCategory::Conflict,
@@ -174,8 +129,7 @@ impl DiscoveryError {
                 format!("cannot access discovery state {}: {message}", path.display()),
             ),
             Self::BootstrapConflict { existing } => {
-                let names: Vec<String> =
-                    existing.iter().map(|id| id.0.clone()).collect();
+                let names: Vec<String> = existing.iter().map(|id| id.0.clone()).collect();
                 dxbot_error(
                     ErrorCode::Conflict,
                     ErrorCategory::Conflict,
@@ -210,33 +164,30 @@ fn default_base_path() -> PathBuf {
     }
     if let Some(home) = std::env::var_os("HOME") {
         if !home.is_empty() {
-            return PathBuf::from(home).join(".local").join("state").join("dxbot").join("cli");
+            return PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("dxbot")
+                .join("cli");
         }
     }
     PathBuf::from("dxbot-state").join("cli")
 }
 
-/// CLI discovery entry point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovery {
     base_path: PathBuf,
 }
 
 impl Discovery {
-    /// Creates a discovery view rooted at the default CLI state directory
-    /// (`$XDG_STATE_HOME/dxbot/cli`, falling back to `~/.local/state/dxbot/cli`).
     pub fn new() -> Self {
         Self::at(default_base_path())
     }
 
-    /// Creates a discovery view rooted at `base_path`.
-    ///
-    /// Primarily used by tests and embedders that must isolate state.
     pub fn at(base_path: PathBuf) -> Self {
         Self { base_path }
     }
 
-    /// Returns the top-level help text covering every command group.
     pub fn show_help() -> String {
         "\
 dxb — DXBOT command line interface
@@ -244,7 +195,7 @@ dxb — DXBOT command line interface
 Usage:
   dxb <command> [options]
   dxb --help
-  dxb --version [--format json|jsonl]
+  dxb --version [--format human|json|jsonl]
   dxb [--profile <name>] [--instance <id>] <group> <command> [options]
 
 Global options:
@@ -273,19 +224,19 @@ Command groups:
   process       Show, watch.
   version       Show client version and protocol compatibility.
 
-Instance selection (DXB-RUN-035 precedence):
+Instance selection:
   explicit --instance, then profile binding, then exactly one verified local
   endpoint. No silent fallback. No Instance is runtime-unavailable (exit 10);
   more than one candidate is ambiguous-target (exit 5).
 
-First run:
-  `dxb runtime start` bootstraps the first Instance only when none exist.
-  Other commands never auto-start or auto-bootstrap a Runtime.
+Runtime bootstrap:
+  First-Instance creation belongs to the Runtime Host coordinator. Discovery
+  never fabricates an endpoint or provider-ready descriptor. Until the
+  authenticated control path is connected, runtime operations fail closed.
 "
-    .to_string()
+        .to_string()
     }
 
-    /// Returns the client version information.
     pub fn show_version() -> VersionInfo {
         VersionInfo {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -295,12 +246,6 @@ First run:
         }
     }
 
-    /// Selects exactly one Instance from `profile`/`instance` hints.
-    ///
-    /// Selection is exact and follows DXB-RUN-035 precedence. Returns
-    /// [`DiscoveryError::NoInstance`] when nothing matches and
-    /// [`DiscoveryError::Ambiguous`] when multiple candidates match. It never
-    /// bootstraps and never silently falls back to another Instance.
     pub fn select_instance(
         &self,
         profile: Option<&str>,
@@ -314,12 +259,12 @@ First run:
                 .filter(|id| id.0 == name)
                 .cloned()
                 .collect()
-        } else if let Some(prof) = profile {
+        } else if let Some(profile) = profile {
             state
                 .instance_endpoints
                 .values()
-                .filter(|ep| ep.profile.as_deref() == Some(prof))
-                .map(|ep| ep.instance_id.clone())
+                .filter(|endpoint| endpoint.profile.as_deref() == Some(profile))
+                .map(|endpoint| endpoint.instance_id.clone())
                 .collect()
         } else {
             state.instance_endpoints.keys().cloned().collect()
@@ -333,8 +278,8 @@ First run:
         if candidates.is_empty() {
             let wanted = match (profile, instance) {
                 (_, Some(name)) => format!("instance '{name}'"),
-                (Some(prof), None) => format!("profile '{prof}'"),
-                (None, None) => "any local Instance".to_string(),
+                (Some(profile), None) => format!("profile '{profile}'"),
+                (None, None) => "any verified local Instance".to_string(),
             };
             return Err(DiscoveryError::NoInstance {
                 message: format!("no Runtime Instance found matching {wanted}"),
@@ -343,34 +288,22 @@ First run:
         Err(DiscoveryError::Ambiguous { candidates })
     }
 
-    /// Bootstraps the first Instance when none exist.
-    ///
-    /// Creates the default state directory and the default Instance, persists
-    /// the state, and returns the new InstanceId. Refuses
-    /// ([`DiscoveryError::BootstrapConflict`]) when Instances already exist.
+    /// Refuses to synthesize first-run state in the CLI layer. The Runtime Host
+    /// must perform atomic bootstrap and endpoint authentication, then publish
+    /// the verified descriptor through the integration boundary.
     pub fn first_run_bootstrap(&self) -> Result<InstanceId, DiscoveryError> {
-        let mut state = DiscoveryState::load_state(&self.base_path)?;
+        let state = DiscoveryState::load_state(&self.base_path)?;
         if !state.instance_endpoints.is_empty() {
-            let existing: Vec<InstanceId> =
-                state.instance_endpoints.keys().cloned().collect();
-            return Err(DiscoveryError::BootstrapConflict { existing });
+            return Err(DiscoveryError::BootstrapConflict {
+                existing: state.instance_endpoints.keys().cloned().collect(),
+            });
         }
-
-        let id = InstanceId("default".to_string());
-        let descriptor = DiscoveryEndpoint {
-            instance_id: id.clone(),
-            profile: Some("default".to_string()),
-            endpoint: "local://default".to_string(),
-            host_generation: 1,
-            provider_id: "reference".to_string(),
-            provider_ready: true,
-        };
-        state.instance_endpoints.insert(id.clone(), descriptor);
-        state.save_state(&self.base_path)?;
-        Ok(id)
+        Err(DiscoveryError::NoInstance {
+            message: "first-run bootstrap requires the Runtime Host coordinator; discovery did not publish an unverified endpoint"
+                .to_string(),
+        })
     }
 
-    /// Diagnoses provider availability for the given Instance.
     pub fn doctor_provider(
         &self,
         instance_id: &InstanceId,
@@ -392,7 +325,7 @@ First run:
             status: status.to_string(),
             required_capabilities: REQUIRED_PROVIDER_CAPABILITIES
                 .iter()
-                .map(|s| s.to_string())
+                .map(|capability| (*capability).to_string())
                 .collect(),
             available: descriptor.provider_ready,
         })

@@ -13,7 +13,7 @@ use dxbot_core::types::{
 };
 
 use crate::delegation::DelegationRecord;
-use crate::membership::{AuthorityBinding, MembershipRecord};
+use crate::membership::MembershipRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleState {
@@ -65,8 +65,15 @@ pub struct TaskState {
     pub status: TaskStatus,
 }
 
-/// In-memory domain state store. Binding indexes deliberately mirror the two
-/// independent lookup dimensions required by the control protocol.
+/// Durable metadata attached to the principal/key-digest idempotency index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyBindingState {
+    pub command_id: CommandId,
+    pub expires_at: i64,
+}
+
+/// In-memory domain state store. Security AuthorityBinding deliberately does
+/// not live here: runtime-security is its sole canonical owner.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DomainState {
     pub bots: HashMap<BotId, BotState>,
@@ -75,14 +82,10 @@ pub struct DomainState {
     pub tasks: HashMap<TaskId, TaskState>,
     pub receipts: HashMap<OperationId, ReceiptRecord>,
     pub results: HashMap<OperationId, OperationResult>,
-    /// `CommandId -> OperationId` binding index.
     pub command_bindings: HashMap<CommandId, OperationId>,
-    /// `CommandId -> RequestDigest`, used to reject same-command/different-request replay.
     pub command_request_digests: HashMap<CommandId, RequestDigest>,
-    /// `(PrincipalRef, IdempotencyKey digest) -> CommandId` second binding index.
-    pub idempotency_bindings: HashMap<(String, String), CommandId>,
+    pub idempotency_bindings: HashMap<(String, String), IdempotencyBindingState>,
     pub memberships: HashMap<String, MembershipRecord>,
-    pub authority_bindings: HashMap<String, AuthorityBinding>,
     pub delegations: Vec<DelegationRecord>,
     pub subscriptions: crate::subscription::SubscriptionRegistry,
 }

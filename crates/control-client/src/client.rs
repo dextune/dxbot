@@ -1,17 +1,18 @@
 //! Submission client: durable `Prepared`/`Dispatching` before send, binding
-//! lookup recovery, and replay from an in-memory journal.
+//! lookup recovery, and replay from an injected control transport.
 //!
-//! Request identity is validated before reuse or dispatch: a matching
-//! CommandId/IdempotencyKey is reusable only when its RequestDigest also
-//! matches the durable journal record.
+//! CommandId, OperationId, IdempotencyKey, RequestDigest, and InstanceId are a
+//! single replay identity. No component is regenerated or silently replaced
+//! after the Prepared boundary. A missing authenticated transport fails closed;
+//! the client never fabricates a committed result.
 
 use std::cell::RefCell;
 use std::fmt;
 
 use dxbot_core::receipt::{ReceiptDisposition, ReceiptRecord};
 use dxbot_core::types::{
-    CommandId, IdempotencyKey, InstanceId, JournalRecord, JournalState, OperationId,
-    OperationRequest, OperationResult, VersionInfo,
+    CommandId, IdempotencyKey, InstanceId, JournalRecord, JournalState, OperationRequest,
+    OperationResult, VersionInfo,
 };
 
 use crate::crash::CrashPoint;
@@ -26,8 +27,11 @@ pub enum ClientError {
     AlreadyExists(CommandId),
     NotCommitted(CommandId),
     RecoveryRequired(CommandId),
+    TransportUnavailable,
     IdempotencyKeyConflict(CommandId),
     RequestDigestConflict(CommandId),
+    OperationIdConflict(CommandId),
+    TransportIdentityConflict(CommandId),
     InstanceMismatch {
         client: InstanceId,
         request: InstanceId,
@@ -48,6 +52,9 @@ impl fmt::Display for ClientError {
             Self::RecoveryRequired(command_id) => {
                 write!(formatter, "recovery required before reissue: {}", command_id.0)
             }
+            Self::TransportUnavailable => {
+                write!(formatter, "authenticated control transport is not configured")
+            }
             Self::IdempotencyKeyConflict(command_id) => write!(
                 formatter,
                 "command id {} is already bound to a different idempotency key",
@@ -56,6 +63,16 @@ impl fmt::Display for ClientError {
             Self::RequestDigestConflict(command_id) => write!(
                 formatter,
                 "command id {} is already bound to a different request digest",
+                command_id.0
+            ),
+            Self::OperationIdConflict(command_id) => write!(
+                formatter,
+                "command id {} is already bound to a different operation id",
+                command_id.0
+            ),
+            Self::TransportIdentityConflict(command_id) => write!(
+                formatter,
+                "transport returned an operation identity inconsistent with command {}",
                 command_id.0
             ),
             Self::InstanceMismatch { client, request } => write!(
@@ -73,7 +90,7 @@ pub struct SubmissionClient {
     pub instance_id: InstanceId,
     hard_crash: bool,
     journal: RefCell<JournalStore>,
-    transport: RefCell<Transport>,
+    transport: Option<RefCell<Transport>>,
     version: VersionInfo,
 }
 
@@ -84,6 +101,7 @@ impl fmt::Debug for SubmissionClient {
             .field("instance_id", &self.instance_id)
             .field("hard_crash", &self.hard_crash)
             .field("journal_len", &self.journal.borrow().len())
+            .field("transport_configured", &self.transport.is_some())
             .field("client_version", &self.version.client_version)
             .finish_non_exhaustive()
     }
@@ -131,15 +149,11 @@ impl SubmissionClientBuilder {
     }
 
     pub fn build(self) -> SubmissionClient {
-        let default_instance = self.instance_id.clone();
-        let transport = self.transport.unwrap_or_else(|| {
-            Box::new(move |request| committed_result(request, &default_instance))
-        });
         SubmissionClient {
             instance_id: self.instance_id,
             hard_crash: self.hard_crash,
             journal: RefCell::new(self.journal),
-            transport: RefCell::new(transport),
+            transport: self.transport.map(RefCell::new),
             version: self.version,
         }
     }
@@ -184,8 +198,8 @@ impl SubmissionClient {
         self.submit_internal(request, Some(crash_point))
     }
 
-    /// Binding lookup intentionally does not require a RequestDigest because it
-    /// is read-only recovery discovery; any replay still validates the digest.
+    /// Binding lookup is read-only discovery. It returns the original durable
+    /// OperationId even when a terminal result has not yet been observed.
     pub fn lookup_operation(
         &self,
         command_id: &CommandId,
@@ -206,12 +220,15 @@ impl SubmissionClient {
         let command_id = request.command_id.clone();
         match self.bind(&command_id, &request.idempotency_key) {
             Some((record, Some(result))) => {
-                ensure_request_digest(&record, request)?;
+                ensure_replay_identity(&record, request)?;
+                validate_result_identity(request, &result)?;
                 Ok(result)
             }
             Some((record, None)) => {
-                ensure_request_digest(&record, request)?;
-                let result = self.send(request);
+                ensure_replay_identity(&record, request)?;
+                self.ensure_transport()?;
+                let result = self.send(request)?;
+                validate_result_identity(request, &result)?;
                 let mut store = self.journal.borrow_mut();
                 store.observe(&command_id, &result)?;
                 store.terminate(&command_id, &result)?;
@@ -230,9 +247,12 @@ impl SubmissionClient {
         let command_id = request.command_id.clone();
 
         if let Some((record, result)) = self.bind(&command_id, &request.idempotency_key) {
-            ensure_request_digest(&record, request)?;
+            ensure_replay_identity(&record, request)?;
             return match result {
-                Some(result) => Ok(result),
+                Some(result) => {
+                    validate_result_identity(request, &result)?;
+                    Ok(result)
+                }
                 None => Ok(recoverable_result(&command_id, &record)),
             };
         }
@@ -241,20 +261,34 @@ impl SubmissionClient {
             return Err(ClientError::IdempotencyKeyConflict(command_id));
         }
 
+        // Missing transport is a PreAccept/local failure. Do not create a
+        // Prepared record for an operation that cannot be dispatched at all.
+        self.ensure_transport()?;
         self.crash_at(crash, CrashPoint::BeforeCommit)?;
-        self.journal.borrow_mut().prepare(self.prepared_base(request))?;
+        self.journal
+            .borrow_mut()
+            .prepare(self.prepared_base(request))?;
 
         self.crash_at(crash, CrashPoint::BeforeDispatching)?;
         self.journal.borrow_mut().dispatch(&command_id)?;
 
         self.crash_at(crash, CrashPoint::AfterDispatchingBeforeSend)?;
-        let result = self.send(request);
+        let result = self.send(request)?;
+        validate_result_identity(request, &result)?;
 
         self.crash_at(crash, CrashPoint::AfterCommitBeforeResponse)?;
         let mut store = self.journal.borrow_mut();
         store.observe(&command_id, &result)?;
         store.terminate(&command_id, &result)?;
         Ok(result)
+    }
+
+    fn ensure_transport(&self) -> Result<(), ClientError> {
+        if self.transport.is_some() {
+            Ok(())
+        } else {
+            Err(ClientError::TransportUnavailable)
+        }
     }
 
     fn crash_at(
@@ -271,9 +305,12 @@ impl SubmissionClient {
         Ok(())
     }
 
-    fn send(&self, request: &OperationRequest) -> OperationResult {
-        let transport = self.transport.borrow();
-        (transport)(request)
+    fn send(&self, request: &OperationRequest) -> Result<OperationResult, ClientError> {
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or(ClientError::TransportUnavailable)?;
+        Ok((transport.borrow())(request))
     }
 
     fn bind(
@@ -289,6 +326,7 @@ impl SubmissionClient {
             state: JournalState::Prepared,
             instance_id: self.instance_id.clone(),
             command_id: request.command_id.clone(),
+            operation_id: request.new_operation_id.clone(),
             idempotency_key: request.idempotency_key.clone(),
             request_digest: request.request_digest.clone(),
             sequence: 0,
@@ -308,12 +346,30 @@ impl SubmissionClient {
     }
 }
 
-fn ensure_request_digest(
+fn ensure_replay_identity(
     record: &JournalRecord,
     request: &OperationRequest,
 ) -> Result<(), ClientError> {
     if record.request_digest != request.request_digest {
-        return Err(ClientError::RequestDigestConflict(
+        return Err(ClientError::RequestDigestConflict(request.command_id.clone()));
+    }
+    if record.operation_id != request.new_operation_id {
+        return Err(ClientError::OperationIdConflict(request.command_id.clone()));
+    }
+    Ok(())
+}
+
+fn validate_result_identity(
+    request: &OperationRequest,
+    result: &OperationResult,
+) -> Result<(), ClientError> {
+    if result.command_id != request.command_id
+        || result.operation_id != request.new_operation_id
+        || result.instance_id != request.payload.instance_id
+        || result.receipt.operation_id != request.new_operation_id.0
+        || result.receipt.resolved_binding_digest != request.request_digest.0
+    {
+        return Err(ClientError::TransportIdentityConflict(
             request.command_id.clone(),
         ));
     }
@@ -329,38 +385,15 @@ fn default_version() -> VersionInfo {
     }
 }
 
-fn committed_result(request: &OperationRequest, instance_id: &InstanceId) -> OperationResult {
-    let operation_id = request.new_operation_id.clone();
-    OperationResult {
-        operation_id: operation_id.clone(),
-        command_id: request.command_id.clone(),
-        instance_id: instance_id.clone(),
-        receipt: ReceiptRecord {
-            operation_id: operation_id.0.clone(),
-            disposition: ReceiptDisposition::Committed,
-            result_ref: format!("result:{}", operation_id.0),
-            resolved_binding_digest: request.request_digest.0.clone(),
-            owner_kind: "instance".to_owned(),
-            lease_until: None,
-            last_progress: 0,
-            reconciliation_policy: "at-least-once".to_owned(),
-        },
-        status: "committed".to_owned(),
-        committed_payload: None,
-        error: None,
-        operation_may_continue: false,
-    }
-}
-
 fn recoverable_result(command_id: &CommandId, record: &JournalRecord) -> OperationResult {
     OperationResult {
-        operation_id: OperationId(format!("recovery:{}", command_id.0)),
+        operation_id: record.operation_id.clone(),
         command_id: command_id.clone(),
         instance_id: record.instance_id.clone(),
         receipt: ReceiptRecord {
-            operation_id: String::new(),
+            operation_id: record.operation_id.0.clone(),
             disposition: ReceiptDisposition::RecoveryRequired,
-            result_ref: String::new(),
+            result_ref: format!("operation:{}", record.operation_id.0),
             resolved_binding_digest: record.request_digest.0.clone(),
             owner_kind: "instance".to_owned(),
             lease_until: None,

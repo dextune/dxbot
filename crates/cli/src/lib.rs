@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
-/// Local journal: single-writer takeover, hash chain, bounded retention.
+/// Local journal: OS-locked single-writer ownership, hash chain, bounded retention.
 pub mod journal;
 
-/// CLI discovery: help/version, first-run bootstrap, exact Instance selection,
-/// and provider doctor.
+/// CLI discovery: help/version, exact Instance selection, fail-closed Runtime
+/// bootstrap delegation, and provider descriptor diagnostics.
 pub mod discovery;
 
 /// Exact, ambiguity-safe resource selector resolution (`AT-CLI-009`).
@@ -34,21 +34,21 @@ pub mod confirmation;
 /// applied-wait (`AT-CLI-010`).
 pub mod directive;
 
+pub use automation::{MachineRenderer, StreamEvent};
 pub use commands::{CommandsError, CoreCommands, TaskOptions};
-pub use directive::{
-    DirectiveController, DirectiveError, WaitResult, CMD_TASK_CANCEL, CMD_TASK_REDIRECT,
-    CMD_TASK_RESUME, CMD_TASK_SUSPEND,
-};
 pub use confirmation::{Confirmation, ConfirmationError};
+pub use directive::{
+    CMD_TASK_CANCEL, CMD_TASK_REDIRECT, CMD_TASK_RESUME, CMD_TASK_SUSPEND, DirectiveController,
+    DirectiveError, WaitResult,
+};
 pub use discovery::{Discovery, DiscoveryState, ProviderDiagnostic};
 pub use interactive::{
     ConflictStatus, InteractiveError, InteractiveJourney, PreflightResult, ProviderStatus,
 };
 pub use journal::LocalJournal;
-pub use automation::{MachineRenderer, StreamEvent};
-pub use safe_writer::SafeWriter;
-pub use selector::SelectorResolver;
 pub use recovery::{
     BindingKey, BindingLookup, RecoveryAction, RecoveryEntry, RecoveryError, RecoveryManager,
     ReusedIds,
 };
+pub use safe_writer::SafeWriter;
+pub use selector::SelectorResolver;

@@ -5,9 +5,10 @@
 use std::error::Error;
 
 use control_client::{ClientError, CrashPoint, SubmissionClient};
+use dxbot_core::receipt::{ReceiptDisposition, ReceiptRecord};
 use dxbot_core::types::{
-    CanonicalTarget, CommandId, CommandPayload, IdempotencyKey, InstanceId, OperationRequest,
-    OperationId, PrincipalRef, RequestDigest,
+    CanonicalTarget, CommandId, CommandPayload, IdempotencyKey, InstanceId, OperationId,
+    OperationRequest, OperationResult, PrincipalRef, RequestDigest,
 };
 
 fn request() -> OperationRequest {
@@ -32,8 +33,43 @@ fn request() -> OperationRequest {
     }
 }
 
+fn committed_result(request: &OperationRequest) -> OperationResult {
+    let operation_id = request.new_operation_id.clone();
+    OperationResult {
+        operation_id: operation_id.clone(),
+        command_id: request.command_id.clone(),
+        instance_id: request.payload.instance_id.clone(),
+        receipt: ReceiptRecord {
+            operation_id: operation_id.0.clone(),
+            disposition: ReceiptDisposition::Committed,
+            result_ref: format!("result:{}", operation_id.0),
+            resolved_binding_digest: request.request_digest.0.clone(),
+            owner_kind: "test".to_owned(),
+            lease_until: None,
+            last_progress: 0,
+            reconciliation_policy: "at-least-once".to_owned(),
+        },
+        status: "committed".to_owned(),
+        committed_payload: None,
+        error: None,
+        operation_may_continue: false,
+    }
+}
+
 fn client() -> SubmissionClient {
-    SubmissionClient::builder(InstanceId("instance-1".to_owned())).build()
+    SubmissionClient::builder(InstanceId("instance-1".to_owned()))
+        .with_transport(Box::new(committed_result))
+        .build()
+}
+
+#[test]
+fn submission_without_transport_fails_before_prepare() {
+    let client = SubmissionClient::builder(InstanceId("instance-1".to_owned())).build();
+    assert_eq!(
+        client.submit(&request()).unwrap_err(),
+        ClientError::TransportUnavailable
+    );
+    assert_eq!(client.journal_len(), 0);
 }
 
 #[test]
@@ -43,6 +79,7 @@ fn submission_normal_submits_and_returns_result() -> Result<(), Box<dyn Error>> 
     let result = client.submit(&request)?;
     assert_eq!(result.command_id, request.command_id);
     assert_eq!(result.operation_id, request.new_operation_id);
+    assert_eq!(result.receipt.operation_id, request.new_operation_id.0);
     assert_eq!(result.receipt.resolved_binding_digest, request.request_digest.0);
     assert_eq!(result.status, "committed");
     assert_eq!(client.journal_len(), 1);
@@ -57,15 +94,17 @@ fn submission_crash_before_commit_leaves_no_operation() {
         .submit_with_crash_point(&request, CrashPoint::BeforeCommit)
         .unwrap_err();
     assert_eq!(error, ClientError::SimulatedCrash(CrashPoint::BeforeCommit));
-    assert!(client
-        .lookup_operation(&request.command_id, &request.idempotency_key)
-        .unwrap()
-        .is_none());
+    assert!(
+        client
+            .lookup_operation(&request.command_id, &request.idempotency_key)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(client.journal_len(), 0);
 }
 
 #[test]
-fn submission_crash_after_commit_is_recoverable() {
+fn submission_crash_after_commit_is_recoverable_with_original_operation_id() {
     let client = client();
     let request = request();
     let error = client
@@ -81,6 +120,8 @@ fn submission_crash_after_commit_is_recoverable() {
         .unwrap()
         .expect("committed binding must be recoverable");
     assert_eq!(recovered.command_id, request.command_id);
+    assert_eq!(recovered.operation_id, request.new_operation_id);
+    assert_eq!(recovered.receipt.operation_id, request.new_operation_id.0);
     assert_eq!(recovered.status, "recovery-required");
     assert_eq!(
         recovered.receipt.resolved_binding_digest,
@@ -131,12 +172,63 @@ fn submission_same_binding_different_request_digest_is_conflict() {
 
     let mut conflicting = request.clone();
     conflicting.request_digest = RequestDigest("changed-request".to_owned());
-    conflicting.new_operation_id = OperationId("changed-operation".to_owned());
     let error = client.submit(&conflicting).unwrap_err();
     assert_eq!(
         error,
         ClientError::RequestDigestConflict(request.command_id.clone())
     );
+}
+
+#[test]
+fn submission_same_binding_different_operation_id_is_conflict() {
+    let client = client();
+    let request = request();
+    client.submit(&request).unwrap();
+
+    let mut conflicting = request.clone();
+    conflicting.new_operation_id = OperationId("changed-operation".to_owned());
+    let error = client.submit(&conflicting).unwrap_err();
+    assert_eq!(
+        error,
+        ClientError::OperationIdConflict(request.command_id.clone())
+    );
+}
+
+#[test]
+fn submission_transport_identity_mismatch_is_not_journaled_as_observed() {
+    let request = request();
+    let client = SubmissionClient::builder(InstanceId("instance-1".to_owned()))
+        .with_transport(Box::new(|request| OperationResult {
+            operation_id: OperationId("wrong-operation".to_owned()),
+            command_id: request.command_id.clone(),
+            instance_id: request.payload.instance_id.clone(),
+            receipt: ReceiptRecord {
+                operation_id: "wrong-operation".to_owned(),
+                disposition: ReceiptDisposition::Committed,
+                result_ref: "wrong".to_owned(),
+                resolved_binding_digest: request.request_digest.0.clone(),
+                owner_kind: "test".to_owned(),
+                lease_until: None,
+                last_progress: 0,
+                reconciliation_policy: "test".to_owned(),
+            },
+            status: "committed".to_owned(),
+            committed_payload: None,
+            error: None,
+            operation_may_continue: false,
+        }))
+        .build();
+
+    assert_eq!(
+        client.submit(&request).unwrap_err(),
+        ClientError::TransportIdentityConflict(request.command_id.clone())
+    );
+    let recovered = client
+        .lookup_operation(&request.command_id, &request.idempotency_key)
+        .unwrap()
+        .expect("Prepared/Dispatching binding remains recoverable");
+    assert_eq!(recovered.operation_id, request.new_operation_id);
+    assert_eq!(recovered.status, "recovery-required");
 }
 
 #[test]

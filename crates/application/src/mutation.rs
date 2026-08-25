@@ -1,9 +1,10 @@
-//! Domain mutation: target materialization, binding-first identity, receipt, and
-//! domain-outcome semantics.
+//! Domain mutation: canonical target materialization, binding-first identity,
+//! receipt, and domain-outcome semantics.
 //!
-//! [`ApplicationMutator`] consumes the complete [`OperationRequest`] so the
-//! command/idempotency/request identities chosen before dispatch are preserved
-//! through the authoritative mutation boundary.
+//! [`ApplicationMutator`] consumes the complete [`OperationRequest`] so
+//! CommandId, OperationId, IdempotencyKey, RequestDigest, and target identity
+//! chosen before dispatch are preserved through the authoritative mutation
+//! boundary. Missing ownership relationships are never fabricated.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +15,9 @@ use dxbot_core::types::{
 };
 
 use crate::outcome::{DomainOutcome, resolve_outcome};
-use crate::state::{BotState, ConversationState, DomainState, LifecycleState, ThreadState};
+use crate::state::{
+    BotState, ConversationState, DomainState, IdempotencyBindingState, LifecycleState, ThreadState,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppError {
@@ -57,11 +60,11 @@ impl ApplicationMutator {
     }
 
     pub fn snapshot(&self) -> Result<DomainState, AppError> {
-        self.lock().map(|guard| guard.clone()).map_err(AppError::Internal)
+        self.lock()
+            .map(|guard| guard.clone())
+            .map_err(AppError::Internal)
     }
 
-    /// Applies one complete operation request atomically in the in-memory
-    /// fixture. Existing bindings are resolved before any domain effect.
     pub fn mutate(&self, request: &OperationRequest) -> Result<OperationResult, AppError> {
         validate_request_identity(request)?;
         let payload = &request.payload;
@@ -69,18 +72,28 @@ impl ApplicationMutator {
             request.idempotency_key.principal_ref.0.clone(),
             request.idempotency_key.key_digest.clone(),
         );
-        let mut guard = self
-            .lock()
-            .map_err(|message| AppError::Internal(format!("domain state lock unavailable: {message}")))?;
+        let mut guard = self.lock().map_err(|message| {
+            AppError::Internal(format!("domain state lock unavailable: {message}"))
+        })?;
 
         match (
             guard.command_bindings.get(&request.command_id),
             guard.idempotency_bindings.get(&idempotency_binding),
         ) {
-            (Some(operation_id), Some(bound_command_id)) => {
-                if bound_command_id != &request.command_id {
+            (Some(operation_id), Some(bound_binding)) => {
+                if bound_binding.command_id != request.command_id {
                     return Err(AppError::Conflict(
                         "idempotency key is already bound to another command".to_string(),
+                    ));
+                }
+                if bound_binding.expires_at != request.idempotency_key.expires_at {
+                    return Err(AppError::Conflict(
+                        "idempotency key expiry does not match durable binding".to_string(),
+                    ));
+                }
+                if operation_id != &request.new_operation_id {
+                    return Err(AppError::Conflict(
+                        "command binding operation id mismatch".to_string(),
                     ));
                 }
                 let stored_digest = guard
@@ -96,11 +109,13 @@ impl ApplicationMutator {
                         "command binding request digest mismatch".to_string(),
                     ));
                 }
-                return guard.results.get(operation_id).cloned().ok_or_else(|| {
+                let result = guard.results.get(operation_id).cloned().ok_or_else(|| {
                     AppError::Internal(
                         "committed command binding exists without operation result".to_string(),
                     )
-                });
+                })?;
+                validate_committed_result(&result, request)?;
+                return Ok(result);
             }
             (None, None) => {}
             _ => {
@@ -128,15 +143,20 @@ impl ApplicationMutator {
         };
         let result = self.apply(&mut guard, payload, &identity, outcome)?;
 
-        guard
-            .command_request_digests
-            .insert(identity.command_id.clone(), identity.request_digest.clone());
+        guard.command_request_digests.insert(
+            identity.command_id.clone(),
+            identity.request_digest.clone(),
+        );
         guard
             .command_bindings
             .insert(identity.command_id.clone(), identity.operation_id.clone());
-        guard
-            .idempotency_bindings
-            .insert(idempotency_binding, identity.command_id.clone());
+        guard.idempotency_bindings.insert(
+            idempotency_binding,
+            IdempotencyBindingState {
+                command_id: identity.command_id.clone(),
+                expires_at: request.idempotency_key.expires_at,
+            },
+        );
         Ok(result)
     }
 
@@ -145,9 +165,9 @@ impl ApplicationMutator {
         target: &CanonicalTarget,
         cas: &Option<CasConditions>,
     ) -> Result<(), AppError> {
-        let guard = self
-            .lock()
-            .map_err(|message| AppError::Internal(format!("domain state lock unavailable: {message}")))?;
+        let guard = self.lock().map_err(|message| {
+            AppError::Internal(format!("domain state lock unavailable: {message}"))
+        })?;
         self.validate_target_against(&guard, target, cas)
     }
 
@@ -155,9 +175,9 @@ impl ApplicationMutator {
         &self,
         operation_id: &OperationId,
     ) -> Result<Option<ReceiptRecord>, AppError> {
-        let guard = self
-            .lock()
-            .map_err(|message| AppError::Internal(format!("domain state lock unavailable: {message}")))?;
+        let guard = self.lock().map_err(|message| {
+            AppError::Internal(format!("domain state lock unavailable: {message}"))
+        })?;
         Ok(guard.receipts.get(operation_id).cloned())
     }
 
@@ -200,14 +220,25 @@ impl ApplicationMutator {
             {
                 self.materialize_bot_from_payload(guard, payload)?
             }
-            (CanonicalTarget::Bot { id, .. }, DomainOutcome::Created) => {
+            (CanonicalTarget::Bot { id, .. }, DomainOutcome::Created)
+                if payload.command_key == "bot-create" =>
+            {
                 self.materialize_bot(guard, payload, id)
             }
-            (CanonicalTarget::Conversation { id, .. }, DomainOutcome::Created) => {
-                self.materialize_conversation(guard, id)
+            (CanonicalTarget::Bot { .. }, DomainOutcome::Created) => {
+                return Err(AppError::NotFound(format!(
+                    "{} requires an existing bot",
+                    payload.command_key
+                )));
+            }
+            (CanonicalTarget::Conversation { .. }, DomainOutcome::Created) => {
+                return Err(AppError::NotFound(
+                    "conversation creation requires a canonical owning bot; ownership is absent from this target"
+                        .to_string(),
+                ));
             }
             (CanonicalTarget::Thread { id, parent_id, .. }, DomainOutcome::Created) => {
-                self.materialize_thread(guard, id, parent_id.clone())
+                self.materialize_thread(guard, id, parent_id.as_ref())?
             }
             (CanonicalTarget::Bot { .. }, DomainOutcome::Updated)
                 if payload.command_key == "bot-create" =>
@@ -216,8 +247,16 @@ impl ApplicationMutator {
                     "bot-create cannot update an existing bot identity".to_string(),
                 ));
             }
-            (CanonicalTarget::Bot { id, .. }, DomainOutcome::Updated) => {
-                self.update_bot(guard, id, payload)
+            (CanonicalTarget::Bot { id, .. }, DomainOutcome::Updated)
+                if matches!(payload.command_key.as_str(), "bot-activate" | "bot-deactivate") =>
+            {
+                self.update_bot(guard, id, payload)?
+            }
+            (CanonicalTarget::Bot { .. }, DomainOutcome::Updated) => {
+                return Err(AppError::Conflict(format!(
+                    "bot command is not implemented by the current lifecycle model: {}",
+                    payload.command_key
+                )));
             }
             _ => {
                 return Err(AppError::NotFound(format!(
@@ -246,7 +285,9 @@ impl ApplicationMutator {
             error: None,
             operation_may_continue: false,
         };
-        guard.receipts.insert(identity.operation_id.clone(), receipt);
+        guard
+            .receipts
+            .insert(identity.operation_id.clone(), receipt);
         guard
             .results
             .insert(identity.operation_id.clone(), result.clone());
@@ -263,7 +304,9 @@ impl ApplicationMutator {
             .get("name")
             .and_then(|value| value.as_str())
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| AppError::NotFound("bot-create requires a materialized name".to_string()))?;
+            .ok_or_else(|| {
+                AppError::NotFound("bot-create requires a materialized name".to_string())
+            })?;
         let id = dxbot_core::types::BotId(name.to_string());
         if guard.bots.contains_key(&id) {
             return Err(AppError::Conflict(format!(
@@ -319,63 +362,64 @@ impl ApplicationMutator {
         guard: &mut DomainState,
         id: &dxbot_core::types::BotId,
         payload: &CommandPayload,
-    ) -> Option<serde_json::Value> {
-        let bot = guard.bots.get_mut(id)?;
-        bot.revision += 1;
+    ) -> Result<Option<serde_json::Value>, AppError> {
         let lifecycle = match payload.command_key.as_str() {
             "bot-deactivate" => LifecycleState::Inactive,
-            "bot-activate" | "bot-restore" => LifecycleState::Active,
-            _ => bot.lifecycle,
+            "bot-activate" => LifecycleState::Active,
+            _ => {
+                return Err(AppError::Conflict(format!(
+                    "unsupported bot lifecycle command: {}",
+                    payload.command_key
+                )));
+            }
         };
+        let bot = guard
+            .bots
+            .get_mut(id)
+            .ok_or_else(|| AppError::NotFound(format!("bot {} does not exist", id.0)))?;
+        bot.revision = bot
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| AppError::Internal(format!("bot {} revision exhausted", id.0)))?;
         bot.lifecycle = lifecycle;
-        Some(serde_json::json!({
+        Ok(Some(serde_json::json!({
             "bot_ref": format!("bot:{}", id.0),
             "bot_revision": bot.revision,
             "lifecycle": lifecycle_str(bot.lifecycle),
-        }))
-    }
-
-    fn materialize_conversation(
-        &self,
-        guard: &mut DomainState,
-        id: &ConversationId,
-    ) -> Option<serde_json::Value> {
-        let bot_id = dxbot_core::types::BotId(format!("bot-of-{}", id.0));
-        guard.conversations.insert(
-            id.clone(),
-            ConversationState {
-                id: id.clone(),
-                bot_id,
-                revision: 1,
-                messages: Vec::new(),
-            },
-        );
-        Some(serde_json::json!({
-            "conversation_ref": format!("conversation:{}", id.0),
-            "conversation_revision": 1,
-        }))
+        })))
     }
 
     fn materialize_thread(
         &self,
         guard: &mut DomainState,
         id: &ThreadId,
-        parent_id: Option<ConversationId>,
-    ) -> Option<serde_json::Value> {
-        let conversation_id = parent_id.unwrap_or_else(|| ConversationId(format!("c-{}", id.0)));
+        parent_id: Option<&ConversationId>,
+    ) -> Result<Option<serde_json::Value>, AppError> {
+        let conversation_id = parent_id.ok_or_else(|| {
+            AppError::NotFound(
+                "thread creation requires an explicit canonical parent conversation".to_string(),
+            )
+        })?;
+        if !guard.conversations.contains_key(conversation_id) {
+            return Err(AppError::NotFound(format!(
+                "thread parent conversation does not exist: {}",
+                conversation_id.0
+            )));
+        }
         guard.threads.insert(
             id.clone(),
             ThreadState {
                 id: id.clone(),
-                conversation_id,
+                conversation_id: conversation_id.clone(),
                 revision: 1,
                 parent_message_id: None,
             },
         );
-        Some(serde_json::json!({
+        Ok(Some(serde_json::json!({
             "thread_ref": format!("thread:{}", id.0),
             "thread_revision": 1,
-        }))
+            "conversation_ref": format!("conversation:{}", conversation_id.0),
+        })))
     }
 }
 
@@ -392,6 +436,30 @@ fn validate_request_identity(request: &OperationRequest) -> Result<(), AppError>
     if request.idempotency_key.principal_ref != request.payload.principal_ref {
         return Err(AppError::Conflict(
             "idempotency principal does not match payload principal".to_string(),
+        ));
+    }
+    if let CanonicalTarget::Instance(target_instance) = &request.payload.canonical_target {
+        if target_instance != &request.payload.instance_id {
+            return Err(AppError::Conflict(
+                "instance target does not match request instance".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_committed_result(
+    result: &OperationResult,
+    request: &OperationRequest,
+) -> Result<(), AppError> {
+    if result.operation_id != request.new_operation_id
+        || result.command_id != request.command_id
+        || result.instance_id != request.payload.instance_id
+        || result.receipt.operation_id != request.new_operation_id.0
+        || result.receipt.resolved_binding_digest != request.request_digest.0
+    {
+        return Err(AppError::Internal(
+            "stored operation result diverges from canonical command binding".to_string(),
         ));
     }
     Ok(())

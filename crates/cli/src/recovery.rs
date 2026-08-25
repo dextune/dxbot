@@ -1,120 +1,91 @@
-//! CLI journal recovery: bounded scan, prepared reuse, dispatching binding
-//! lookup, replay projection, and stale-prepared pruning.
+//! CLI journal recovery projection for DXB-RUN-033.
 //!
-//! The recovery projection (DXB-RUN-033) layers on top of [`LocalJournal`]:
-//!
-//! - **Prepared** (provably unsent): a same-semantic-digest entry can be
-//!   reused to continue with the original IDs; a stale/different-digest entry
-//!   can be pruned only when lock-free, integrity-valid and retention-eligible;
-//!   otherwise it is abandoned.
-//! - **Dispatching/Observed**: a server binding lookup runs first. A found
-//!   binding exposes the existing committed result; an absent binding allows a
-//!   same-ID/digest/payload replay. A corrupt/unknown/uncertain journal is
-//!   never auto-replayed or auto-deleted.
-//!
-//! Recovery never turns a local observation end (SIGINT, SIGTERM, broken pipe,
-//! pager exit, local timeout) into a Runtime cancel: the projected result of a
-//! `Dispatching`/`Observed` entry carries `operation_may_continue = true` and
-//! its `OperationRef` (operation id) so the user does not misread an interrupt
-//! as a cancel.
+//! Recovery decisions are made from chain-validated durable journal state plus
+//! the *fresh invocation* digest. Stored values are never compared to their own
+//! projection, stale scan entries are revalidated against disk, and replay keys
+//! are checked before any continued observation.
 
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use dxbot_core::types::*;
 use dxbot_core::ReceiptRecord;
+use dxbot_core::types::*;
 
 use crate::journal::{JournalError, LocalJournal, PrunePolicy};
 
-/// Default session-wide ceiling for recovery entries surfaced by a single
-/// [`RecoveryManager::scan_journal`].
 const MAX_SCAN_ENTRIES: usize = 100_000;
-
-/// Default minimum age (seconds) a stale `Prepared` record must have before a
-/// reuse decision may prune it (mirrors `DXB-RUN-033` retention bounds).
 const DEFAULT_PRUNE_MIN_RETENTION_SECONDS: u64 = 300;
 
-/// Prefix used to derive a stable operation id for a command from its journal
-/// (the journal itself does not persist an operation id).
-const OPERATION_PREFIX: &str = "op-recovery:";
-
-/// Error produced by the CLI recovery projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryError {
-    /// A lower-level journal operation failed (I/O, lock, capacity).
     Journal(JournalError),
-    /// Records could not be interpreted or a mandatory invariant is absent.
     Corrupt(String),
-    /// The journal carries an unknown client/journal schema version; auto
-    /// replay or delete is forbidden until a doctor/schema action resolves it.
     UnsupportedVersion(String),
-    /// The journal hash chain or a record digest failed validation; auto
-    /// replay or delete is forbidden.
     ChainMismatch(String),
-    /// Replay/reuse was requested for an entry that is not in the right state.
     NotDispatchable(CommandId),
-    /// No journal records exist for a command.
     NotFound(CommandId),
-    /// The bounded startup scan exceeded its ceiling.
+    BindingConflict(CommandId),
     CapacityBoundExceeded(usize),
 }
 
 impl From<JournalError> for RecoveryError {
-    fn from(e: JournalError) -> Self {
-        match e {
-            JournalError::ChainIntegrity(msg) => Self::ChainMismatch(msg),
-            JournalError::Corrupt(msg) => Self::Corrupt(msg),
-            JournalError::CapacityBoundExceeded(n) => Self::CapacityBoundExceeded(n),
-            JournalError::NotFound(id) => Self::NotFound(id),
+    fn from(error: JournalError) -> Self {
+        match error {
+            JournalError::ChainIntegrity(message) => Self::ChainMismatch(message),
+            JournalError::Corrupt(message) => Self::Corrupt(message),
+            JournalError::CapacityBoundExceeded(count) => Self::CapacityBoundExceeded(count),
+            JournalError::NotFound(command_id) => Self::NotFound(command_id),
             other => Self::Journal(other),
         }
     }
 }
 
-/// A single journal entry reconstructed from the local journal, grouped by
-/// command and projected into a stable recovery shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryEntry {
-    /// The command this entry names.
     pub command_id: CommandId,
-    /// The most advanced state recorded for this command.
     pub state: JournalState,
-    /// Semantic digest of the most recent recorded request (materialized
-    /// `RequestDigest`). Reuse is allowed only when this matches a fresh
-    /// invocation's digest.
+    /// Chain-validated stored RequestDigest projection. A fresh invocation must
+    /// supply its own digest separately to [`RecoveryManager::reuse_prepared`].
     pub semantic_digest: String,
-    /// The full, chain-validated record series for this command.
     pub records: Vec<JournalRecord>,
 }
 
 impl RecoveryEntry {
-    /// The idempotency key recorded for this entry (shared across its series).
-    fn primary_key(&self) -> Result<IdempotencyKey, RecoveryError> {
-        self.records
-            .last()
-            .map(|r| r.idempotency_key.clone())
-            .ok_or_else(|| {
-                RecoveryError::Corrupt(format!(
-                    "entry {} has no journal records",
-                    self.command_id.0
-                ))
-            })
+    fn last(&self) -> Result<&JournalRecord, RecoveryError> {
+        self.records.last().ok_or_else(|| {
+            RecoveryError::Corrupt(format!(
+                "entry {} has no journal records",
+                self.command_id.0
+            ))
+        })
     }
 
-    /// The stable IDs a Continue/Replay reuse would adopt: the original command
-    /// id, a derived operation id, and the recorded idempotency key.
+    fn validate_projection(&self) -> Result<&JournalRecord, RecoveryError> {
+        let last = self.last()?;
+        if last.command_id != self.command_id
+            || last.state != self.state
+            || last.request_digest.0 != self.semantic_digest
+        {
+            return Err(RecoveryError::Corrupt(format!(
+                "recovery entry projection diverged from journal for {}",
+                self.command_id.0
+            )));
+        }
+        Ok(last)
+    }
+
     fn reused_ids(&self) -> Result<ReusedIds, RecoveryError> {
+        let last = self.validate_projection()?;
         Ok(ReusedIds {
             command_id: self.command_id.clone(),
-            operation_id: OperationId(format!("{OPERATION_PREFIX}{}", self.command_id.0)),
-            idempotency_key: self.primary_key()?,
+            operation_id: last.operation_id.clone(),
+            idempotency_key: last.idempotency_key.clone(),
         })
     }
 }
 
-/// The IDs reused when a journal entry is continued or replayed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReusedIds {
     pub command_id: CommandId,
@@ -122,52 +93,34 @@ pub struct ReusedIds {
     pub idempotency_key: IdempotencyKey,
 }
 
-/// What a recovery decision should do with a journal entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryAction {
-    /// Reuse the original IDs and continue (same semantic digest).
     Continue { ids: ReusedIds },
-    /// The stale prepared entry is eligible to be removed by the capacity
-    /// policy.
     Prune,
-    /// The entry cannot be reused, replayed or pruned: abandon it.
     Abandon,
-    /// A server binding lookup found a committed result; expose it.
     Resolved { result: Box<OperationResult> },
-    /// Both server bindings are absent; replay with the same IDs.
     Replay { ids: ReusedIds },
 }
 
-/// The composite key passed to the injected server binding lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingKey {
     pub command_id: CommandId,
     pub idempotency_key: IdempotencyKey,
 }
 
-/// Server binding lookup: maps a command/key onto a possibly committed
-/// [`OperationResult`]. Injected so the CLI performs no real network I/O in
-/// this module. The default mock reports an absent binding.
 pub type BindingLookup = fn(&BindingKey) -> Result<Option<OperationResult>, RecoveryError>;
 
-/// Default server binding lookup: reports no committed result. With both
-/// bindings absent, recovery may replay with the same IDs.
 fn mock_binding_lookup(_key: &BindingKey) -> Result<Option<OperationResult>, RecoveryError> {
     Ok(None)
 }
 
-/// Creates an [`OperationResult`] projecting a continued operation for
-/// `command_id`. Used for Dispatching/Observed entries so a local observation
-/// end is never misread as a Runtime cancel: the result carries
-/// `operation_may_continue = true` and its `OperationRef` (operation id).
 fn continuation_result(
+    operation_id: &OperationId,
     command_id: &CommandId,
     instance_id: &InstanceId,
-    _key: &IdempotencyKey,
+    request_digest: &RequestDigest,
     status: &str,
-    may_continue: bool,
 ) -> OperationResult {
-    let operation_id = OperationId(format!("{OPERATION_PREFIX}{}", command_id.0));
     OperationResult {
         operation_id: operation_id.clone(),
         command_id: command_id.clone(),
@@ -175,21 +128,20 @@ fn continuation_result(
         receipt: ReceiptRecord {
             operation_id: operation_id.0.clone(),
             disposition: dxbot_core::ReceiptDisposition::Accepted,
-            result_ref: operation_id.0.clone(),
-            resolved_binding_digest: String::new(),
-            owner_kind: String::new(),
+            result_ref: format!("operation:{}", operation_id.0),
+            resolved_binding_digest: request_digest.0.clone(),
+            owner_kind: "instance".to_owned(),
             lease_until: None,
             last_progress: 0,
-            reconciliation_policy: String::new(),
+            reconciliation_policy: "binding-lookup-required".to_owned(),
         },
-        status: status.to_string(),
+        status: status.to_owned(),
         committed_payload: None,
         error: None,
-        operation_may_continue: may_continue,
+        operation_may_continue: true,
     }
 }
 
-/// Recovery decision/projection entry point over a shared [`LocalJournal`].
 #[derive(Debug, Clone)]
 pub struct RecoveryManager {
     journal: Arc<Mutex<LocalJournal>>,
@@ -198,17 +150,12 @@ pub struct RecoveryManager {
 
 impl PartialEq for RecoveryManager {
     fn eq(&self, other: &Self) -> bool {
-        // The journal is compared by shared ownership (its contents are not
-        // `PartialEq`-comparable through the mutex); the binding lookup is a
-        // `fn` pointer and compares by address.
         Arc::ptr_eq(&self.journal, &other.journal)
             && std::ptr::fn_addr_eq(self.binding_lookup, other.binding_lookup)
     }
 }
 
 impl RecoveryManager {
-    /// Creates a recovery view over `journal` with the default (absent)
-    /// server binding lookup.
     pub fn new(journal: Arc<Mutex<LocalJournal>>) -> Self {
         Self {
             journal,
@@ -216,9 +163,6 @@ impl RecoveryManager {
         }
     }
 
-    /// Creates a recovery view with an injected server binding lookup (the
-    /// hook for a mock or an authenticated binding producer; no real network
-    /// occurs in this module).
     pub fn with_binding_lookup(
         journal: Arc<Mutex<LocalJournal>>,
         lookup: BindingLookup,
@@ -229,10 +173,6 @@ impl RecoveryManager {
         }
     }
 
-    /// Bounded scan of the journal, grouped into [`RecoveryEntry`] values.
-    /// The underlying `LocalJournal::scan` is itself bounded (capacity-exceeded
-    /// fails closed); this additionally applies a session-wide ceiling on the
-    /// number of entries surfaced to a caller.
     pub fn scan_journal(&self) -> Result<Vec<RecoveryEntry>, RecoveryError> {
         let records = self.journal()?.scan()?;
         let mut groups: BTreeMap<String, Vec<JournalRecord>> = BTreeMap::new();
@@ -245,114 +185,99 @@ impl RecoveryManager {
                 return Err(RecoveryError::CapacityBoundExceeded(groups.len()));
             }
         }
+
         let mut entries = Vec::with_capacity(groups.len());
-        for (command_id, series) in groups {
-            entries.push(to_entry(CommandId(command_id), series));
+        for (command_id, records) in groups {
+            entries.push(to_entry(CommandId(command_id), records)?);
         }
         Ok(entries)
     }
 
-    /// Decides whether a `Prepared` entry can be reused by a new invocation.
-    ///
-    /// - Same semantic digest → reuse the original IDs and continue.
-    /// - Stale/different digest → prune only when the entry is lock-free,
-    ///   integrity-valid and retention-eligible; otherwise abandon.
     pub fn reuse_prepared(
         &self,
         entry: &RecoveryEntry,
+        invocation_digest: &RequestDigest,
     ) -> Result<RecoveryAction, RecoveryError> {
-        let last = entry.records.last().ok_or_else(|| {
-            RecoveryError::Corrupt(format!("entry {} has no journal records", entry.command_id.0))
-        })?;
+        let last = self.durable_last(entry)?;
         if last.state != JournalState::Prepared {
             return Ok(RecoveryAction::Abandon);
         }
-        let canonical_digest = last.request_digest.0.clone();
-        if entry.semantic_digest == canonical_digest {
-            // Same semantic digest: reuse the original IDs to continue.
+
+        if last.request_digest == *invocation_digest {
             return Ok(RecoveryAction::Continue {
                 ids: entry.reused_ids()?,
             });
         }
-        // Stale/different digest: prune only if provably-unsent, lock-free,
-        // integrity-valid and retention-eligible.
-        let eligible = self.journal()?.is_prepared_eligible_for_prune(
+
+        if self.journal()?.is_prepared_eligible_for_prune(
             &entry.command_id,
             DEFAULT_PRUNE_MIN_RETENTION_SECONDS,
-        );
-        if eligible {
+        ) {
             Ok(RecoveryAction::Prune)
         } else {
             Ok(RecoveryAction::Abandon)
         }
     }
 
-    /// Decides what to do with a `Dispatching`/`Observed` entry. Performs the
-    /// server binding lookup first; never auto-replays when a binding exists
-    /// or when the journal is uncertain/corrupt.
     pub fn lookup_dispatching(
         &self,
         entry: &RecoveryEntry,
     ) -> Result<RecoveryAction, RecoveryError> {
-        if entry.state != JournalState::Dispatching
-            && entry.state != JournalState::Observed
-        {
+        let last = self.durable_last(entry)?;
+        if !matches!(
+            last.state,
+            JournalState::Dispatching | JournalState::Observed
+        ) {
             return Err(RecoveryError::NotDispatchable(entry.command_id.clone()));
         }
-        let key = entry.primary_key()?;
+
         let binding = BindingKey {
             command_id: entry.command_id.clone(),
-            idempotency_key: key.clone(),
+            idempotency_key: last.idempotency_key.clone(),
         };
         match (self.binding_lookup)(&binding)? {
-            // A stored binding exists: expose the committed result directly.
-            Some(result) => Ok(RecoveryAction::Resolved { result: Box::new(result) }),
-            // Both bindings absent: replay with the same IDs/digest/payload.
+            Some(result) => {
+                validate_bound_result(&last, &result)?;
+                Ok(RecoveryAction::Resolved {
+                    result: Box::new(result),
+                })
+            }
             None => Ok(RecoveryAction::Replay {
                 ids: entry.reused_ids()?,
             }),
         }
     }
 
-    /// Replays an operation from the journal for a `Dispatching`/`Observed`
-    /// command, projecting the continued operation. Corrupt/unknown records
-    /// fail chain validation before this point, so no auto replay/delete is
-    /// possible from this path.
     pub fn replay_operation(
         &self,
         command_id: &CommandId,
         key: &IdempotencyKey,
     ) -> Result<OperationResult, RecoveryError> {
         let guard = self.journal()?;
-        let records = match guard.lookup(command_id)? {
-            Some(records) => records,
-            None => return Err(RecoveryError::NotFound(command_id.clone())),
-        };
+        let records = guard
+            .lookup(command_id)?
+            .ok_or_else(|| RecoveryError::NotFound(command_id.clone()))?;
         let last = records
             .last()
             .ok_or_else(|| RecoveryError::NotFound(command_id.clone()))?;
-        let instance_id = last.instance_id.clone();
-        let state = last.state;
-        drop(guard);
-
-        let (status, may_continue) = match state {
-            JournalState::Dispatching | JournalState::Observed => ("in-flight", true),
-            JournalState::Terminal => ("terminal", false),
-            JournalState::Prepared | JournalState::Abandoned => {
-                return Err(RecoveryError::NotDispatchable(command_id.clone()));
-            }
-        };
+        if last.idempotency_key != *key {
+            return Err(RecoveryError::BindingConflict(command_id.clone()));
+        }
+        if !matches!(
+            last.state,
+            JournalState::Dispatching | JournalState::Observed
+        ) {
+            return Err(RecoveryError::NotDispatchable(command_id.clone()));
+        }
         Ok(continuation_result(
+            &last.operation_id,
             command_id,
-            &instance_id,
-            key,
-            status,
-            may_continue,
+            &last.instance_id,
+            &last.request_digest,
+            "in-flight",
         ))
     }
 
-    /// Prunes stale, eligible `Prepared` commands under `policy` by delegating
-    /// to the journal's bounded capacity policy. Returns the number pruned.
     pub fn prune_stale_prepared(
         &mut self,
         policy: &PrunePolicy,
@@ -360,27 +285,68 @@ impl RecoveryManager {
         Ok(self.journal()?.prune_prepared(policy)?)
     }
 
-    /// Locks the shared journal, recovering from a poisoned lock by taking its
-    /// inner value: the state recorded before any panic is kept, never treated
-    /// as loss.
+    /// Re-read the command immediately before making a recovery decision. A
+    /// scan result is only a snapshot and must not authorize reuse after the
+    /// durable state has advanced.
+    fn durable_last(&self, entry: &RecoveryEntry) -> Result<JournalRecord, RecoveryError> {
+        entry.validate_projection()?;
+        let records = self
+            .journal()?
+            .lookup(&entry.command_id)?
+            .ok_or_else(|| RecoveryError::NotFound(entry.command_id.clone()))?;
+        if records != entry.records {
+            return Err(RecoveryError::Corrupt(format!(
+                "recovery entry for {} is stale; rescan required",
+                entry.command_id.0
+            )));
+        }
+        records.last().cloned().ok_or_else(|| {
+            RecoveryError::Corrupt(format!(
+                "durable journal for {} is empty",
+                entry.command_id.0
+            ))
+        })
+    }
+
     fn journal(&self) -> Result<MutexGuard<'_, LocalJournal>, RecoveryError> {
-        Ok(self
-            .journal
+        self.journal
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()))
+            .map_err(|_| RecoveryError::Corrupt("local journal mutex poisoned".to_owned()))
     }
 }
 
-/// Groups a validated record series into a recovery entry, taking the entry's
-/// state and semantic digest from the most advanced record in the series.
-fn to_entry(command_id: CommandId, records: Vec<JournalRecord>) -> RecoveryEntry {
-    let last = records.last();
-    let state = last.map(|r| r.state).unwrap_or(JournalState::Prepared);
-    let semantic_digest = last.map(|r| r.request_digest.0.clone()).unwrap_or_default();
-    RecoveryEntry {
-        command_id,
-        state,
-        semantic_digest,
-        records,
+fn validate_bound_result(
+    journal: &JournalRecord,
+    result: &OperationResult,
+) -> Result<(), RecoveryError> {
+    if result.command_id != journal.command_id
+        || result.operation_id != journal.operation_id
+        || result.instance_id != journal.instance_id
+        || result.receipt.operation_id != journal.operation_id.0
+        || result.receipt.resolved_binding_digest != journal.request_digest.0
+    {
+        return Err(RecoveryError::BindingConflict(journal.command_id.clone()));
     }
+    Ok(())
+}
+
+fn to_entry(
+    command_id: CommandId,
+    records: Vec<JournalRecord>,
+) -> Result<RecoveryEntry, RecoveryError> {
+    let last = records.last().ok_or_else(|| {
+        RecoveryError::Corrupt(format!("journal group {} is empty", command_id.0))
+    })?;
+    if last.command_id != command_id {
+        return Err(RecoveryError::Corrupt(format!(
+            "journal group {} contains mismatched command {}",
+            command_id.0, last.command_id.0
+        )));
+    }
+    Ok(RecoveryEntry {
+        command_id,
+        state: last.state,
+        semantic_digest: last.request_digest.0.clone(),
+        records,
+    })
 }

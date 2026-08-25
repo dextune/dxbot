@@ -1,30 +1,22 @@
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use cli::{
-    commands::CoreCommands,
-    confirmation::Confirmation,
-    directive::DirectiveController,
-    discovery::Discovery,
-    interactive::InteractiveJourney,
-    selector::SelectorResolver,
-};
+use cli::{commands::CoreCommands, confirmation::Confirmation, directive::DirectiveController};
 use dxbot_core::{
-    error::DxbotError,
+    error::{DxbotError, ErrorCategory, ErrorCode},
     types::{ContentSource, InstanceId, OutputFormat, PrincipalRef},
 };
 
-// ── Helpers ──
-
-fn parse_format(value: &str) -> OutputFormat {
+fn parse_format(value: &str) -> Option<OutputFormat> {
     match value {
-        "json" => OutputFormat::Json,
-        "jsonl" => OutputFormat::Jsonl,
-        _ => OutputFormat::Human,
+        "human" => Some(OutputFormat::Human),
+        "json" => Some(OutputFormat::Json),
+        "jsonl" => Some(OutputFormat::Jsonl),
+        _ => None,
     }
 }
 
-fn error_code(code: dxbot_core::error::ErrorCode) -> ExitCode {
+fn error_code(code: ErrorCode) -> ExitCode {
     ExitCode::from(code.exit_code() as u8)
 }
 
@@ -42,60 +34,112 @@ fn print_error(err: &DxbotError, format: OutputFormat) -> ExitCode {
     error_code(code)
 }
 
-fn human_action(msg: &str) {
-    println!("{msg}");
+fn local_error(code: ErrorCode, category: ErrorCategory, message: impl Into<String>) -> DxbotError {
+    DxbotError {
+        code,
+        category,
+        message: message.into(),
+        retryable: false,
+        operation_ref: None,
+        target_refs: Vec::new(),
+        field_violations: Vec::new(),
+        current_revision: None,
+        current_generation: None,
+        resume_cursor: None,
+        next_actions: Vec::new(),
+    }
 }
 
-fn json_action(result: &serde_json::Value) {
-    println!("{}", serde_json::to_string_pretty(result).unwrap_or_default());
+fn usage_error(message: impl Into<String>, format: OutputFormat) -> ExitCode {
+    print_error(
+        &local_error(ErrorCode::Usage, ErrorCategory::Input, message),
+        format,
+    )
 }
 
-// ── Main dispatcher ──
+/// Fail closed for a command whose local projection exists but whose
+/// authenticated ControlClient submission path is not connected yet.
+/// No durable operation is created and no success-like payload is printed.
+fn not_wired(command: &str, format: OutputFormat) -> ExitCode {
+    print_error(
+        &local_error(
+            ErrorCode::RuntimeUnavailable,
+            ErrorCategory::Availability,
+            format!(
+                "{command} is not connected to an authenticated Runtime control endpoint; no operation was created"
+            ),
+        ),
+        format,
+    )
+}
+
+fn require_value(args: &[String], index: &mut usize, option: &str) -> Result<(), String> {
+    *index += 1;
+    if args.get(*index).is_none() {
+        return Err(format!("{option} requires a value"));
+    }
+    Ok(())
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        print!("{}", Discovery::show_help());
+        print!("{}", cli::discovery::Discovery::show_help());
         return ExitCode::SUCCESS;
     }
 
-    // Parse global options and command
     let mut format = OutputFormat::Human;
     let mut yes_flag = false;
-    let is_tty = std::io::stdout().is_terminal();
-    let mut cmd_start = 0;
+    let is_tty = std::io::stdin().is_terminal();
+    let mut version_requested = false;
+    let mut cmd_start = None;
 
-    let mut i = 0;
+    let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
-                print!("{}", Discovery::show_help());
+                print!("{}", cli::discovery::Discovery::show_help());
                 return ExitCode::SUCCESS;
             }
-            "--version" => {
-                return show_version(format);
-            }
+            "--version" => version_requested = true,
             "--format" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    format = parse_format(v);
+                if let Err(message) = require_value(&args, &mut i, "--format") {
+                    return usage_error(message, format);
+                }
+                let value = &args[i];
+                let Some(parsed) = parse_format(value) else {
+                    return usage_error(
+                        format!("unsupported --format value: {value}"),
+                        format,
+                    );
+                };
+                format = parsed;
+            }
+            "--profile" | "--instance" | "--color" | "--wait" | "--timeout" => {
+                let option = args[i].clone();
+                if let Err(message) = require_value(&args, &mut i, &option) {
+                    return usage_error(message, format);
                 }
             }
             "-y" | "--yes" => yes_flag = true,
-            s if !s.starts_with('-') => {
-                cmd_start = i;
+            value if value.starts_with('-') => {
+                return usage_error(format!("unknown global option: {value}"), format);
+            }
+            _ => {
+                cmd_start = Some(i);
                 break;
             }
-            _ => {}
         }
         i += 1;
     }
 
-    if cmd_start >= args.len() {
-        print!("{}", Discovery::show_help());
-        return ExitCode::SUCCESS;
+    if version_requested {
+        return show_version(format);
     }
 
+    let Some(cmd_start) = cmd_start else {
+        return usage_error("missing command group", format);
+    };
     let group = &args[cmd_start];
     let sub = args.get(cmd_start + 1).map(String::as_str);
     let cmd_args: &[String] = if cmd_start + 2 < args.len() {
@@ -104,530 +148,280 @@ fn main() -> ExitCode {
         &[]
     };
 
-    let default_instance = InstanceId("default".into());
-    let default_principal = PrincipalRef("cli".into());
-    let discovery = Discovery::new();
-    let commands = CoreCommands::at(default_instance, default_principal);
-    let interactive = InteractiveJourney::default();
-    let selector = SelectorResolver::new();
+    let commands = CoreCommands::at(
+        InstanceId("default".to_owned()),
+        PrincipalRef("cli".to_owned()),
+    );
     let directive = DirectiveController::new();
 
     match group.as_str() {
         "version" => show_version(format),
-
-        "runtime" => dispatch_runtime(sub, cmd_args, &discovery, format),
-
-        "bot" => dispatch_bot(sub, cmd_args, &commands, &interactive, &selector, format, yes_flag, is_tty),
-
-        "conversation" => dispatch_conversation(sub, cmd_args, &commands, &interactive, &selector, format),
-
-        "thread" => dispatch_thread(sub, cmd_args, format),
-
-        "task" => dispatch_task(sub, cmd_args, &commands, &interactive, &selector, &directive, format),
-
-        "project" => dispatch_project(sub, cmd_args, format),
-
-        "channel" => dispatch_channel(sub, cmd_args, format),
-
-        "memory" => dispatch_memory(sub, cmd_args, format),
-
-        "approval" => dispatch_approval(sub, cmd_args, format),
-
-        "provider" => dispatch_provider(sub, cmd_args, format),
-
-        "operation" => dispatch_operation(sub, cmd_args, format),
-
-        "process" => dispatch_process(sub, cmd_args, format),
-
-        _ => {
-            if format == OutputFormat::Human {
-                eprintln!("dxb: unknown command group '{group}'");
-                eprintln!("Run 'dxb --help' for available commands.");
-            }
-            ExitCode::from(2)
+        "runtime" => dispatch_unwired_group(
+            "runtime",
+            sub,
+            &["start", "status", "stop", "doctor"],
+            format,
+        ),
+        "bot" => dispatch_bot(sub, cmd_args, &commands, format, yes_flag, is_tty),
+        "conversation" => dispatch_conversation(sub, cmd_args, &commands, format),
+        "thread" => dispatch_unwired_group(
+            "thread",
+            sub,
+            &["create", "list", "show", "send", "history", "branch"],
+            format,
+        ),
+        "task" => dispatch_task(sub, cmd_args, &commands, &directive, format),
+        "project" => dispatch_unwired_group(
+            "project",
+            sub,
+            &["create", "list", "show", "archive", "restore", "member"],
+            format,
+        ),
+        "channel" => dispatch_unwired_group(
+            "channel",
+            sub,
+            &["create", "list", "show", "member", "send", "history"],
+            format,
+        ),
+        "memory" => dispatch_unwired_group(
+            "memory",
+            sub,
+            &["get", "search", "history", "propose", "promote"],
+            format,
+        ),
+        "approval" => dispatch_unwired_group(
+            "approval",
+            sub,
+            &["list", "show", "approve", "deny"],
+            format,
+        ),
+        "provider" => dispatch_unwired_group("provider", sub, &["list", "show"], format),
+        "operation" => {
+            dispatch_unwired_group("operation", sub, &["show", "reconcile"], format)
         }
+        "process" => dispatch_unwired_group("process", sub, &["show", "watch"], format),
+        _ => usage_error(format!("unknown command group: {group}"), format),
     }
 }
 
-// ── Version ──
-
 fn show_version(format: OutputFormat) -> ExitCode {
-    let info = Discovery::show_version();
+    let info = cli::discovery::Discovery::show_version();
     match format {
-        OutputFormat::Human => {
-            println!("dxb {}", info.client_version);
-        }
-        _ => {
-            println!("{}", serde_json::to_string(&info).unwrap_or_default());
-        }
+        OutputFormat::Human => println!("dxb {}", info.client_version),
+        _ => match serde_json::to_string(&info) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                return print_error(
+                    &local_error(
+                        ErrorCode::InternalInvariant,
+                        ErrorCategory::Internal,
+                        format!("failed to encode version information: {error}"),
+                    ),
+                    format,
+                );
+            }
+        },
     }
     ExitCode::SUCCESS
 }
 
-// ── Runtime ──
-
-fn dispatch_runtime(
+fn dispatch_unwired_group(
+    group: &str,
     sub: Option<&str>,
-    args: &[String],
-    discovery: &Discovery,
+    allowed: &[&str],
     format: OutputFormat,
 ) -> ExitCode {
     match sub {
-        Some("start") => {
-            if args.iter().any(|a| a == "--help" || a == "-h") {
-                println!("dxb runtime start [--ready-at <process|storage|runtime|control>] [--timeout <duration>]");
-                println!();
-                println!("Bootstraps the first Runtime Instance when none exist, or starts an existing Instance.");
-                println!("Ready-at stages: process (default), storage, runtime, control.");
-                return ExitCode::SUCCESS;
-            }
-            match discovery.first_run_bootstrap() {
-                Ok(instance_id) => {
-                    human_action(&format!("Runtime instance '{}' started.", instance_id.0));
-                    ExitCode::SUCCESS
-                }
-                Err(e) => print_error(&e.to_dxbot_error(), format),
-            }
+        Some(command) if allowed.contains(&command) => {
+            not_wired(&format!("{group} {command}"), format)
         }
-        Some("status") => {
-            human_action("Runtime status: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        Some("stop") => {
-            human_action("Runtime stop: graceful shutdown requested.");
-            ExitCode::SUCCESS
-        }
-        Some("doctor") => {
-            match discovery.first_run_bootstrap() {
-                Ok(instance_id) => {
-                    match discovery.doctor_provider(&instance_id) {
-                        Ok(diag) => {
-                            human_action(&format!(
-                                "Provider '{}': status={}, available={}",
-                                diag.provider_id, diag.status, diag.available
-                            ));
-                            ExitCode::SUCCESS
-                        }
-                        Err(e) => print_error(&e.to_dxbot_error(), format),
-                    }
-                }
-                Err(e) => print_error(&e.to_dxbot_error(), format),
-            }
-        }
-        _ => {
-            eprintln!("dxb runtime: unknown subcommand. Try 'start', 'status', 'stop', or 'doctor'.");
-            ExitCode::from(2)
-        }
+        Some(command) => usage_error(
+            format!("unknown {group} subcommand: {command}"),
+            format,
+        ),
+        None => usage_error(format!("{group} requires a subcommand"), format),
     }
 }
 
-// ── Bot ──
-
-#[allow(clippy::too_many_arguments)]
 fn dispatch_bot(
     sub: Option<&str>,
     args: &[String],
     commands: &CoreCommands,
-    _interactive: &InteractiveJourney,
-    _selector: &SelectorResolver,
     format: OutputFormat,
     yes_flag: bool,
     is_tty: bool,
 ) -> ExitCode {
     match sub {
         Some("create") => {
-            let name = args.first().cloned().unwrap_or_default();
-            if name.is_empty() {
-                return print_error(
-                    &DxbotError {
-                        code: dxbot_core::error::ErrorCode::Usage,
-                        category: dxbot_core::error::ErrorCategory::Input,
-                        message: "bot create requires a name".into(),
-                        retryable: false,
-                        operation_ref: None,
-                        target_refs: vec![],
-                        field_violations: vec![],
-                        current_revision: None,
-                        current_generation: None,
-                        resume_cursor: None,
-                        next_actions: vec![],
-                    },
-                    format,
-                );
+            let name = args.first().map(String::as_str).unwrap_or_default();
+            match commands.bot_create(name, &std::collections::HashMap::new()) {
+                Ok(_) => not_wired("bot create", format),
+                Err(error) => print_error(&error.to_dxbot_error(), format),
             }
-            match commands.bot_create(&name, &std::collections::HashMap::new()) {
-                Ok(payload) => {
-                    json_action(&serde_json::to_value(&payload).unwrap_or_default());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => print_error(&e.to_dxbot_error(), format),
-            }
-        }
-        Some("list") => {
-            human_action("Bots: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        Some("show") => {
-            human_action("Bot show: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        Some("activate") | Some("deactivate") => {
-            human_action("Lifecycle change: (requires live endpoint)");
-            ExitCode::SUCCESS
         }
         Some("archive") => {
-            let target = args.first().map(|s| s.as_str()).unwrap_or("unknown");
+            let Some(target) = args.first().map(String::as_str) else {
+                return usage_error("bot archive requires a target", format);
+            };
             match Confirmation::require_destructive("archive bot", target, is_tty, yes_flag) {
-                Ok(true) => {
-                    human_action(&format!("Bot '{target}' archived."));
-                    ExitCode::SUCCESS
-                }
+                Ok(true) => not_wired("bot archive", format),
                 Ok(false) => {
-                    human_action("Archive cancelled.");
+                    if format == OutputFormat::Human {
+                        println!("Archive cancelled.");
+                    }
                     ExitCode::SUCCESS
                 }
-                Err(e) => print_error(&e.to_dxbot_error(), format),
+                Err(error) => print_error(&error.to_dxbot_error(), format),
             }
         }
-        Some("restore") => {
-            human_action("Bot restore: (requires live endpoint)");
-            ExitCode::SUCCESS
+        Some(command) if ["list", "show", "activate", "deactivate", "restore"].contains(&command) => {
+            not_wired(&format!("bot {command}"), format)
         }
-        _ => {
-            eprintln!("dxb bot: unknown subcommand. Try 'create', 'list', 'show', 'activate', 'deactivate', 'archive', or 'restore'.");
-            ExitCode::from(2)
-        }
+        Some(command) => usage_error(format!("unknown bot subcommand: {command}"), format),
+        None => usage_error("bot requires a subcommand", format),
     }
 }
-
-// ── Conversation ──
 
 fn dispatch_conversation(
     sub: Option<&str>,
     args: &[String],
     commands: &CoreCommands,
-    _interactive: &InteractiveJourney,
-    _selector: &SelectorResolver,
     format: OutputFormat,
 ) -> ExitCode {
     match sub {
         Some("send") => {
-            let bot_selector = args.first().cloned().unwrap_or_default();
-            let content = if args.iter().any(|a| a == "--stdin") {
+            let selector = args.first().map(String::as_str).unwrap_or_default();
+            let content = if args.iter().any(|argument| argument == "--stdin") {
                 ContentSource::Stdin
             } else {
                 ContentSource::Text {
                     value: args.get(1).cloned().unwrap_or_default(),
                 }
             };
-            match commands.conversation_send(&bot_selector, &content) {
-                Ok(payload) => {
-                    json_action(&serde_json::to_value(&payload).unwrap_or_default());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => print_error(&e.to_dxbot_error(), format),
+            match commands.conversation_send(selector, &content) {
+                Ok(_) => not_wired("conversation send", format),
+                Err(error) => print_error(&error.to_dxbot_error(), format),
             }
         }
-        Some("show") => {
-            human_action("Conversation show: (requires live endpoint)");
-            ExitCode::SUCCESS
+        Some(command) if ["show", "history"].contains(&command) => {
+            not_wired(&format!("conversation {command}"), format)
         }
-        Some("history") => {
-            human_action("Conversation history: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!("dxb conversation: unknown subcommand. Try 'show', 'send', or 'history'.");
-            ExitCode::from(2)
-        }
+        Some(command) => usage_error(
+            format!("unknown conversation subcommand: {command}"),
+            format,
+        ),
+        None => usage_error("conversation requires a subcommand", format),
     }
 }
-
-// ── Thread ──
-
-fn dispatch_thread(
-    sub: Option<&str>,
-    _args: &[String],
-    _format: OutputFormat,
-) -> ExitCode {
-    match sub {
-        Some("create") | Some("list") | Some("show") | Some("send") | Some("history") | Some("branch") => {
-            human_action("Thread operations: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!("dxb thread: unknown subcommand. Try 'create', 'list', 'show', 'send', 'history', or 'branch'.");
-            ExitCode::from(2)
-        }
-    }
-}
-
-// ── Task ──
 
 fn dispatch_task(
     sub: Option<&str>,
     args: &[String],
     commands: &CoreCommands,
-    _interactive: &InteractiveJourney,
-    _selector: &SelectorResolver,
     directive: &DirectiveController,
     format: OutputFormat,
 ) -> ExitCode {
     match sub {
         Some("submit") => {
-            let owner = args.first().cloned().unwrap_or_default();
+            let owner = args.first().map(String::as_str).unwrap_or_default();
             let content = ContentSource::Text {
                 value: args.get(1).cloned().unwrap_or_default(),
             };
-            let options = cli::TaskOptions::default();
-            match commands.task_submit(&owner, &content, &options) {
-                Ok(payload) => {
-                    json_action(&serde_json::to_value(&payload).unwrap_or_default());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => print_error(&e.to_dxbot_error(), format),
+            match commands.task_submit(owner, &content, &cli::TaskOptions::default()) {
+                Ok(_) => not_wired("task submit", format),
+                Err(error) => print_error(&error.to_dxbot_error(), format),
             }
         }
-        Some("list") => {
-            human_action("Tasks: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        Some("show") => {
-            let selector = args.first().cloned().unwrap_or_default();
-            match commands.task_show(&selector) {
-                Ok(payload) => {
-                    json_action(&serde_json::to_value(&payload).unwrap_or_default());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => print_error(&e.to_dxbot_error(), format),
+        Some("show") | Some("result") => {
+            let selector = args.first().map(String::as_str).unwrap_or_default();
+            let projected = if sub == Some("show") {
+                commands.task_show(selector)
+            } else {
+                commands.task_result(selector)
+            };
+            match projected {
+                Ok(_) => not_wired(&format!("task {}", sub.unwrap_or_default()), format),
+                Err(error) => print_error(&error.to_dxbot_error(), format),
             }
         }
-        Some("result") => {
-            let selector = args.first().cloned().unwrap_or_default();
-            match commands.task_result(&selector) {
-                Ok(payload) => {
-                    json_action(&serde_json::to_value(&payload).unwrap_or_default());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => print_error(&e.to_dxbot_error(), format),
-            }
-        }
-        Some("cancel") => {
-            let selector = args.first().cloned().unwrap_or_default();
-            match directive.cancel_task(&selector, None, None, None) {
-                Ok(payload) => {
-                    json_action(&serde_json::to_value(&payload).unwrap_or_default());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => print_error(&directive_error_to_dxbot(&e), format),
-            }
-        }
-        Some("suspend") => {
-            let selector = args.first().cloned().unwrap_or_default();
-            match directive.suspend_task(&selector, None, None, None) {
-                Ok(payload) => {
-                    json_action(&serde_json::to_value(&payload).unwrap_or_default());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => print_error(&directive_error_to_dxbot(&e), format),
-            }
-        }
-        Some("resume") => {
-            let selector = args.first().cloned().unwrap_or_default();
-            match directive.resume_task(&selector, None) {
-                Ok(payload) => {
-                    json_action(&serde_json::to_value(&payload).unwrap_or_default());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => print_error(&directive_error_to_dxbot(&e), format),
-            }
-        }
+        Some("cancel") => project_directive(
+            directive.cancel_task(
+                args.first().map(String::as_str).unwrap_or_default(),
+                None,
+                None,
+                None,
+            ),
+            "task cancel",
+            format,
+        ),
+        Some("suspend") => project_directive(
+            directive.suspend_task(
+                args.first().map(String::as_str).unwrap_or_default(),
+                None,
+                None,
+                None,
+            ),
+            "task suspend",
+            format,
+        ),
+        Some("resume") => project_directive(
+            directive.resume_task(
+                args.first().map(String::as_str).unwrap_or_default(),
+                None,
+            ),
+            "task resume",
+            format,
+        ),
         Some("redirect") => {
-            let selector = args.first().cloned().unwrap_or_default();
             let replacement = ContentSource::Text {
                 value: args.get(1).cloned().unwrap_or_default(),
             };
-            match directive.redirect_task(&selector, None, &replacement) {
-                Ok(payload) => {
-                    json_action(&serde_json::to_value(&payload).unwrap_or_default());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => print_error(&directive_error_to_dxbot(&e), format),
-            }
+            project_directive(
+                directive.redirect_task(
+                    args.first().map(String::as_str).unwrap_or_default(),
+                    None,
+                    &replacement,
+                ),
+                "task redirect",
+                format,
+            )
         }
-        _ => {
-            eprintln!("dxb task: unknown subcommand. Try 'submit', 'list', 'show', 'cancel', 'suspend', 'resume', 'redirect', or 'result'.");
-            ExitCode::from(2)
+        Some("list") | Some("watch") => {
+            not_wired(&format!("task {}", sub.unwrap_or_default()), format)
         }
+        Some(command) => usage_error(format!("unknown task subcommand: {command}"), format),
+        None => usage_error("task requires a subcommand", format),
     }
 }
 
-fn directive_error_to_dxbot(err: &cli::directive::DirectiveError) -> DxbotError {
+fn project_directive(
+    projection: Result<dxbot_core::types::CommandPayload, cli::directive::DirectiveError>,
+    command: &str,
+    format: OutputFormat,
+) -> ExitCode {
+    match projection {
+        Ok(_) => not_wired(command, format),
+        Err(error) => print_error(&directive_error_to_dxbot(&error), format),
+    }
+}
+
+fn directive_error_to_dxbot(error: &cli::directive::DirectiveError) -> DxbotError {
     use cli::directive::DirectiveError;
-    match err {
-        DirectiveError::InvalidSelector { selector } => DxbotError {
-            code: dxbot_core::error::ErrorCode::InvalidInput,
-            category: dxbot_core::error::ErrorCategory::Input,
-            message: format!("invalid task selector: {selector}"),
-            retryable: false,
-            operation_ref: None,
-            target_refs: vec![selector.clone()],
-            field_violations: vec![],
-            current_revision: None,
-            current_generation: None,
-            resume_cursor: None,
-            next_actions: vec![],
-        },
-        DirectiveError::ReplacementRequired => DxbotError {
-            code: dxbot_core::error::ErrorCode::InvalidInput,
-            category: dxbot_core::error::ErrorCategory::Input,
-            message: "redirect requires replacement content".into(),
-            retryable: false,
-            operation_ref: None,
-            target_refs: vec![],
-            field_violations: vec![],
-            current_revision: None,
-            current_generation: None,
-            resume_cursor: None,
-            next_actions: vec![],
-        },
-        DirectiveError::ObserverLost => DxbotError {
-            code: dxbot_core::error::ErrorCode::InternalInvariant,
-            category: dxbot_core::error::ErrorCategory::Internal,
-            message: "directive observer lost".into(),
-            retryable: false,
-            operation_ref: None,
-            target_refs: vec![],
-            field_violations: vec![],
-            current_revision: None,
-            current_generation: None,
-            resume_cursor: None,
-            next_actions: vec![],
-        },
-    }
-}
-
-// ── Project ──
-
-fn dispatch_project(
-    sub: Option<&str>,
-    _args: &[String],
-    _format: OutputFormat,
-) -> ExitCode {
-    match sub {
-        Some("create") | Some("list") | Some("show") | Some("archive") | Some("restore") => {
-            human_action("Project operations: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        Some("member") => {
-            human_action("Project member operations: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!("dxb project: unknown subcommand. Try 'create', 'list', 'show', 'archive', 'restore', or 'member'.");
-            ExitCode::from(2)
-        }
-    }
-}
-
-// ── Channel ──
-
-fn dispatch_channel(
-    sub: Option<&str>,
-    _args: &[String],
-    _format: OutputFormat,
-) -> ExitCode {
-    match sub {
-        Some("create") | Some("list") | Some("show") => {
-            human_action("Channel operations: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        Some("member") => {
-            human_action("Channel member operations: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        Some("send") | Some("history") => {
-            human_action("Channel conversation: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!("dxb channel: unknown subcommand. Try 'create', 'list', 'show', 'member', 'send', or 'history'.");
-            ExitCode::from(2)
-        }
-    }
-}
-
-// ── Memory ──
-
-fn dispatch_memory(sub: Option<&str>, _args: &[String], _format: OutputFormat) -> ExitCode {
-    match sub {
-        Some("get") | Some("search") | Some("history") | Some("propose") | Some("promote") => {
-            human_action("Memory operations: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!("dxb memory: unknown subcommand. Try 'get', 'search', 'history', 'propose', or 'promote'.");
-            ExitCode::from(2)
-        }
-    }
-}
-
-// ── Approval ──
-
-fn dispatch_approval(sub: Option<&str>, _args: &[String], _format: OutputFormat) -> ExitCode {
-    match sub {
-        Some("list") | Some("show") | Some("approve") | Some("deny") => {
-            human_action("Approval operations: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!("dxb approval: unknown subcommand. Try 'list', 'show', 'approve', or 'deny'.");
-            ExitCode::from(2)
-        }
-    }
-}
-
-// ── Provider ──
-
-fn dispatch_provider(sub: Option<&str>, _args: &[String], _format: OutputFormat) -> ExitCode {
-    match sub {
-        Some("list") | Some("show") => {
-            human_action("Provider operations: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!("dxb provider: unknown subcommand. Try 'list' or 'show'.");
-            ExitCode::from(2)
-        }
-    }
-}
-
-// ── Operation ──
-
-fn dispatch_operation(sub: Option<&str>, _args: &[String], _format: OutputFormat) -> ExitCode {
-    match sub {
-        Some("show") | Some("reconcile") => {
-            human_action("Operation operations: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!("dxb operation: unknown subcommand. Try 'show' or 'reconcile'.");
-            ExitCode::from(2)
-        }
-    }
-}
-
-// ── Process ──
-
-fn dispatch_process(sub: Option<&str>, _args: &[String], _format: OutputFormat) -> ExitCode {
-    match sub {
-        Some("show") | Some("watch") => {
-            human_action("Process operations: (requires live endpoint)");
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!("dxb process: unknown subcommand. Try 'show' or 'watch'.");
-            ExitCode::from(2)
-        }
+    match error {
+        DirectiveError::InvalidSelector { selector } => local_error(
+            ErrorCode::InvalidInput,
+            ErrorCategory::Input,
+            format!("invalid task selector: {selector}"),
+        ),
+        DirectiveError::ReplacementRequired => local_error(
+            ErrorCode::InvalidInput,
+            ErrorCategory::Input,
+            "redirect requires replacement content",
+        ),
+        DirectiveError::ObserverLost => local_error(
+            ErrorCode::InternalInvariant,
+            ErrorCategory::Internal,
+            "directive observer lost",
+        ),
     }
 }

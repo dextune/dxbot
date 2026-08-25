@@ -1,17 +1,16 @@
 //! Executable crash fixture for the submission protocol.
 //!
-//! Runs a genuine submission in a child process and provokes a real
-//! `std::process::exit` at the requested [`CrashPoint`] boundary. The exit
-//! code lets the parent harness verify exactly where the process terminated.
-//!
-//! Usage: `submission-crash-probe <before-commit|after-commit|before-dispatching|after-dispatching>`
+//! Runs a genuine submission in a child process with an explicit deterministic
+//! transport and provokes a real `std::process::exit` at the requested
+//! [`CrashPoint`] boundary.
 
 use std::process::ExitCode;
 
 use control_client::{CrashPoint, SubmissionClient};
+use dxbot_core::receipt::{ReceiptDisposition, ReceiptRecord};
 use dxbot_core::types::{
     CanonicalTarget, CommandId, CommandPayload, IdempotencyKey, InstanceId, OperationRequest,
-    OperationId, PrincipalRef, RequestDigest,
+    OperationResult, PrincipalRef, RequestDigest,
 };
 
 fn main() -> ExitCode {
@@ -29,14 +28,10 @@ fn main() -> ExitCode {
     let request = request();
     let client = SubmissionClient::builder(InstanceId("instance-1".to_owned()))
         .with_hard_crash(true)
+        .with_transport(Box::new(committed_result))
         .build();
-    // The submitted request intentionally carries an operation id that the
-    // caller overrides on replay, mirroring the M1A storage fixture.
     let _ = client.submit_with_crash_point(&request, crash_point);
 
-    // If we reach here, the configured crash point did not terminate the
-    // process. Return a non-zero code that never collides with the documented
-    // crash exit codes so the parent harness reports a missing crash.
     ExitCode::from(99)
 }
 
@@ -49,7 +44,7 @@ fn request() -> OperationRequest {
             expires_at: 100,
         },
         request_digest: RequestDigest("request-a".to_owned()),
-        new_operation_id: OperationId("operation-a".to_owned()),
+        new_operation_id: dxbot_core::types::OperationId("operation-a".to_owned()),
         payload: CommandPayload {
             command_key: "cmd".to_owned(),
             principal_ref: PrincipalRef("principal-a".to_owned()),
@@ -59,5 +54,28 @@ fn request() -> OperationRequest {
             content: None,
             semantic_options: serde_json::json!({}),
         },
+    }
+}
+
+fn committed_result(request: &OperationRequest) -> OperationResult {
+    let operation_id = request.new_operation_id.clone();
+    OperationResult {
+        operation_id: operation_id.clone(),
+        command_id: request.command_id.clone(),
+        instance_id: request.payload.instance_id.clone(),
+        receipt: ReceiptRecord {
+            operation_id: operation_id.0.clone(),
+            disposition: ReceiptDisposition::Committed,
+            result_ref: format!("result:{}", operation_id.0),
+            resolved_binding_digest: request.request_digest.0.clone(),
+            owner_kind: "crash-fixture".to_owned(),
+            lease_until: None,
+            last_progress: 0,
+            reconciliation_policy: "at-least-once".to_owned(),
+        },
+        status: "committed".to_owned(),
+        committed_payload: None,
+        error: None,
+        operation_may_continue: false,
     }
 }
