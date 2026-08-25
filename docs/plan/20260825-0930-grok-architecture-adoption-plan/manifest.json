@@ -1,0 +1,82 @@
+{
+  "package": "20260825-0930-grok-architecture-adoption-plan",
+  "version": "0.1.0",
+  "status": "Reference Snapshot",
+  "normative": false,
+  "last_updated": "2026-08-25",
+  "package_path": "docs/plan/20260825-0930-grok-architecture-adoption-plan",
+  "source_baseline": {
+    "dxbot_commit": "e43739614631c95752482c2ad2ec53cb7ebd251f",
+    "grok_reconstructed_commit": "a9f633e09d49a85829b8236331b9e21f7e612634"
+  },
+  "documents": [
+    {
+      "path": "readme.md",
+      "document_id": "DXB-ADP-INDEX"
+    },
+    {
+      "path": "manifest.md",
+      "document_id": "DXB-ADP-MANIFEST"
+    },
+    {
+      "path": "00-scope-and-decision-principles.md",
+      "document_id": "DXB-ADP-000"
+    },
+    {
+      "path": "10-gap-assessment.md",
+      "document_id": "DXB-ADP-010"
+    },
+    {
+      "path": "20-extension-lifecycle-and-runtime-composition.md",
+      "document_id": "DXB-ADP-020"
+    },
+    {
+      "path": "21-local-execution-isolation-and-sandbox-lifecycle.md",
+      "document_id": "DXB-ADP-021"
+    },
+    {
+      "path": "22-observability-diagnostics-and-state-backstop.md",
+      "document_id": "DXB-ADP-022"
+    },
+    {
+      "path": "23-human-readable-projections-and-recovery-evidence.md",
+      "document_id": "DXB-ADP-023"
+    },
+    {
+      "path": "24-multi-bot-messaging-and-wake-semantics.md",
+      "document_id": "DXB-ADP-024"
+    },
+    {
+      "path": "25-provider-adapter-conformance-and-usage-accounting.md",
+      "document_id": "DXB-ADP-025"
+    },
+    {
+      "path": "26-build-provenance-and-artifact-verification.md",
+      "document_id": "DXB-ADP-026"
+    },
+    {
+      "path": "30-non-adoption-boundaries.md",
+      "document_id": "DXB-ADP-030"
+    },
+    {
+      "path": "40-integrated-roadmap.md",
+      "document_id": "DXB-ADP-040"
+    },
+    {
+      "path": "50-acceptance-and-test-plan.md",
+      "document_id": "DXB-ADP-050"
+    },
+    {
+      "path": "60-risk-register.md",
+      "document_id": "DXB-ADP-060"
+    },
+    {
+      "path": "90-source-map.md",
+      "document_id": "DXB-ADP-090"
+    },
+    {
+      "path": "99-validation-report.md",
+      "document_id": "DXB-ADP-099"
+    }
+  ]
+}
