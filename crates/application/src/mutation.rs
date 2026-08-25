@@ -58,7 +58,9 @@ impl ApplicationMutator {
     }
 
     pub fn snapshot(&self) -> Result<DomainState, AppError> {
-        self.lock().map(|guard| guard.clone()).map_err(AppError::Internal)
+        self.lock()
+            .map(|guard| guard.clone())
+            .map_err(AppError::Internal)
     }
 
     pub fn mutate(&self, request: &OperationRequest) -> Result<OperationResult, AppError> {
@@ -67,11 +69,10 @@ impl ApplicationMutator {
         let idempotency_binding = (
             request.idempotency_key.principal_ref.0.clone(),
             request.idempotency_key.key_digest.clone(),
-            request.idempotency_key.expires_at,
         );
-        let mut guard = self
-            .lock()
-            .map_err(|message| AppError::Internal(format!("domain state lock unavailable: {message}")))?;
+        let mut guard = self.lock().map_err(|message| {
+            AppError::Internal(format!("domain state lock unavailable: {message}"))
+        })?;
 
         match (
             guard.command_bindings.get(&request.command_id),
@@ -135,9 +136,10 @@ impl ApplicationMutator {
         };
         let result = self.apply(&mut guard, payload, &identity, outcome)?;
 
-        guard
-            .command_request_digests
-            .insert(identity.command_id.clone(), identity.request_digest.clone());
+        guard.command_request_digests.insert(
+            identity.command_id.clone(),
+            identity.request_digest.clone(),
+        );
         guard
             .command_bindings
             .insert(identity.command_id.clone(), identity.operation_id.clone());
@@ -152,9 +154,9 @@ impl ApplicationMutator {
         target: &CanonicalTarget,
         cas: &Option<CasConditions>,
     ) -> Result<(), AppError> {
-        let guard = self
-            .lock()
-            .map_err(|message| AppError::Internal(format!("domain state lock unavailable: {message}")))?;
+        let guard = self.lock().map_err(|message| {
+            AppError::Internal(format!("domain state lock unavailable: {message}"))
+        })?;
         self.validate_target_against(&guard, target, cas)
     }
 
@@ -162,9 +164,9 @@ impl ApplicationMutator {
         &self,
         operation_id: &OperationId,
     ) -> Result<Option<ReceiptRecord>, AppError> {
-        let guard = self
-            .lock()
-            .map_err(|message| AppError::Internal(format!("domain state lock unavailable: {message}")))?;
+        let guard = self.lock().map_err(|message| {
+            AppError::Internal(format!("domain state lock unavailable: {message}"))
+        })?;
         Ok(guard.receipts.get(operation_id).cloned())
     }
 
@@ -256,7 +258,9 @@ impl ApplicationMutator {
             error: None,
             operation_may_continue: false,
         };
-        guard.receipts.insert(identity.operation_id.clone(), receipt);
+        guard
+            .receipts
+            .insert(identity.operation_id.clone(), receipt);
         guard
             .results
             .insert(identity.operation_id.clone(), result.clone());
@@ -273,7 +277,9 @@ impl ApplicationMutator {
             .get("name")
             .and_then(|value| value.as_str())
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| AppError::NotFound("bot-create requires a materialized name".to_string()))?;
+            .ok_or_else(|| {
+                AppError::NotFound("bot-create requires a materialized name".to_string())
+            })?;
         let id = dxbot_core::types::BotId(name.to_string());
         if guard.bots.contains_key(&id) {
             return Err(AppError::Conflict(format!(
@@ -334,9 +340,10 @@ impl ApplicationMutator {
             .bots
             .get_mut(id)
             .ok_or_else(|| AppError::NotFound(format!("bot {} does not exist", id.0)))?;
-        bot.revision = bot.revision.checked_add(1).ok_or_else(|| {
-            AppError::Internal(format!("bot {} revision exhausted", id.0))
-        })?;
+        bot.revision = bot
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| AppError::Internal(format!("bot {} revision exhausted", id.0)))?;
         let lifecycle = match payload.command_key.as_str() {
             "bot-deactivate" => LifecycleState::Inactive,
             "bot-activate" | "bot-restore" => LifecycleState::Active,

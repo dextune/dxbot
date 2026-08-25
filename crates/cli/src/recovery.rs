@@ -10,14 +10,13 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use dxbot_core::types::*;
 use dxbot_core::ReceiptRecord;
+use dxbot_core::types::*;
 
 use crate::journal::{JournalError, LocalJournal, PrunePolicy};
 
 const MAX_SCAN_ENTRIES: usize = 100_000;
 const DEFAULT_PRUNE_MIN_RETENTION_SECONDS: u64 = 300;
-const OPERATION_PREFIX: &str = "op-recovery:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryError {
@@ -63,10 +62,6 @@ impl RecoveryEntry {
         })
     }
 
-    fn primary_key(&self) -> Result<IdempotencyKey, RecoveryError> {
-        Ok(self.last()?.idempotency_key.clone())
-    }
-
     fn validate_projection(&self) -> Result<&JournalRecord, RecoveryError> {
         let last = self.last()?;
         if last.command_id != self.command_id
@@ -82,14 +77,11 @@ impl RecoveryEntry {
     }
 
     fn reused_ids(&self) -> Result<ReusedIds, RecoveryError> {
-        self.validate_projection()?;
+        let last = self.validate_projection()?;
         Ok(ReusedIds {
             command_id: self.command_id.clone(),
-            // Local recovery projection only. The current journal schema does
-            // not persist the server OperationId; authenticated server binding
-            // lookup remains authoritative for an already-dispatched request.
-            operation_id: OperationId(format!("{OPERATION_PREFIX}{}", self.command_id.0)),
-            idempotency_key: self.primary_key()?,
+            operation_id: last.operation_id.clone(),
+            idempotency_key: last.idempotency_key.clone(),
         })
     }
 }
@@ -123,12 +115,12 @@ fn mock_binding_lookup(_key: &BindingKey) -> Result<Option<OperationResult>, Rec
 }
 
 fn continuation_result(
+    operation_id: &OperationId,
     command_id: &CommandId,
     instance_id: &InstanceId,
     request_digest: &RequestDigest,
     status: &str,
 ) -> OperationResult {
-    let operation_id = OperationId(format!("{OPERATION_PREFIX}{}", command_id.0));
     OperationResult {
         operation_id: operation_id.clone(),
         command_id: command_id.clone(),
@@ -136,7 +128,7 @@ fn continuation_result(
         receipt: ReceiptRecord {
             operation_id: operation_id.0.clone(),
             disposition: dxbot_core::ReceiptDisposition::Accepted,
-            result_ref: operation_id.0.clone(),
+            result_ref: format!("operation:{}", operation_id.0),
             resolved_binding_digest: request_digest.0.clone(),
             owner_kind: "instance".to_owned(),
             lease_until: None,
@@ -232,7 +224,10 @@ impl RecoveryManager {
         entry: &RecoveryEntry,
     ) -> Result<RecoveryAction, RecoveryError> {
         let last = self.durable_last(entry)?;
-        if !matches!(last.state, JournalState::Dispatching | JournalState::Observed) {
+        if !matches!(
+            last.state,
+            JournalState::Dispatching | JournalState::Observed
+        ) {
             return Err(RecoveryError::NotDispatchable(entry.command_id.clone()));
         }
 
@@ -268,10 +263,14 @@ impl RecoveryManager {
         if last.idempotency_key != *key {
             return Err(RecoveryError::BindingConflict(command_id.clone()));
         }
-        if !matches!(last.state, JournalState::Dispatching | JournalState::Observed) {
+        if !matches!(
+            last.state,
+            JournalState::Dispatching | JournalState::Observed
+        ) {
             return Err(RecoveryError::NotDispatchable(command_id.clone()));
         }
         Ok(continuation_result(
+            &last.operation_id,
             command_id,
             &last.instance_id,
             &last.request_digest,
@@ -320,11 +319,11 @@ fn validate_bound_result(
     journal: &JournalRecord,
     result: &OperationResult,
 ) -> Result<(), RecoveryError> {
-    let digest_matches = result.receipt.resolved_binding_digest.is_empty()
-        || result.receipt.resolved_binding_digest == journal.request_digest.0;
     if result.command_id != journal.command_id
+        || result.operation_id != journal.operation_id
         || result.instance_id != journal.instance_id
-        || !digest_matches
+        || result.receipt.operation_id != journal.operation_id.0
+        || result.receipt.resolved_binding_digest != journal.request_digest.0
     {
         return Err(RecoveryError::BindingConflict(journal.command_id.clone()));
     }

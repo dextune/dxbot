@@ -52,6 +52,7 @@ fn prepared_record(
         state: JournalState::Prepared,
         instance_id: instance_id.clone(),
         command_id: CommandId(command_id.to_owned()),
+        operation_id: OperationId(format!("op-{command_id}")),
         idempotency_key: IdempotencyKey {
             principal_ref: PrincipalRef("test-principal".to_owned()),
             key_digest: key_digest.to_owned(),
@@ -64,11 +65,7 @@ fn prepared_record(
     }
 }
 
-fn result(
-    instance_id: &str,
-    command_id: &str,
-    request_digest: &str,
-) -> OperationResult {
+fn result(instance_id: &str, command_id: &str, request_digest: &str) -> OperationResult {
     let operation_id = OperationId(format!("op-{command_id}"));
     OperationResult {
         operation_id: operation_id.clone(),
@@ -77,7 +74,7 @@ fn result(
         receipt: ReceiptRecord {
             operation_id: operation_id.0.clone(),
             disposition: ReceiptDisposition::Committed,
-            result_ref: operation_id.0,
+            result_ref: operation_id.0.clone(),
             resolved_binding_digest: request_digest.to_owned(),
             owner_kind: "instance".to_owned(),
             lease_until: None,
@@ -96,7 +93,11 @@ fn existing_binding(_key: &BindingKey) -> Result<Option<OperationResult>, Recove
 }
 
 fn mismatched_binding(_key: &BindingKey) -> Result<Option<OperationResult>, RecoveryError> {
-    Ok(Some(result("wrong-instance", "wrong-command", "wrong-digest")))
+    Ok(Some(result(
+        "wrong-instance",
+        "wrong-command",
+        "wrong-digest",
+    )))
 }
 
 fn set_mtime(path: &Path, time: SystemTime) {
@@ -148,15 +149,17 @@ fn recovery_prepared_reuse_compares_fresh_invocation_digest() {
     )));
     let entry = recovery.scan_journal().unwrap().remove(0);
 
-    assert!(matches!(
-        recovery
-            .reuse_prepared(&entry, &RequestDigest("req-a".to_owned()))
-            .unwrap(),
-        RecoveryAction::Continue { .. }
-    ));
+    match recovery
+        .reuse_prepared(&entry, &RequestDigest("req-a".to_owned()))
+        .unwrap()
+    {
+        RecoveryAction::Continue { ids } => {
+            assert_eq!(ids.command_id.0, "cmd-same");
+            assert_eq!(ids.operation_id.0, "op-cmd-same");
+        }
+        other => panic!("expected Continue, got {other:?}"),
+    }
 
-    // Different fresh semantics must not reuse an old Prepared record merely
-    // because the stored projection equals the stored record.
     assert!(matches!(
         recovery
             .reuse_prepared(&entry, &RequestDigest("req-b".to_owned()))
@@ -212,10 +215,12 @@ fn recovery_dispatching_validates_returned_binding_identity() {
         .remove(0);
 
     let recovery = RecoveryManager::with_binding_lookup(Arc::clone(&journal), existing_binding);
-    assert!(matches!(
-        recovery.lookup_dispatching(&entry).unwrap(),
-        RecoveryAction::Resolved { .. }
-    ));
+    match recovery.lookup_dispatching(&entry).unwrap() {
+        RecoveryAction::Resolved { result } => {
+            assert_eq!(result.operation_id.0, "op-cmd-existing");
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
 
     let recovery = RecoveryManager::with_binding_lookup(journal, mismatched_binding);
     assert!(matches!(
@@ -225,7 +230,7 @@ fn recovery_dispatching_validates_returned_binding_identity() {
 }
 
 #[test]
-fn recovery_dispatching_absent_binding_allows_same_local_binding_replay() {
+fn recovery_dispatching_absent_binding_replays_original_ids() {
     let base = temp_base();
     let inst = instance("i4");
     dispatch_on_disk(base.as_path(), &inst, "cmd-replay", "req-replay");
@@ -237,6 +242,7 @@ fn recovery_dispatching_absent_binding_allows_same_local_binding_replay() {
     match recovery.lookup_dispatching(&entry).unwrap() {
         RecoveryAction::Replay { ids } => {
             assert_eq!(ids.command_id.0, "cmd-replay");
+            assert_eq!(ids.operation_id.0, "op-cmd-replay");
             assert_eq!(ids.idempotency_key.key_digest, "key");
         }
         other => panic!("expected Replay, got {other:?}"),
@@ -262,6 +268,8 @@ fn recovery_replay_rejects_wrong_idempotency_key() {
 
     let projected = recovery.replay_operation(&command, &key).unwrap();
     assert!(projected.operation_may_continue);
+    assert_eq!(projected.operation_id.0, "op-cmd-key");
+    assert_eq!(projected.receipt.operation_id, "op-cmd-key");
     assert_eq!(projected.receipt.resolved_binding_digest, "req-key");
 }
 
@@ -290,9 +298,11 @@ fn recovery_corrupt_journal_refuses_auto_replay() {
         recovery.scan_journal(),
         Err(RecoveryError::ChainMismatch(_))
     ));
-    assert!(recovery
-        .replay_operation(&CommandId("cmd-corrupt".to_owned()), &key)
-        .is_err());
+    assert!(
+        recovery
+            .replay_operation(&CommandId("cmd-corrupt".to_owned()), &key)
+            .is_err()
+    );
     assert!(path.exists());
 }
 

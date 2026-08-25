@@ -47,6 +47,7 @@ fn prepared_record(instance_id: &InstanceId, command_id: &str) -> JournalRecord 
         state: JournalState::Prepared,
         instance_id: instance_id.clone(),
         command_id: CommandId(command_id.to_owned()),
+        operation_id: OperationId(format!("op-{command_id}")),
         idempotency_key: IdempotencyKey {
             principal_ref: PrincipalRef("test-principal".to_owned()),
             key_digest: format!("key-{command_id}"),
@@ -66,14 +67,14 @@ fn make_result(instance_id: &InstanceId, command_id: &CommandId) -> OperationRes
         command_id: command_id.clone(),
         instance_id: instance_id.clone(),
         receipt: ReceiptRecord {
-            operation_id: operation_id.0,
+            operation_id: operation_id.0.clone(),
             disposition: ReceiptDisposition::Accepted,
-            result_ref: String::new(),
-            resolved_binding_digest: String::new(),
-            owner_kind: String::new(),
+            result_ref: format!("operation:{}", operation_id.0),
+            resolved_binding_digest: format!("req-{}", command_id.0),
+            owner_kind: "instance".to_owned(),
             lease_until: None,
             last_progress: 0,
-            reconciliation_policy: String::new(),
+            reconciliation_policy: "at-least-once".to_owned(),
         },
         status: "accepted".to_owned(),
         committed_payload: None,
@@ -132,8 +133,10 @@ fn journal_hash_chain_and_transition_order_are_validated() {
     let records = journal.lookup(&cmd).unwrap().unwrap();
     assert_eq!(records.len(), 4);
     assert_eq!(records[0].previous_digest, ZERO_HASH_HEX);
+    assert_eq!(records[0].operation_id, OperationId("op-chain-command".to_owned()));
     for (index, record) in records.iter().enumerate() {
         assert_eq!(record.sequence, i64::try_from(index + 1).unwrap());
+        assert_eq!(record.operation_id, records[0].operation_id);
         if index > 0 {
             assert_eq!(record.previous_digest, records[index - 1].record_digest);
         }
@@ -153,6 +156,28 @@ fn journal_hash_chain_and_transition_order_are_validated() {
     ));
 }
 
+#[test]
+fn journal_truncated_tail_is_repaired_before_next_append() {
+    let base = temp_base();
+    let inst = instance("tail");
+    let cmd = CommandId("tail-command".to_owned());
+    let mut journal = LocalJournal::open(inst.clone(), base.as_path()).unwrap();
+    journal
+        .append_prepared(&prepared_record(&inst, &cmd.0))
+        .unwrap();
+
+    let path = journal.dir().join("tail-command.jsonl");
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    use std::io::Write as _;
+    file.write_all(b"{\"partial\":").unwrap();
+    file.sync_all().unwrap();
+
+    journal.dispatch(&cmd).unwrap();
+    let records = journal.lookup(&cmd).unwrap().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].state, JournalState::Dispatching);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn journal_takeover_reclaims_only_a_dead_owner() {
@@ -168,15 +193,9 @@ fn journal_takeover_reclaims_only_a_dead_owner() {
     }
 
     let operations = base.as_path().join(&inst.0).join("operations");
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("exit 0")
-        .spawn()
-        .unwrap();
-    child.wait().unwrap();
     fs::write(
         operations.join(".takeover-command.lock"),
-        child.id().to_string(),
+        "stale-diagnostic-pid",
     )
     .unwrap();
 
@@ -216,7 +235,6 @@ fn journal_capacity_never_bypasses_minimum_retention() {
 
     let mut journal = LocalJournal::open(inst.clone(), base.as_path()).unwrap();
 
-    // Minimum retention creates eligibility; it is not a TTL by itself.
     let no_pressure = PrunePolicy {
         min_retention_seconds: 300,
         max_prepared_count: 1000,
@@ -224,7 +242,6 @@ fn journal_capacity_never_bypasses_minimum_retention() {
     assert_eq!(journal.prune_prepared(&no_pressure).unwrap(), 0);
     assert_eq!(journal.scan().unwrap().len(), 4);
 
-    // Under capacity pressure only the three old eligible records are removed.
     let pressure = PrunePolicy {
         min_retention_seconds: 300,
         max_prepared_count: 1,
@@ -234,8 +251,6 @@ fn journal_capacity_never_bypasses_minimum_retention() {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].command_id.0, "prep-3");
 
-    // Fresh records can temporarily exceed the capacity target; safety wins
-    // over eagerly deleting provably-unsent recovery state.
     for index in 5..7 {
         let name = format!("prep-{index}");
         let mut writer = LocalJournal::open(inst.clone(), base.as_path()).unwrap();

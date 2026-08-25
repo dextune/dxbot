@@ -99,6 +99,11 @@ impl LocalJournal {
                 record.instance_id.0, self.instance_id.0
             )));
         }
+        if record.operation_id.0.trim().is_empty() {
+            return Err(JournalError::Corrupt(
+                "prepared record operation id must not be empty".to_owned(),
+            ));
+        }
         self.acquire_lock(&command_id)?;
 
         let path = self.command_file(&command_id)?;
@@ -118,6 +123,7 @@ impl LocalJournal {
             state: JournalState::Prepared,
             instance_id: self.instance_id.clone(),
             command_id,
+            operation_id: record.operation_id.clone(),
             idempotency_key: record.idempotency_key.clone(),
             request_digest: record.request_digest.clone(),
             sequence: 1,
@@ -248,7 +254,9 @@ impl LocalJournal {
                 Ok(modified) => modified,
                 Err(_) => continue,
             };
-            let age = now.duration_since(modified).map_or(0, |duration| duration.as_secs());
+            let age = now
+                .duration_since(modified)
+                .map_or(0, |duration| duration.as_secs());
             if age >= policy.min_retention_seconds {
                 candidates.push((age, command_id, entry.path()));
             }
@@ -398,20 +406,68 @@ impl LocalJournal {
         max_records: usize,
     ) -> Result<Vec<JournalRecord>, JournalError> {
         let file = File::open(path)?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(file);
         let mut records = Vec::new();
-        for line in reader.lines() {
-            let raw = line?;
-            if raw.trim().is_empty() {
+        let mut raw = Vec::new();
+        loop {
+            raw.clear();
+            let read = reader.read_until(b'\n', &mut raw)?;
+            if read == 0 {
+                break;
+            }
+            if raw.last().copied() != Some(b'\n') {
+                // Crash during append: only the final unterminated record may
+                // be ignored. It is truncated under writer ownership before a
+                // later append.
+                break;
+            }
+            while raw
+                .last()
+                .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+            {
+                raw.pop();
+            }
+            if raw.iter().all(|byte| byte.is_ascii_whitespace()) {
                 continue;
             }
             if records.len() >= max_records {
                 return Err(JournalError::CapacityBoundExceeded(records.len() + 1));
             }
-            records.push(serde_json::from_str(&raw)?);
+            records.push(serde_json::from_slice(&raw)?);
         }
         validate_chain(&records)?;
         Ok(records)
+    }
+
+    fn truncate_incomplete_tail(&self, path: &Path) -> Result<(), JournalError> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len == 0 {
+            return Ok(());
+        }
+
+        let mut reader = BufReader::new(file.try_clone()?);
+        let mut raw = Vec::new();
+        let mut complete_len = 0u64;
+        loop {
+            raw.clear();
+            let read = reader.read_until(b'\n', &mut raw)?;
+            if read == 0 || raw.last().copied() != Some(b'\n') {
+                break;
+            }
+            let read = u64::try_from(read)
+                .map_err(|_| JournalError::Corrupt("journal file length overflow".to_owned()))?;
+            complete_len = complete_len
+                .checked_add(read)
+                .ok_or_else(|| JournalError::Corrupt("journal file length overflow".to_owned()))?;
+        }
+
+        if complete_len < file_len {
+            file.set_len(complete_len)?;
+            file.sync_all()?;
+            self.fsync_dir()?;
+        }
+        Ok(())
     }
 
     fn append_state(
@@ -423,16 +479,9 @@ impl LocalJournal {
         if !self.active_locks.contains_key(command_id) {
             return Err(JournalError::NotOwner(command_id.clone()));
         }
-        if let Some(result) = result {
-            if result.command_id != *command_id || result.instance_id != self.instance_id {
-                return Err(JournalError::Corrupt(format!(
-                    "observed result identity does not match command {} and instance {}",
-                    command_id.0, self.instance_id.0
-                )));
-            }
-        }
 
         let path = self.command_file(command_id)?;
+        self.truncate_incomplete_tail(&path)?;
         let records = self.read_file(&path)?;
         let Some(last) = records.last() else {
             return Err(JournalError::NotFound(command_id.clone()));
@@ -444,6 +493,19 @@ impl LocalJournal {
                 to: state,
             });
         }
+        if let Some(result) = result {
+            if result.command_id != *command_id
+                || result.operation_id != last.operation_id
+                || result.instance_id != self.instance_id
+                || result.receipt.operation_id != last.operation_id.0
+                || result.receipt.resolved_binding_digest != last.request_digest.0
+            {
+                return Err(JournalError::Corrupt(format!(
+                    "observed result identity does not match command {}",
+                    command_id.0
+                )));
+            }
+        }
 
         let sequence = last.sequence.checked_add(1).ok_or_else(|| {
             JournalError::Corrupt(format!("sequence exhausted for command {}", command_id.0))
@@ -452,6 +514,7 @@ impl LocalJournal {
             state,
             instance_id: self.instance_id.clone(),
             command_id: command_id.clone(),
+            operation_id: last.operation_id.clone(),
             idempotency_key: last.idempotency_key.clone(),
             request_digest: last.request_digest.clone(),
             sequence,
@@ -518,6 +581,7 @@ fn canonical_payload(record: &JournalRecord) -> Vec<u8> {
     push(&mut bytes, state_str(record.state).as_bytes());
     push(&mut bytes, record.instance_id.0.as_bytes());
     push(&mut bytes, record.command_id.0.as_bytes());
+    push(&mut bytes, record.operation_id.0.as_bytes());
     push(
         &mut bytes,
         record.idempotency_key.principal_ref.0.as_bytes(),
@@ -549,7 +613,13 @@ fn validate_chain(records: &[JournalRecord]) -> Result<(), JournalError> {
     let mut previous_digest: Option<&str> = None;
     let mut previous_state: Option<JournalState> = None;
     let mut expected_sequence = 1i64;
-    let mut identity: Option<(&InstanceId, &CommandId, &IdempotencyKey, &RequestDigest)> = None;
+    let mut identity: Option<(
+        &InstanceId,
+        &CommandId,
+        &OperationId,
+        &IdempotencyKey,
+        &RequestDigest,
+    )> = None;
 
     for record in records {
         if record.sequence != expected_sequence {
@@ -562,9 +632,10 @@ fn validate_chain(records: &[JournalRecord]) -> Result<(), JournalError> {
             JournalError::ChainIntegrity("journal sequence exhausted".to_owned())
         })?;
 
-        if let Some((instance, command, key, digest)) = identity {
+        if let Some((instance, command, operation, key, digest)) = identity {
             if record.instance_id != *instance
                 || record.command_id != *command
+                || record.operation_id != *operation
                 || record.idempotency_key != *key
                 || record.request_digest != *digest
             {
@@ -573,9 +644,16 @@ fn validate_chain(records: &[JournalRecord]) -> Result<(), JournalError> {
                 ));
             }
         } else {
+            if record.operation_id.0.trim().is_empty() {
+                return Err(JournalError::ChainIntegrity(
+                    "journal operation id is missing; legacy record requires migration"
+                        .to_owned(),
+                ));
+            }
             identity = Some((
                 &record.instance_id,
                 &record.command_id,
+                &record.operation_id,
                 &record.idempotency_key,
                 &record.request_digest,
             ));

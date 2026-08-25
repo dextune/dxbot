@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use cli::journal::{JournalError, LocalJournal};
 use dxbot_core::types::{
-    CommandId, IdempotencyKey, InstanceId, JournalRecord, JournalState, PrincipalRef, RequestDigest,
+    CommandId, IdempotencyKey, InstanceId, JournalRecord, JournalState, OperationId, PrincipalRef,
+    RequestDigest,
 };
 
 fn main() -> ExitCode {
@@ -34,6 +35,7 @@ fn main() -> ExitCode {
         state: JournalState::Prepared,
         instance_id: instance,
         command_id: CommandId(command.clone()),
+        operation_id: OperationId(format!("operation-{command}")),
         idempotency_key: IdempotencyKey {
             principal_ref: PrincipalRef("probe".to_owned()),
             key_digest: format!("key-{command}"),

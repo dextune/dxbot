@@ -93,7 +93,13 @@ fn relation_request(command_id: &str, target: CanonicalTarget) -> OperationReque
 #[test]
 fn mutation_create_bot_produces_bot_ref_and_main_conversation() -> Result<(), AppError> {
     let mutator = ApplicationMutator::new();
-    let request = create_bot_request("command-1", "key-1", "digest-1", "operation-1", "alpha-bot");
+    let request = create_bot_request(
+        "command-1",
+        "key-1",
+        "digest-1",
+        "operation-1",
+        "alpha-bot",
+    );
     let result = mutator.mutate(&request)?;
 
     assert_eq!(result.command_id, request.command_id);
@@ -133,8 +139,8 @@ fn mutation_stale_revision_is_conflict() -> Result<(), AppError> {
 
     let stale = update_request("command-2", "operation-2", 0);
     assert!(matches!(
-        mutator.mutate(&stale).err(),
-        Some(AppError::Conflict(_))
+        mutator.mutate(&stale),
+        Err(AppError::Conflict(_))
     ));
     Ok(())
 }
@@ -167,7 +173,13 @@ fn mutation_receipt_is_retrievable() -> Result<(), AppError> {
 #[test]
 fn mutation_exact_retry_returns_existing() -> Result<(), AppError> {
     let mutator = ApplicationMutator::new();
-    let request = create_bot_request("command-1", "key-1", "digest-1", "operation-1", "alpha-bot");
+    let request = create_bot_request(
+        "command-1",
+        "key-1",
+        "digest-1",
+        "operation-1",
+        "alpha-bot",
+    );
     let first = mutator.mutate(&request)?;
     let second = mutator.mutate(&request)?;
 
@@ -217,8 +229,8 @@ fn mutation_same_command_different_digest_conflicts() -> Result<(), AppError> {
     let mut conflicting = original.clone();
     conflicting.request_digest = RequestDigest("digest-other".to_string());
     assert!(matches!(
-        mutator.mutate(&conflicting).err(),
-        Some(AppError::Conflict(_))
+        mutator.mutate(&conflicting),
+        Err(AppError::Conflict(_))
     ));
     Ok(())
 }
@@ -245,23 +257,31 @@ fn mutation_same_binding_different_operation_id_conflicts() -> Result<(), AppErr
 }
 
 #[test]
-fn mutation_same_key_digest_different_expiry_is_not_same_binding() -> Result<(), AppError> {
+fn mutation_same_key_digest_different_expiry_still_conflicts() -> Result<(), AppError> {
     let mutator = ApplicationMutator::new();
-    let original = create_bot_request(
+    mutator.mutate(&create_bot_request(
         "command-1",
         "key-1",
         "digest-1",
         "operation-1",
         "alpha-bot",
-    );
-    mutator.mutate(&original)?;
+    ))?;
 
-    let mut changed = original.clone();
-    changed.command_id = CommandId("command-2".to_owned());
-    changed.new_operation_id = OperationId("operation-2".to_owned());
+    let mut changed = create_bot_request(
+        "command-2",
+        "key-1",
+        "digest-2",
+        "operation-2",
+        "beta-bot",
+    );
     changed.idempotency_key.expires_at = i64::MAX - 1;
-    changed.request_digest = RequestDigest("digest-2".to_owned());
-    changed.semantic_options_mut_for_test();
+    assert!(matches!(
+        mutator.mutate(&changed),
+        Err(AppError::Conflict(_))
+    ));
+
+    let state = mutator.snapshot().expect("snapshot must succeed");
+    assert_eq!(state.bot_count(), 1);
     Ok(())
 }
 
@@ -285,8 +305,8 @@ fn mutation_single_sided_binding_conflicts() -> Result<(), AppError> {
         "beta-bot",
     );
     assert!(matches!(
-        mutator.mutate(&same_command_new_key).err(),
-        Some(AppError::Conflict(_))
+        mutator.mutate(&same_command_new_key),
+        Err(AppError::Conflict(_))
     ));
 
     let new_command_same_key = create_bot_request(
@@ -297,8 +317,8 @@ fn mutation_single_sided_binding_conflicts() -> Result<(), AppError> {
         "beta-bot",
     );
     assert!(matches!(
-        mutator.mutate(&new_command_same_key).err(),
-        Some(AppError::Conflict(_))
+        mutator.mutate(&new_command_same_key),
+        Err(AppError::Conflict(_))
     ));
     Ok(())
 }
