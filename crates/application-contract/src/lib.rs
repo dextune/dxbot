@@ -18,6 +18,7 @@ pub mod local_control;
 /// Golden-file contract test support.
 pub mod golden;
 
+#[path = "field-spec.rs"]
 mod field_spec;
 mod registry;
 mod util;
