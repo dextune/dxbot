@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::membership::MembershipRecord;
 use crate::mutation::{AppError, ApplicationMutator};
 use crate::query::scope_owner;
-use crate::state::{ConversationOwner, DomainState, MemoryAssertionStatus};
+use crate::state::{ConversationOwner, DomainState, MemoryAssertionStatus, ProcessState};
 
 pub const DEFAULT_PAGE_SIZE: usize = 50;
 pub const MAX_PAGE_SIZE: usize = 1000;
@@ -167,9 +167,17 @@ fn resolve_target(
             id: id.clone(),
             revision: *revision,
         }),
-        CanonicalTarget::Approval { .. }
-        | CanonicalTarget::Provider { .. }
-        | CanonicalTarget::Process { .. } => Ok(payload.canonical_target.clone()),
+        CanonicalTarget::Process { id } => {
+            let row = state
+                .processes
+                .get(id)
+                .or_else(|| state.processes.get(&ProcessId(raw.to_owned())))
+                .ok_or_else(|| AppError::NotFound(format!("process not found: {raw}")))?;
+            Ok(CanonicalTarget::Process { id: row.id.clone() })
+        }
+        CanonicalTarget::Approval { .. } | CanonicalTarget::Provider { .. } => {
+            Ok(payload.canonical_target.clone())
+        }
     }
 }
 
@@ -177,24 +185,41 @@ fn resolve_scope(state: &DomainState, scope: &ScopeSelector) -> Result<ScopeSele
     match scope {
         ScopeSelector::Bot(selector) => Ok(ScopeSelector::Bot(resolve_bot_selector(state, selector)?)),
         ScopeSelector::Project(ProjectSelector::CanonicalId(id)) => {
-            let row = state.projects.get(id).or_else(|| {
-                state.projects.values().find(|project| project.name == id.0)
-            }).ok_or_else(|| AppError::NotFound(format!("project not found: {}", id.0)))?;
+            let row = state
+                .projects
+                .get(id)
+                .or_else(|| state.projects.values().find(|project| project.name == id.0))
+                .ok_or_else(|| AppError::NotFound(format!("project not found: {}", id.0)))?;
             Ok(ScopeSelector::Project(ProjectSelector::CanonicalId(row.id.clone())))
         }
         ScopeSelector::Project(ProjectSelector::VisibleExact(name)) => {
-            let row = state.projects.values().find(|project| project.name == *name)
+            let row = state
+                .projects
+                .values()
+                .find(|project| project.name == *name)
                 .ok_or_else(|| AppError::NotFound(format!("project not found: {name}")))?;
             Ok(ScopeSelector::Project(ProjectSelector::CanonicalId(row.id.clone())))
         }
         ScopeSelector::Channel(ChannelSelector::CanonicalId(id)) => {
-            let row = state.channels.get(id).ok_or_else(|| AppError::NotFound(format!("channel not found: {}", id.0)))?;
+            let row = state
+                .channels
+                .get(id)
+                .ok_or_else(|| AppError::NotFound(format!("channel not found: {}", id.0)))?;
             Ok(ScopeSelector::Channel(ChannelSelector::CanonicalId(row.id.clone())))
         }
         ScopeSelector::Channel(ChannelSelector::ProjectExact { project, name }) => {
-            let candidates = state.channels.values().filter(|channel| {
-                channel.name == *name && (channel.project_id.0 == *project || state.projects.get(&channel.project_id).is_some_and(|row| row.name == *project))
-            }).collect::<Vec<_>>();
+            let candidates = state
+                .channels
+                .values()
+                .filter(|channel| {
+                    channel.name == *name
+                        && (channel.project_id.0 == *project
+                            || state
+                                .projects
+                                .get(&channel.project_id)
+                                .is_some_and(|row| row.name == *project))
+                })
+                .collect::<Vec<_>>();
             let row = exactly_one(candidates, "channel", &format!("{project}/{name}"))?;
             Ok(ScopeSelector::Channel(ChannelSelector::CanonicalId(row.id.clone())))
         }
@@ -204,12 +229,18 @@ fn resolve_scope(state: &DomainState, scope: &ScopeSelector) -> Result<ScopeSele
 fn resolve_bot_selector(state: &DomainState, selector: &BotSelector) -> Result<BotSelector, AppError> {
     match selector {
         BotSelector::CanonicalId(id) => {
-            let bot = state.bots.get(id).or_else(|| state.bots.values().find(|bot| bot.name == id.0))
+            let bot = state
+                .bots
+                .get(id)
+                .or_else(|| state.bots.values().find(|bot| bot.name == id.0))
                 .ok_or_else(|| AppError::NotFound(format!("bot not found: {}", id.0)))?;
             Ok(BotSelector::CanonicalId(bot.id.clone()))
         }
         BotSelector::ScopedExact(name) => {
-            let bot = state.bots.values().find(|bot| bot.name == *name)
+            let bot = state
+                .bots
+                .values()
+                .find(|bot| bot.name == *name)
                 .ok_or_else(|| AppError::NotFound(format!("bot not found: {name}")))?;
             Ok(BotSelector::CanonicalId(bot.id.clone()))
         }
@@ -244,7 +275,10 @@ fn materialize_cas(
             }
         }
         CanonicalTarget::Task { id, .. } => {
-            let task = state.tasks.get(id).ok_or_else(|| AppError::NotFound(format!("task not found: {}", id.0)))?;
+            let task = state
+                .tasks
+                .get(id)
+                .ok_or_else(|| AppError::NotFound(format!("task not found: {}", id.0)))?;
             cas.if_revision.get_or_insert(task.revision);
             if matches!(command, "task-cancel" | "task-suspend") {
                 cas.if_execution_generation.get_or_insert(task.execution_generation);
@@ -261,13 +295,20 @@ fn materialize_cas(
             }
         }
         CanonicalTarget::Channel { id, .. } => {
-            let channel = state.channels.get(id).ok_or_else(|| AppError::NotFound(format!("channel not found: {}", id.0)))?;
+            let channel = state
+                .channels
+                .get(id)
+                .ok_or_else(|| AppError::NotFound(format!("channel not found: {}", id.0)))?;
             if matches!(command, "task-submit" | "memory-propose") {
                 cas.if_scope_revision.get_or_insert(channel.revision);
             } else if matches!(command, "channel-member-set" | "channel-member-remove") {
                 cas.if_channel_revision.get_or_insert(channel.revision);
             } else if command == "channel-send" {
-                let revision = state.conversations.get(&channel.conversation_id).map(|row| row.revision).unwrap_or(0);
+                let revision = state
+                    .conversations
+                    .get(&channel.conversation_id)
+                    .map(|row| row.revision)
+                    .unwrap_or(0);
                 cas.if_revision.get_or_insert(revision);
             }
         }
@@ -286,9 +327,15 @@ fn materialize_cas(
             }
             let revision = scope_revision(state, scope)?;
             match scope {
-                ScopeSelector::Project(_) => { cas.if_project_revision.get_or_insert(revision); }
-                ScopeSelector::Channel(_) => { cas.if_channel_revision.get_or_insert(revision); }
-                ScopeSelector::Bot(_) => { cas.if_scope_revision.get_or_insert(revision); }
+                ScopeSelector::Project(_) => {
+                    cas.if_project_revision.get_or_insert(revision);
+                }
+                ScopeSelector::Channel(_) => {
+                    cas.if_channel_revision.get_or_insert(revision);
+                }
+                ScopeSelector::Bot(_) => {
+                    cas.if_scope_revision.get_or_insert(revision);
+                }
             }
         }
         CanonicalTarget::Operation { operation_id, .. } => {
@@ -297,7 +344,9 @@ fn materialize_cas(
             }
         }
         CanonicalTarget::SideEffect { id, .. } => {
-            if let Some(row) = state.side_effects.get(id) { cas.if_revision.get_or_insert(row.revision); }
+            if let Some(row) = state.side_effects.get(id) {
+                cas.if_revision.get_or_insert(row.revision);
+            }
         }
         _ => {}
     }
@@ -349,6 +398,7 @@ fn query_state(state: &DomainState, payload: &CommandPayload) -> Result<Value, A
         }
         "channel-show" => channel_query(state, payload),
         "channel-history" => channel_history(state, payload, page_size, cursor.as_deref()),
+        "process-show" => process_query(state, payload),
         "operation-show" => operation_query(state, payload),
         other => Err(AppError::NotFound(format!("no Application query owner for command {other}"))),
     }
@@ -383,6 +433,29 @@ fn task_query(state: &DomainState, payload: &CommandPayload) -> Result<Value, Ap
     Ok(task_value(row))
 }
 fn task_value(row: &crate::state::TaskState) -> Value { json!({"task_ref": format!("task:{}", row.id.0), "owner": row.owner, "revision": row.revision, "execution_generation": row.execution_generation, "state": format!("{:?}", row.status).to_lowercase()}) }
+
+fn process_query(state: &DomainState, payload: &CommandPayload) -> Result<Value, AppError> {
+    let CanonicalTarget::Process { id } = &payload.canonical_target else { return Err(target_error(payload)); };
+    let row = state.processes.get(id).ok_or_else(|| AppError::NotFound(format!("process {} does not exist", id.0)))?;
+    Ok(process_value(row))
+}
+
+fn process_value(row: &ProcessState) -> Value {
+    json!({
+        "process_ref": format!("process:{}", row.id.0),
+        "definition_ref": row.definition_id,
+        "definition_version": row.definition_version,
+        "revision": row.revision,
+        "scope_ref": row.scope_ref,
+        "initiator_ref": row.initiator_ref,
+        "state": format!("{:?}", row.lifecycle).to_ascii_lowercase(),
+        "current_step_ref": row.current_step_ref,
+        "waiting_condition_ref": row.waiting_condition_ref,
+        "child_refs": row.child_refs,
+        "progress": row.progress,
+        "terminal_reason": row.terminal_reason,
+    })
+}
 
 fn memory_query(state: &DomainState, payload: &CommandPayload) -> Result<Value, AppError> {
     let CanonicalTarget::Memory { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
