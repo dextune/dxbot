@@ -62,7 +62,7 @@ pub use directive::{
 };
 pub use discovery::{Discovery, DiscoveryState, ProviderDiagnostic};
 pub use host_process::run_runtime_host_process;
-pub use identity::{build_operation_request, request_digest_for_payload};
+pub use identity::{build_operation_request, request_digest_for_input};
 pub use interactive::{
     ConflictStatus, InteractiveError, InteractiveJourney, PreflightResult, ProviderStatus,
 };
