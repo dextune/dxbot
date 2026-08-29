@@ -1,8 +1,8 @@
 //! `dxb` process entrypoint.
 //!
 //! All public command semantics live in `cli::runner`; this file only converts
-//! OS argv, handles the private Runtime Host process mode, writes complete
-//! output buffers, and exits with the canonical code chosen by the runner.
+//! OS argv, handles the private Runtime Host process mode, and delegates bounded
+//! or incremental output to the production runner.
 
 use std::ffi::OsStr;
 use std::io::Write;
@@ -31,19 +31,7 @@ fn main() {
             Err(argument) => exit_invalid_unicode(&argument),
         }
     }
-
-    let output = cli::execute(&args);
-    if !output.stdout.is_empty() {
-        let mut stdout = std::io::stdout().lock();
-        if stdout.write_all(output.stdout.as_bytes()).is_err() {
-            std::process::exit(17);
-        }
-    }
-    if !output.stderr.is_empty() {
-        let mut stderr = std::io::stderr().lock();
-        let _ = stderr.write_all(output.stderr.as_bytes());
-    }
-    std::process::exit(output.exit_code);
+    std::process::exit(cli::run_process(&args));
 }
 
 fn exit_invalid_unicode(argument: &OsStr) -> ! {
