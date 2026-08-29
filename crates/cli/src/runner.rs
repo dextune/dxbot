@@ -1,11 +1,10 @@
 //! Production CLI orchestration.
 //!
-//! The binary delegates here so every invocation follows one reusable path:
+//! Every invocation follows one reusable path:
 //! registry path resolution -> typed argv binding -> local content materialize ->
 //! verified Instance discovery -> authenticated local Principal handshake ->
-//! bounded remote preflight -> query, stream, host action or durable
-//! submission/recovery -> render. Local-only options never cross the Prepared
-//! boundary.
+//! bounded preflight -> query, stream, host action or durable submission/recovery
+//! -> render. Local-only options never cross the Prepared boundary.
 
 use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
@@ -21,7 +20,7 @@ use application_contract::{
 use control_client::{ClientError, LocalControlClient};
 use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
 use dxbot_core::types::{ColorMode, CommandPayload, OperationResult, OutputFormat};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::{
     Confirmation, Discovery, MachineRenderer, SafeWriter, StreamEvent, SubmissionFlowError,
@@ -100,27 +99,25 @@ impl LocalPaths {
 /// stream would violate the CLI contract.
 pub fn execute(args: &[String]) -> CliOutput {
     let format_hint = requested_format(args);
-    let color_hint = requested_color(args);
+    let color_enabled = format_hint == OutputFormat::Human
+        && requested_color(args) == ColorMode::Always;
     match prepare_invocation(args).and_then(execute_prepared_buffered) {
-        Ok(output) => decorate_output(output, color_hint == ColorMode::Always),
-        Err(error) => decorate_output(
-            render_error(error, format_hint),
-            color_hint == ColorMode::Always,
-        ),
+        Ok(output) => decorate_output(output, color_enabled),
+        Err(error) => decorate_output(render_error(error, format_hint), color_enabled),
     }
 }
 
-/// Production process entrypoint. Bounded commands reuse the exact buffered
+/// Production process entrypoint. Bounded commands reuse the same buffered
 /// path; S-kind commands write and flush each observation directly to stdout.
 pub fn run_process(args: &[String]) -> i32 {
     let format_hint = requested_format(args);
-    let color_hint = requested_color(args);
     let stdout_is_terminal = std::io::stdout().is_terminal();
-    let color_enabled = match color_hint {
-        ColorMode::Always => true,
-        ColorMode::Never => false,
-        ColorMode::Auto => stdout_is_terminal,
-    };
+    let color_enabled = format_hint == OutputFormat::Human
+        && match requested_color(args) {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => stdout_is_terminal,
+        };
 
     match prepare_invocation(args) {
         Ok(PreparedInvocation::Command {
@@ -129,10 +126,10 @@ pub fn run_process(args: &[String]) -> i32 {
             kind,
         }) if kind == "S" => match stream_command(&mut input, &command_key, color_enabled) {
             Ok(()) => 0,
-            Err(error) => {
-                let output = decorate_output(render_error(error, format_hint), color_enabled);
-                emit_cli_output(&output)
-            }
+            Err(error) => emit_cli_output(&decorate_output(
+                render_error(error, format_hint),
+                color_enabled,
+            )),
         },
         Ok(prepared) => match execute_prepared_buffered(prepared) {
             Ok(output) => emit_cli_output(&decorate_output(output, color_enabled)),
@@ -168,6 +165,7 @@ fn prepare_invocation(args: &[String]) -> Result<PreparedInvocation, DxbotError>
     if normalized.command_tokens.is_empty() {
         return Err(usage_error("missing command"));
     }
+
     let group = &normalized.command_tokens[0];
     if !commands_in_group(group).is_empty()
         && (normalized.command_tokens.len() == 1
@@ -474,7 +472,7 @@ fn query_all_pages(
                 cursor,
             ));
         }
-        set_payload_cursor(payload, cursor.as_deref());
+        set_payload_cursor(payload, cursor.as_deref())?;
         let page = client.query(payload).map_err(client_error)?;
         bytes = bytes
             .checked_add(page.to_string().len())
@@ -534,11 +532,14 @@ fn query_all_pages(
 }
 
 #[cfg(unix)]
-fn set_payload_cursor(payload: &mut CommandPayload, cursor: Option<&str>) {
+fn set_payload_cursor(
+    payload: &mut CommandPayload,
+    cursor: Option<&str>,
+) -> Result<(), DxbotError> {
     let object = payload
         .semantic_options
         .as_object_mut()
-        .expect("project_for_execution always returns object semantic_options");
+        .ok_or_else(|| internal_error("projected semantic_options must be a JSON object"))?;
     match cursor {
         Some(cursor) => {
             object.insert("cursor".to_owned(), Value::String(cursor.to_owned()));
@@ -547,6 +548,7 @@ fn set_payload_cursor(payload: &mut CommandPayload, cursor: Option<&str>) {
             object.remove("cursor");
         }
     }
+    Ok(())
 }
 
 fn write_output_artifact(
@@ -688,17 +690,25 @@ fn stream_command(
                 .and_then(Value::as_str)
                 .ok_or_else(|| internal_error("watch observation omitted cursor"))?
                 .to_owned();
-            if cursor.as_deref().is_some_and(|current| current > next_cursor.as_str()) {
+            if cursor
+                .as_deref()
+                .is_some_and(|current| current > next_cursor.as_str())
+            {
                 return Err(internal_error("watch cursor regressed"));
             }
             let terminal = value
                 .get("terminal")
                 .and_then(Value::as_bool)
                 .ok_or_else(|| internal_error("watch observation omitted terminal flag"))?;
-            let line = render_stream_value(&value, input.global_options.format, command_key, color_enabled)?;
+            let line = render_stream_value(
+                &value,
+                input.global_options.format,
+                command_key,
+                color_enabled,
+            )?;
             stdout
                 .write_all(line.as_bytes())
-                .and_then(|_| stdout.flush())
+                .and_then(|()| stdout.flush())
                 .map_err(|error| {
                     interrupted_error(format!(
                         "stream output closed; runtime observation stopped without cancelling target: {error}"
@@ -728,14 +738,20 @@ fn render_stream_value(
         OutputFormat::Json => Err(input_error(
             "streaming commands cannot render a bounded JSON document",
         )),
-        OutputFormat::Jsonl => Ok(format!("{}\n", value)),
+        OutputFormat::Jsonl => Ok(format!("{value}\n")),
         OutputFormat::Human => {
             let event = value
                 .get("event")
                 .and_then(Value::as_str)
                 .unwrap_or(command_key);
-            let state = value.get("state").and_then(Value::as_str).unwrap_or("unknown");
-            let cursor = value.get("cursor").and_then(Value::as_str).unwrap_or("?");
+            let state = value
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let cursor = value
+                .get("cursor")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
             let headline = format!("{event}: state={state} cursor={cursor}");
             let headline = if color_enabled {
                 format!("\x1b[36m{headline}\x1b[0m")
@@ -914,15 +930,19 @@ fn color_first_line(value: &str, ansi_code: &str) -> String {
 }
 
 fn emit_cli_output(output: &CliOutput) -> i32 {
-    if !output.stdout.is_empty() {
-        if std::io::stdout().write_all(output.stdout.as_bytes()).is_err() {
-            return ErrorCode::Interrupted.exit_code();
-        }
+    if !output.stdout.is_empty()
+        && std::io::stdout()
+            .write_all(output.stdout.as_bytes())
+            .is_err()
+    {
+        return ErrorCode::Interrupted.exit_code();
     }
-    if !output.stderr.is_empty() {
-        if std::io::stderr().write_all(output.stderr.as_bytes()).is_err() {
-            return ErrorCode::Interrupted.exit_code();
-        }
+    if !output.stderr.is_empty()
+        && std::io::stderr()
+            .write_all(output.stderr.as_bytes())
+            .is_err()
+    {
+        return ErrorCode::Interrupted.exit_code();
     }
     output.exit_code
 }
@@ -1205,12 +1225,15 @@ fn partial_error(message: impl Into<String>, resume_cursor: Option<String>) -> D
 fn usage_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::Usage, ErrorCategory::Input, message)
 }
+
 fn input_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::InvalidInput, ErrorCategory::Input, message)
 }
+
 fn local_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::StorageOrCorruption, ErrorCategory::Local, message)
 }
+
 fn storage_error(message: impl Into<String>) -> DxbotError {
     error_with(
         ErrorCode::StorageOrCorruption,
@@ -1218,6 +1241,7 @@ fn storage_error(message: impl Into<String>) -> DxbotError {
         message,
     )
 }
+
 fn runtime_unavailable(message: impl Into<String>) -> DxbotError {
     error_with(
         ErrorCode::RuntimeUnavailable,
@@ -1225,20 +1249,25 @@ fn runtime_unavailable(message: impl Into<String>) -> DxbotError {
         message,
     )
 }
+
 fn incompatible_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::Incompatible, ErrorCategory::Conflict, message)
 }
+
 fn timeout_error(message: impl Into<String>) -> DxbotError {
     let mut error = error_with(ErrorCode::Timeout, ErrorCategory::Availability, message);
     error.retryable = true;
     error
 }
+
 fn interrupted_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::Interrupted, ErrorCategory::Local, message)
 }
+
 fn internal_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::InternalInvariant, ErrorCategory::Internal, message)
 }
+
 fn error_with(
     code: ErrorCode,
     category: ErrorCategory,
@@ -1305,7 +1334,7 @@ mod tests {
         assert_eq!(output.exit_code, 0);
         let value: Value = serde_json::from_str(output.stdout.trim()).expect("valid json");
         assert_eq!(value["supported_protocol_versions"][0], "1");
-        assert_eq!(value["supported_schema_versions"][0], "v1");
+        assert_eq!(value["supported_schema_versions"][0], "v2");
     }
 
     #[test]
@@ -1319,16 +1348,18 @@ mod tests {
     }
 
     #[test]
-    fn stream_json_is_rejected_before_any_unbounded_buffering() {
+    fn stream_json_is_classified_before_unbounded_buffering() {
         let prepared = prepare_invocation(&args(&[
             "task", "watch", "--task", "task-a", "--format", "json",
         ]))
         .expect("invocation parses");
-        let PreparedInvocation::Command { input, kind, .. } = prepared else {
-            panic!("expected command");
-        };
-        assert_eq!(kind, "S");
-        assert_eq!(input.global_options.format, OutputFormat::Json);
+        match prepared {
+            PreparedInvocation::Command { input, kind, .. } => {
+                assert_eq!(kind, "S");
+                assert_eq!(input.global_options.format, OutputFormat::Json);
+            }
+            PreparedInvocation::Offline(_) => assert!(false, "expected command"),
+        }
     }
 
     #[test]
@@ -1338,8 +1369,17 @@ mod tests {
     }
 
     #[test]
-    fn color_always_is_explicit_even_for_buffered_execution() {
+    fn color_always_is_explicit_for_human_output() {
         let output = execute(&args(&["--color", "always", "--version"]));
         assert!(output.stdout.starts_with("\u{1b}[32m"));
+    }
+
+    #[test]
+    fn machine_output_never_contains_ansi_even_when_color_is_always() {
+        let output = execute(&args(&[
+            "--format", "json", "--color", "always", "--version",
+        ]));
+        assert!(!output.stdout.contains("\u{1b}["));
+        let _: Value = serde_json::from_str(output.stdout.trim()).expect("valid json");
     }
 }
