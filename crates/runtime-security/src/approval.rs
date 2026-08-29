@@ -1,44 +1,58 @@
 //! High-risk operation approvals and pending operation continuation.
 //!
-//! Approval state is canonical in runtime-security. Each decision advances the
-//! approval revision so CLI CAS can fence stale approve/deny attempts.
+//! Approval state is canonical in runtime-security. Every approval is bound to
+//! its pending operation, action, target and policy generation. Decisions use a
+//! revision CAS so stale or duplicated CLI decisions fail closed.
 
 use std::collections::HashMap;
 
 use dxbot_core::types::{ApprovalId, OperationId, PrincipalRef};
+use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ApprovalDecision {
     Approve,
     Deny,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ApprovalState {
     Pending,
     Approved,
     Denied,
+    Expired,
+    Revoked,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalBinding {
+    pub action: String,
+    pub target: String,
+    pub policy_generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalDecisionRecord {
     pub by: PrincipalRef,
     pub decision: ApprovalDecision,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRecord {
     pub id: ApprovalId,
     pub operation_id: OperationId,
+    pub binding: ApprovalBinding,
     pub required_approvers: Vec<PrincipalRef>,
     pub decisions: Vec<ApprovalDecisionRecord>,
     pub state: ApprovalState,
     pub revision: i64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ApprovalManager {
     approvals: HashMap<String, ApprovalRecord>,
     next_seq: u64,
@@ -54,16 +68,39 @@ impl ApprovalManager {
         operation_id: OperationId,
         required_approvers: Vec<PrincipalRef>,
     ) -> Result<ApprovalId, Error> {
+        let binding = ApprovalBinding {
+            action: "continue-operation".to_owned(),
+            target: format!("operation:{}", operation_id.0),
+            policy_generation: 1,
+        };
+        self.create_bound_approval(operation_id, binding, required_approvers)
+    }
+
+    pub fn create_bound_approval(
+        &mut self,
+        operation_id: OperationId,
+        binding: ApprovalBinding,
+        required_approvers: Vec<PrincipalRef>,
+    ) -> Result<ApprovalId, Error> {
+        if binding.action.trim().is_empty()
+            || binding.target.trim().is_empty()
+            || binding.policy_generation <= 0
+            || required_approvers.is_empty()
+        {
+            return Err(Error::InvalidApprovalBinding);
+        }
         let sequence = self.next_seq;
-        self.next_seq = self.next_seq.checked_add(1).ok_or_else(|| {
-            Error::ApprovalAlreadyDecided(ApprovalId("approval-id-space-exhausted".to_owned()))
-        })?;
+        self.next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(Error::ApprovalIdSpaceExhausted)?;
         let id = ApprovalId(format!("approval-{sequence}"));
         self.approvals.insert(
             id.0.clone(),
             ApprovalRecord {
                 id: id.clone(),
                 operation_id,
+                binding,
                 required_approvers,
                 decisions: Vec::new(),
                 state: ApprovalState::Pending,
@@ -73,8 +110,6 @@ impl ApprovalManager {
         Ok(id)
     }
 
-    /// Compatibility API for internal callers that already hold the current
-    /// record. Public CLI decisions should use `decide_approval_if_revision`.
     pub fn decide_approval(
         &mut self,
         approval_id: &ApprovalId,
@@ -115,8 +150,8 @@ impl ApprovalManager {
             ApprovalDecision::Deny => record.state = ApprovalState::Denied,
             ApprovalDecision::Approve => {
                 if record.required_approvers.iter().all(|required| {
-                    record.decisions.iter().any(|record| {
-                        record.by == *required && record.decision == ApprovalDecision::Approve
+                    record.decisions.iter().any(|existing| {
+                        existing.by == *required && existing.decision == ApprovalDecision::Approve
                     })
                 }) {
                     record.state = ApprovalState::Approved;
@@ -126,8 +161,35 @@ impl ApprovalManager {
         record.revision = record
             .revision
             .checked_add(1)
-            .ok_or_else(|| Error::ApprovalAlreadyDecided(approval_id.clone()))?;
+            .ok_or(Error::ApprovalRevisionExhausted(approval_id.clone()))?;
         Ok(record.clone())
+    }
+
+    pub fn apply_decision_idempotently(
+        &mut self,
+        approval_id: &ApprovalId,
+        expected_revision: i64,
+        decision: ApprovalDecision,
+        by: &PrincipalRef,
+    ) -> Result<ApprovalRecord, Error> {
+        let current = self.get_approval(approval_id)?;
+        if current.revision == expected_revision {
+            return self.decide_approval_if_revision(
+                approval_id,
+                expected_revision,
+                decision,
+                by,
+            );
+        }
+        if current.revision == expected_revision.saturating_add(1)
+            && current
+                .decisions
+                .iter()
+                .any(|record| record.by == *by && record.decision == decision)
+        {
+            return Ok(current);
+        }
+        Err(Error::ApprovalAlreadyDecided(approval_id.clone()))
     }
 
     pub fn get_approval(&self, id: &ApprovalId) -> Result<ApprovalRecord, Error> {
@@ -161,7 +223,10 @@ impl ApprovalManager {
             .ok_or_else(|| Error::UnknownApproval(approval_id.clone()))?;
         Ok(match record.state {
             ApprovalState::Approved => Some(record.operation_id.clone()),
-            ApprovalState::Pending | ApprovalState::Denied => None,
+            ApprovalState::Pending
+            | ApprovalState::Denied
+            | ApprovalState::Expired
+            | ApprovalState::Revoked => None,
         })
     }
 }
