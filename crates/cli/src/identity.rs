@@ -3,17 +3,22 @@
 //! CommandId, OperationId, IdempotencyKey and RequestDigest are generated once
 //! before Prepared and then reused unchanged by the local journal and control
 //! transport. IDs are uniqueness tokens, not secrets.
+//!
+//! RequestDigest deliberately excludes local discovery/render/wait state, but
+//! binds the raw typed selector independently from the materialized payload so
+//! selector intent cannot drift while resolving to the same canonical target.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use application_contract::{LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_VERSION};
+use application_contract::{CliInput, LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_VERSION};
 use dxbot_core::DxbotError;
 use dxbot_core::error::{ErrorCategory, ErrorCode};
 use dxbot_core::types::{
     CommandId, CommandPayload, IdempotencyKey, OperationId, OperationRequest, RequestDigest,
 };
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::sha256::sha256_hex;
 
@@ -24,17 +29,24 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 struct DigestEnvelope<'a> {
     protocol_version: &'static str,
     schema_version: &'static str,
+    raw_selector: &'a Option<Value>,
     payload: &'a CommandPayload,
 }
 
-pub fn build_operation_request(payload: CommandPayload) -> Result<OperationRequest, DxbotError> {
+pub fn build_operation_request(
+    input: &CliInput,
+    payload: CommandPayload,
+) -> Result<OperationRequest, DxbotError> {
     let seed = unique_seed()?;
-    let command_id = CommandId(format!("cmd-{}", sha256_hex(format!("command:{seed}").as_bytes())));
+    let command_id = CommandId(format!(
+        "cmd-{}",
+        sha256_hex(format!("command:{seed}").as_bytes())
+    ));
     let operation_id = OperationId(format!(
         "op-{}",
         sha256_hex(format!("operation:{seed}").as_bytes())
     ));
-    let request_digest = request_digest_for_payload(&payload)?;
+    let request_digest = request_digest_for_input(input, &payload)?;
     let key_digest = sha256_hex(
         format!(
             "idempotency:{}:{}:{}:{seed}",
@@ -43,9 +55,9 @@ pub fn build_operation_request(payload: CommandPayload) -> Result<OperationReque
         .as_bytes(),
     );
     let now = unix_seconds()?;
-    let expires_at = now.checked_add(IDEMPOTENCY_TTL_SECONDS).ok_or_else(|| {
-        local_error("system clock cannot represent idempotency expiry")
-    })?;
+    let expires_at = now
+        .checked_add(IDEMPOTENCY_TTL_SECONDS)
+        .ok_or_else(|| local_error("system clock cannot represent idempotency expiry"))?;
 
     Ok(OperationRequest {
         command_id,
@@ -60,10 +72,14 @@ pub fn build_operation_request(payload: CommandPayload) -> Result<OperationReque
     })
 }
 
-pub fn request_digest_for_payload(payload: &CommandPayload) -> Result<RequestDigest, DxbotError> {
+pub fn request_digest_for_input(
+    input: &CliInput,
+    payload: &CommandPayload,
+) -> Result<RequestDigest, DxbotError> {
     let envelope = DigestEnvelope {
         protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
         schema_version: LOCAL_CONTROL_SCHEMA_VERSION,
+        raw_selector: &input.selector,
         payload,
     };
     let canonical = serde_json::to_vec(&envelope)
@@ -109,8 +125,20 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use dxbot_core::types::{CanonicalTarget, InstanceId, PrincipalRef};
+    use serde_json::json;
 
     use super::*;
+
+    fn input(selector: &str) -> CliInput {
+        CliInput {
+            command_key: "bot-show".to_owned(),
+            global_options: Default::default(),
+            selector: Some(json!({"kind": "bot", "value": selector})),
+            cas: None,
+            content: None,
+            fields: json!({}),
+        }
+    }
 
     fn payload() -> CommandPayload {
         let instance = InstanceId("instance-a".to_owned());
@@ -121,22 +149,32 @@ mod tests {
             canonical_target: CanonicalTarget::Instance(instance),
             cas: None,
             content: None,
-            semantic_options: serde_json::json!({"name": "alpha"}),
+            semantic_options: json!({"name": "alpha"}),
         }
     }
 
     #[test]
-    fn request_digest_is_stable_for_same_materialized_payload() {
+    fn request_digest_is_stable_for_same_materialized_input() {
+        let input = input("alpha");
         let payload = payload();
-        let first = request_digest_for_payload(&payload).expect("digest computes");
-        let second = request_digest_for_payload(&payload).expect("digest computes");
+        let first = request_digest_for_input(&input, &payload).expect("digest computes");
+        let second = request_digest_for_input(&input, &payload).expect("digest computes");
         assert_eq!(first, second);
     }
 
     #[test]
+    fn request_digest_binds_raw_selector_even_when_payload_is_same() {
+        let payload = payload();
+        let first = request_digest_for_input(&input("alpha"), &payload).expect("digest computes");
+        let second = request_digest_for_input(&input("bot:alpha"), &payload).expect("digest computes");
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn generated_operation_identity_is_unique_and_principal_bound() {
-        let first = build_operation_request(payload()).expect("request builds");
-        let second = build_operation_request(payload()).expect("request builds");
+        let input = input("alpha");
+        let first = build_operation_request(&input, payload()).expect("request builds");
+        let second = build_operation_request(&input, payload()).expect("request builds");
         assert_ne!(first.command_id, second.command_id);
         assert_ne!(first.new_operation_id, second.new_operation_id);
         assert_ne!(first.idempotency_key.key_digest, second.idempotency_key.key_digest);
