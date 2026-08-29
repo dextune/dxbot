@@ -7,9 +7,7 @@
 
 use std::fmt::Debug;
 
-use dxbot_core::types::{
-    CommandId, IdempotencyKey, JournalRecord, OperationResult,
-};
+use dxbot_core::types::{CommandId, IdempotencyKey, JournalRecord, OperationResult};
 
 use crate::client::ClientError;
 use crate::journal::JournalStore;
@@ -31,12 +29,12 @@ pub trait SubmissionJournal: Debug {
         command_id: &CommandId,
         result: &OperationResult,
     ) -> Result<(), ClientError>;
-    fn lookup(&self, command_id: &CommandId) -> Option<JournalRecord>;
+    fn lookup(&self, command_id: &CommandId) -> Result<Option<JournalRecord>, ClientError>;
     fn find_binding(
         &self,
         command_id: &CommandId,
         key: &IdempotencyKey,
-    ) -> Option<(JournalRecord, Option<OperationResult>)>;
+    ) -> Result<Option<(JournalRecord, Option<OperationResult>)>, ClientError>;
     fn len(&self) -> usize;
 
     fn is_empty(&self) -> bool {
@@ -69,16 +67,16 @@ impl SubmissionJournal for JournalStore {
         JournalStore::terminate(self, command_id, result)
     }
 
-    fn lookup(&self, command_id: &CommandId) -> Option<JournalRecord> {
-        JournalStore::lookup(self, command_id)
+    fn lookup(&self, command_id: &CommandId) -> Result<Option<JournalRecord>, ClientError> {
+        Ok(JournalStore::lookup(self, command_id))
     }
 
     fn find_binding(
         &self,
         command_id: &CommandId,
         key: &IdempotencyKey,
-    ) -> Option<(JournalRecord, Option<OperationResult>)> {
-        JournalStore::find_binding(self, command_id, key)
+    ) -> Result<Option<(JournalRecord, Option<OperationResult>)>, ClientError> {
+        Ok(JournalStore::find_binding(self, command_id, key))
     }
 
     fn len(&self) -> usize {
