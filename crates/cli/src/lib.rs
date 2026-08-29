@@ -1,10 +1,19 @@
 #![forbid(unsafe_code)]
 
+#[path = "journal-sha256.rs"]
+pub(crate) mod sha256;
+
 /// Local journal: OS-locked single-writer ownership, hash chain, bounded retention.
 pub mod journal;
 
 /// Adapter from the CLI-owned durable journal to the control-client submission protocol.
 pub mod submission_journal;
+
+/// Bounded local content materialization before Prepared.
+pub mod content;
+
+/// Single-owner replay identity projection before Prepared.
+pub mod identity;
 
 /// CLI discovery: help/version, exact Instance selection, fail-closed Runtime
 /// bootstrap delegation, and provider descriptor diagnostics.
@@ -40,11 +49,13 @@ pub mod directive;
 pub use automation::{MachineRenderer, StreamEvent};
 pub use commands::{CommandsError, CoreCommands, TaskOptions};
 pub use confirmation::{Confirmation, ConfirmationError};
+pub use content::{MAX_MATERIALIZED_CONTENT_BYTES, materialize_content};
 pub use directive::{
     CMD_TASK_CANCEL, CMD_TASK_REDIRECT, CMD_TASK_RESUME, CMD_TASK_SUSPEND, DirectiveController,
     DirectiveError, WaitResult,
 };
 pub use discovery::{Discovery, DiscoveryState, ProviderDiagnostic};
+pub use identity::{build_operation_request, request_digest_for_payload};
 pub use interactive::{
     ConflictStatus, InteractiveError, InteractiveJourney, PreflightResult, ProviderStatus,
 };
