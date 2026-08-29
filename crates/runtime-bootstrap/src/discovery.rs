@@ -5,9 +5,10 @@
 //! bootstrap path.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::bootstrap::Error;
 
 pub const DISCOVERY_STATE_FILE: &str = "discovery.json";
+const MAX_DISCOVERY_STATE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryEndpoint {
@@ -43,12 +45,35 @@ impl DiscoveryState {
 
     pub fn load_state(base_path: &Path) -> Result<Self, Error> {
         let path = base_path.join(DISCOVERY_STATE_FILE);
-        let data = match fs::read(&path) {
-            Ok(data) => data,
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Self::empty()),
             Err(error) => return Err(Error::Io(format!("{}: {error}", path.display()))),
         };
-        validate_state_file(&path)?;
+        validate_state_metadata(&path, &metadata)?;
+        if metadata.len() > MAX_DISCOVERY_STATE_BYTES {
+            return Err(Error::CorruptState(format!(
+                "discovery state exceeds {} bytes: {}",
+                MAX_DISCOVERY_STATE_BYTES,
+                path.display()
+            )));
+        }
+
+        let mut data = Vec::with_capacity(metadata.len() as usize);
+        File::open(&path)
+            .and_then(|mut file| {
+                file.take(MAX_DISCOVERY_STATE_BYTES + 1)
+                    .read_to_end(&mut data)
+                    .map(|_| ())
+            })
+            .map_err(|error| Error::Io(format!("{}: {error}", path.display())))?;
+        if data.len() as u64 > MAX_DISCOVERY_STATE_BYTES {
+            return Err(Error::CorruptState(format!(
+                "discovery state grew beyond {} bytes during read: {}",
+                MAX_DISCOVERY_STATE_BYTES,
+                path.display()
+            )));
+        }
         serde_json::from_slice(&data)
             .map_err(|error| Error::CorruptState(format!("{}: {error}", path.display())))
     }
@@ -60,24 +85,41 @@ impl DiscoveryState {
             .map_err(|error| Error::Io(format!("{}: {error}", base_path.display())))?;
         harden_directory(base_path)?;
         let path = base_path.join(DISCOVERY_STATE_FILE);
-        let tmp = base_path.join(format!(".{DISCOVERY_STATE_FILE}.tmp"));
+        let tmp = unique_temp_path(base_path);
         let bytes = serde_json::to_vec(self)
             .map_err(|error| Error::CorruptState(format!("serialize discovery state: {error}")))?;
-        {
-            let mut file = File::create(&tmp)
+        if bytes.len() as u64 > MAX_DISCOVERY_STATE_BYTES {
+            return Err(Error::CorruptState(format!(
+                "serialized discovery state exceeds {} bytes",
+                MAX_DISCOVERY_STATE_BYTES
+            )));
+        }
+
+        let publish_result = (|| -> Result<(), Error> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
                 .map_err(|error| Error::Io(format!("{}: {error}", tmp.display())))?;
             harden_file(&tmp)?;
             file.write_all(&bytes)
                 .map_err(|error| Error::Io(format!("{}: {error}", tmp.display())))?;
             file.sync_all()
                 .map_err(|error| Error::Io(format!("{}: {error}", tmp.display())))?;
+            drop(file);
+            fs::rename(&tmp, &path).map_err(|error| {
+                Error::Io(format!("{} -> {}: {error}", tmp.display(), path.display()))
+            })?;
+            File::open(base_path)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| Error::Io(format!("{}: {error}", base_path.display())))?;
+            validate_state_file(&path)
+        })();
+
+        if publish_result.is_err() {
+            let _ = fs::remove_file(&tmp);
         }
-        fs::rename(&tmp, &path)
-            .map_err(|error| Error::Io(format!("{} -> {}: {error}", tmp.display(), path.display())))?;
-        File::open(base_path)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| Error::Io(format!("{}: {error}", base_path.display())))?;
-        validate_state_file(&path)
+        publish_result
     }
 }
 
@@ -85,7 +127,7 @@ pub fn discovery_state_owner_uid(base_path: &Path) -> Result<Option<u32>, Error>
     let path = base_path.join(DISCOVERY_STATE_FILE);
     match fs::symlink_metadata(&path) {
         Ok(metadata) => {
-            validate_state_file(&path)?;
+            validate_state_metadata(&path, &metadata)?;
             #[cfg(unix)]
             {
                 Ok(Some(metadata.uid()))
@@ -104,6 +146,10 @@ pub fn discovery_state_owner_uid(base_path: &Path) -> Result<Option<u32>, Error>
 fn validate_state_file(path: &Path) -> Result<(), Error> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| Error::Io(format!("{}: {error}", path.display())))?;
+    validate_state_metadata(path, &metadata)
+}
+
+fn validate_state_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), Error> {
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err(Error::CorruptState(format!(
             "discovery state is not a direct regular file: {}",
@@ -118,6 +164,18 @@ fn validate_state_file(path: &Path) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+fn unique_temp_path(base_path: &Path) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    base_path.join(format!(
+        ".{DISCOVERY_STATE_FILE}.{}.{}.tmp",
+        std::process::id(),
+        nanos
+    ))
 }
 
 #[cfg(unix)]
