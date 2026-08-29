@@ -11,6 +11,7 @@ publish = false
 workspace = true
 
 [dependencies]
+application-contract = { path = "../application-contract" }
 dxbot-core = { path = "../dxbot-core" }
 runtime-security = { path = "../runtime-security" }
 application = { path = "../application" }
