@@ -2,12 +2,18 @@
 //!
 //! A bootstrap candidate prepares every required auxiliary artifact first and
 //! publishes `instance.id` last with an atomic no-replace hard link. Therefore
-//! any visible committed Instance already has its generation and endpoint.
+//! any visible committed Instance already has its generation and endpoint path.
+//! Runtime host restart attaches to that committed identity and advances the
+//! host generation atomically before replacing a stale endpoint under the host
+//! single-writer lock.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 
 use dxbot_core::types::*;
 
@@ -64,6 +70,9 @@ impl RuntimeBootstrap {
             .ok_or_else(|| Error::CorruptState("endpoint path has no parent".to_owned()))?;
         fs::create_dir_all(endpoints_dir).map_err(io_err)?;
 
+        // Bootstrap publishes a durable placeholder path before the commit
+        // marker. The Runtime Host later replaces it with the live Unix socket
+        // only while holding the host single-writer lock.
         let endpoint_file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -74,10 +83,7 @@ impl RuntimeBootstrap {
 
         ensure_first_generation(state_root, &instance_id)?;
 
-        let commit_candidate = state_root.join(format!(
-            ".{COMMIT_FILE}.{}.tmp",
-            instance_id.0
-        ));
+        let commit_candidate = state_root.join(format!(".{COMMIT_FILE}.{}.tmp", instance_id.0));
         let mut candidate_file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -113,6 +119,52 @@ impl RuntimeBootstrap {
         }
     }
 
+    /// Attach to an already committed Runtime state root without creating or
+    /// changing identity.
+    pub fn attach_existing(&mut self, state_root: &Path) -> Result<InstanceId, Error> {
+        self.state_root = Some(state_root.to_path_buf());
+        let committed = fs::read_to_string(state_root.join(COMMIT_FILE)).map_err(io_err)?;
+        let committed = committed.trim();
+        if committed.is_empty() {
+            return Err(Error::CorruptState("instance.id is empty".to_owned()));
+        }
+        let generation = read_generation(state_root)?;
+        if generation <= 0 {
+            return Err(Error::CorruptState(format!(
+                "host-generation must be positive, found {generation}"
+            )));
+        }
+        Ok(InstanceId(committed.to_owned()))
+    }
+
+    /// Advance HostGeneration using write-fsync-rename-fsync. The caller must
+    /// already hold the Runtime host single-writer lock.
+    pub fn advance_host_generation(&self) -> Result<i64, Error> {
+        let root = self.state_root.as_ref().ok_or(Error::NoStateRoot)?;
+        let current = read_generation(root)?;
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| Error::CorruptState("host-generation exhausted".to_owned()))?;
+        let tmp = root.join(format!(".{GENERATION_FILE}.tmp"));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(io_err)?;
+        file.write_all(next.to_string().as_bytes()).map_err(io_err)?;
+        file.sync_all().map_err(io_err)?;
+        drop(file);
+        fs::rename(&tmp, root.join(GENERATION_FILE)).map_err(io_err)?;
+        sync_dir(root)?;
+        Ok(next)
+    }
+
+    pub fn endpoint_path(&self, instance_id: &InstanceId) -> Result<PathBuf, Error> {
+        let root = self.state_root.as_ref().ok_or(Error::NoStateRoot)?;
+        Ok(endpoint_path(root, instance_id))
+    }
+
     pub fn verify_endpoint(&self, instance_id: &InstanceId) -> Result<BootstrapEndpoint, Error> {
         let root = self.state_root.as_ref().ok_or(Error::NoStateRoot)?;
 
@@ -127,7 +179,7 @@ impl RuntimeBootstrap {
 
         let host_generation = read_generation(root)?;
         let endpoint_path = endpoint_path(root, instance_id);
-        let verified = endpoint_path.is_file();
+        let verified = verify_endpoint_file_type(&endpoint_path)?;
 
         Ok(BootstrapEndpoint {
             instance_id: instance_id.clone(),
@@ -240,6 +292,25 @@ fn generate_instance_id() -> InstanceId {
         .unwrap_or(0);
     let pid = std::process::id();
     InstanceId(format!("instance-{pid}-{nanos}"))
+}
+
+fn verify_endpoint_file_type(path: &Path) -> Result<bool, Error> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_err(error)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        Ok(metadata.file_type().is_file() || metadata.file_type().is_socket())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(metadata.file_type().is_file())
+    }
 }
 
 fn sync_dir(path: &Path) -> Result<(), Error> {
