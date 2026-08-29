@@ -15,7 +15,8 @@ use application_contract::{CliInput, LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTR
 use dxbot_core::DxbotError;
 use dxbot_core::error::{ErrorCategory, ErrorCode};
 use dxbot_core::types::{
-    CommandId, CommandPayload, IdempotencyKey, OperationId, OperationRequest, RequestDigest,
+    CommandId, CommandPayload, IdempotencyKey, JournalRecord, OperationId, OperationRequest,
+    RequestDigest,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -72,6 +73,42 @@ pub fn build_operation_request(
     })
 }
 
+/// Reconstruct the exact operation request represented by a surviving journal
+/// record using a fresh invocation only as payload material. The fresh digest,
+/// Instance and Principal must all match before durable IDs are reused.
+pub fn build_replay_request(
+    input: &CliInput,
+    payload: CommandPayload,
+    record: &JournalRecord,
+) -> Result<OperationRequest, DxbotError> {
+    let request_digest = request_digest_for_input(input, &payload)?;
+    if request_digest != record.request_digest {
+        return Err(recovery_error(format!(
+            "fresh invocation does not match durable request digest for {}",
+            record.command_id.0
+        )));
+    }
+    if payload.instance_id != record.instance_id {
+        return Err(recovery_error(format!(
+            "fresh invocation Instance does not match durable command {}",
+            record.command_id.0
+        )));
+    }
+    if payload.principal_ref != record.idempotency_key.principal_ref {
+        return Err(recovery_error(format!(
+            "fresh invocation Principal does not match durable command {}",
+            record.command_id.0
+        )));
+    }
+    Ok(OperationRequest {
+        command_id: record.command_id.clone(),
+        idempotency_key: record.idempotency_key.clone(),
+        request_digest,
+        new_operation_id: record.operation_id.clone(),
+        payload,
+    })
+}
+
 pub fn request_digest_for_input(
     input: &CliInput,
     payload: &CommandPayload,
@@ -104,6 +141,22 @@ fn unix_seconds() -> Result<i64, DxbotError> {
     i64::try_from(seconds).map_err(|_| local_error("system time exceeds i64 range"))
 }
 
+fn recovery_error(message: impl Into<String>) -> DxbotError {
+    DxbotError {
+        code: ErrorCode::RecoveryRequired,
+        category: ErrorCategory::Recovery,
+        message: message.into(),
+        retryable: false,
+        operation_ref: None,
+        target_refs: Vec::new(),
+        field_violations: Vec::new(),
+        current_revision: None,
+        current_generation: None,
+        resume_cursor: None,
+        next_actions: Vec::new(),
+    }
+}
+
 fn local_error(message: impl Into<String>) -> DxbotError {
     DxbotError {
         code: ErrorCode::InternalInvariant,
@@ -124,7 +177,7 @@ fn local_error(message: impl Into<String>) -> DxbotError {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use dxbot_core::types::{CanonicalTarget, InstanceId, PrincipalRef};
+    use dxbot_core::types::{CanonicalTarget, InstanceId, JournalState, PrincipalRef};
     use serde_json::json;
 
     use super::*;
@@ -183,5 +236,28 @@ mod tests {
             first.payload.principal_ref
         );
         assert_eq!(first.request_digest, second.request_digest);
+    }
+
+    #[test]
+    fn replay_request_reuses_all_durable_identity() {
+        let input = input("alpha");
+        let payload = payload();
+        let original = build_operation_request(&input, payload.clone()).expect("request builds");
+        let record = JournalRecord {
+            state: JournalState::Dispatching,
+            instance_id: original.payload.instance_id.clone(),
+            command_id: original.command_id.clone(),
+            operation_id: original.new_operation_id.clone(),
+            idempotency_key: original.idempotency_key.clone(),
+            request_digest: original.request_digest.clone(),
+            sequence: 2,
+            previous_digest: "previous".to_owned(),
+            record_digest: "record".to_owned(),
+        };
+        let replay = build_replay_request(&input, payload, &record).expect("replay builds");
+        assert_eq!(replay.command_id, original.command_id);
+        assert_eq!(replay.new_operation_id, original.new_operation_id);
+        assert_eq!(replay.idempotency_key, original.idempotency_key);
+        assert_eq!(replay.request_digest, original.request_digest);
     }
 }
