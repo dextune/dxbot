@@ -1,9 +1,7 @@
 //! High-risk operation approvals and pending operation continuation.
 //!
-//! An approval is bound to a pending [`OperationId`]. Required approvers cast
-//! decisions; the aggregate transitions `Pending -> Approved | Denied`. Once an
-//! approval is `Approved`, the pending operation it guards may continue
-//! ([`ApprovalManager::continuation_ready`]).
+//! Approval state is canonical in runtime-security. Each decision advances the
+//! approval revision so CLI CAS can fence stale approve/deny attempts.
 
 use std::collections::HashMap;
 
@@ -11,51 +9,35 @@ use dxbot_core::types::{ApprovalId, OperationId, PrincipalRef};
 
 use crate::Error;
 
-/// An approver's decision on an approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalDecision {
-    /// Approve the guarded operation so it may continue.
     Approve,
-    /// Deny the guarded operation; it must not continue.
     Deny,
 }
 
-/// Aggregate state of an approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalState {
-    /// Awaiting required approver decisions.
     Pending,
-    /// All required approvers approved; the pending operation may continue.
     Approved,
-    /// At least one required approver denied; the operation must not continue.
     Denied,
 }
 
-/// A single recorded approver decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalDecisionRecord {
-    /// The principal that cast the decision.
     pub by: PrincipalRef,
-    /// The decision that was cast.
     pub decision: ApprovalDecision,
 }
 
-/// Full record of an approval and its decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRecord {
-    /// Canonical approval id.
     pub id: ApprovalId,
-    /// The pending operation this approval guards.
     pub operation_id: OperationId,
-    /// The required approvers who must approve for `Approved`.
     pub required_approvers: Vec<PrincipalRef>,
-    /// Decisions cast so far, in order.
     pub decisions: Vec<ApprovalDecisionRecord>,
-    /// Current aggregate state.
     pub state: ApprovalState,
+    pub revision: i64,
 }
 
-/// In-memory store of approvals.
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalManager {
     approvals: HashMap<String, ApprovalRecord>,
@@ -63,20 +45,20 @@ pub struct ApprovalManager {
 }
 
 impl ApprovalManager {
-    /// Create an empty approval store.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create a new pending approval for `operation_id` requiring
-    /// `required_approvers` to approve.
     pub fn create_approval(
         &mut self,
         operation_id: OperationId,
         required_approvers: Vec<PrincipalRef>,
     ) -> Result<ApprovalId, Error> {
-        let id = ApprovalId(format!("approval-{}", self.next_seq));
-        self.next_seq += 1;
+        let sequence = self.next_seq;
+        self.next_seq = self.next_seq.checked_add(1).ok_or_else(|| {
+            Error::ApprovalAlreadyDecided(ApprovalId("approval-id-space-exhausted".to_owned()))
+        })?;
+        let id = ApprovalId(format!("approval-{sequence}"));
         self.approvals.insert(
             id.0.clone(),
             ApprovalRecord {
@@ -85,57 +67,55 @@ impl ApprovalManager {
                 required_approvers,
                 decisions: Vec::new(),
                 state: ApprovalState::Pending,
+                revision: 1,
             },
         );
         Ok(id)
     }
 
-    /// Record a decision by `by` on `approval_id`.
-    ///
-    /// Returns the resulting aggregate [`ApprovalState`]. Denying once denies
-    /// the approval; approving every required approver approves it.
     pub fn decide_approval(
         &mut self,
         approval_id: &ApprovalId,
+        expected_revision: i64,
         decision: ApprovalDecision,
         by: &PrincipalRef,
-    ) -> Result<ApprovalState, Error> {
+    ) -> Result<ApprovalRecord, Error> {
         let record = self
             .approvals
             .get_mut(&approval_id.0)
             .ok_or_else(|| Error::UnknownApproval(approval_id.clone()))?;
-
-        if record.state != ApprovalState::Pending {
+        if record.revision != expected_revision || record.state != ApprovalState::Pending {
             return Err(Error::ApprovalAlreadyDecided(approval_id.clone()));
         }
         if !record.required_approvers.contains(by) {
             return Err(Error::InvalidApprover(by.clone()));
         }
+        if record.decisions.iter().any(|existing| existing.by == *by) {
+            return Err(Error::ApprovalAlreadyDecided(approval_id.clone()));
+        }
 
-        record
-            .decisions
-            .push(ApprovalDecisionRecord {
-                by: by.clone(),
-                decision,
-            });
-
+        record.decisions.push(ApprovalDecisionRecord {
+            by: by.clone(),
+            decision,
+        });
         match decision {
             ApprovalDecision::Deny => record.state = ApprovalState::Denied,
             ApprovalDecision::Approve => {
                 if record.required_approvers.iter().all(|required| {
-                    record.decisions.iter().any(|d| {
-                        d.by == *required && d.decision == ApprovalDecision::Approve
+                    record.decisions.iter().any(|record| {
+                        record.by == *required && record.decision == ApprovalDecision::Approve
                     })
                 }) {
                     record.state = ApprovalState::Approved;
                 }
             }
         }
-
-        Ok(record.state)
+        record.revision = record.revision.checked_add(1).ok_or_else(|| {
+            Error::ApprovalAlreadyDecided(approval_id.clone())
+        })?;
+        Ok(record.clone())
     }
 
-    /// Retrieve an approval record.
     pub fn get_approval(&self, id: &ApprovalId) -> Result<ApprovalRecord, Error> {
         self.approvals
             .get(&id.0)
@@ -143,12 +123,20 @@ impl ApprovalManager {
             .ok_or_else(|| Error::UnknownApproval(id.clone()))
     }
 
-    /// Gate for pending operation continuation.
-    ///
-    /// Returns `Ok(Some(operation_id))` once the approval is `Approved` (the
-    /// guarded pending operation may continue), and `Ok(None)` while it remains
-    /// `Pending` or is `Denied` (it must not continue). Unknown approvals are an
-    /// error.
+    pub fn find_by_operation(&self, operation_id: &OperationId) -> Result<ApprovalRecord, Error> {
+        self.approvals
+            .values()
+            .find(|record| record.operation_id == *operation_id)
+            .cloned()
+            .ok_or_else(|| Error::UnknownApproval(ApprovalId(operation_id.0.clone())))
+    }
+
+    pub fn list_approvals(&self) -> Vec<ApprovalRecord> {
+        let mut records = self.approvals.values().cloned().collect::<Vec<_>>();
+        records.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        records
+    }
+
     pub fn continuation_ready(
         &self,
         approval_id: &ApprovalId,
