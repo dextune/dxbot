@@ -3,7 +3,7 @@
 //! The binary delegates here so every invocation follows one reusable path:
 //! registry path resolution -> typed argv binding -> local content materialize ->
 //! verified Instance discovery -> authenticated local Principal handshake ->
-//! bounded preflight -> durable Prepared/Dispatching -> Runtime owner -> render.
+//! bounded preflight -> durable submission/recovery -> Runtime owner -> render.
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -16,14 +16,14 @@ use application_contract::{
     ExecutionContext, TargetMaterialization, cli_path_tokens, commands_in_group, metadata_for_key,
     parse_bound_input, project_for_execution, resolve_cli_path,
 };
-use control_client::{ClientError, LocalControlClient, SubmissionClient};
+use control_client::{ClientError, LocalControlClient};
 use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
 use dxbot_core::types::{OperationResult, OutputFormat};
 use serde_json::{Value, json};
 
 use crate::{
-    Confirmation, Discovery, LocalJournal, MachineRenderer, StreamEvent, build_operation_request,
-    materialize_content,
+    Confirmation, Discovery, MachineRenderer, StreamEvent, SubmissionFlowError,
+    materialize_content, submit_or_recover,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -162,7 +162,7 @@ fn start_runtime(
 
         if let Ok(selected) = discovery.select_endpoint(profile, explicit_instance) {
             if connect_selected(&selected, START_CONNECT_TIMEOUT)
-                .and_then(|client| client.handshake())
+                .and_then(|client| client.handshake().map_err(client_error))
                 .is_ok()
             {
                 return Ok(render_value(
@@ -386,14 +386,8 @@ fn submit_command(
             handshake.principal_ref.clone(),
         );
         let payload = project_for_execution(input, &context)?;
-        let request = build_operation_request(input, payload)?;
-        let journal = LocalJournal::open(handshake.instance_id.clone(), &paths.journal_root)
-            .map_err(|error| storage_error(format!("cannot open local journal: {error:?}")))?;
-        let client = SubmissionClient::builder(handshake.instance_id)
-            .with_journal(journal)
-            .with_fallible_transport(local_client.into_transport())
-            .build();
-        let result = client.submit(&request).map_err(client_error)?;
+        let result = submit_or_recover(input, payload, &paths.journal_root, local_client)
+            .map_err(submission_flow_error)?;
         Ok(render_operation(&result, command_key, format))
     }
 }
@@ -654,6 +648,31 @@ fn is_help(token: &str) -> bool {
     matches!(token, "-h" | "--help")
 }
 
+fn submission_flow_error(error: SubmissionFlowError) -> DxbotError {
+    match error {
+        SubmissionFlowError::Contract(error) => error,
+        SubmissionFlowError::Journal(error) => {
+            storage_error(format!("local journal recovery failed: {error:?}"))
+        }
+        SubmissionFlowError::Client(error) => client_error(error),
+        SubmissionFlowError::AmbiguousRecovery(commands) => error_with(
+            ErrorCode::RecoveryRequired,
+            ErrorCategory::Recovery,
+            format!("multiple non-terminal commands match this invocation: {commands:?}"),
+        ),
+        SubmissionFlowError::PreparedAlreadyBound(command_id) => error_with(
+            ErrorCode::InternalInvariant,
+            ErrorCategory::Internal,
+            format!("Prepared command unexpectedly has a server binding: {}", command_id.0),
+        ),
+        SubmissionFlowError::ObservedBindingMissing(command_id) => error_with(
+            ErrorCode::RecoveryRequired,
+            ErrorCategory::Recovery,
+            format!("Observed command has no canonical server binding: {}", command_id.0),
+        ),
+    }
+}
+
 fn client_error(error: ClientError) -> DxbotError {
     match error {
         ClientError::Remote(error) => error,
@@ -760,7 +779,7 @@ fn error_with(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
 
     use super::*;
 
