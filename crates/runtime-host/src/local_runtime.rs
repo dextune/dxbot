@@ -9,7 +9,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +21,8 @@ use runtime_bootstrap::bootstrap::Error as BootstrapError;
 use runtime_bootstrap::{DiscoveryEndpoint, DiscoveryState, RuntimeBootstrap};
 
 const HOST_LOCK_FILE: &str = ".runtime-host.lock";
+const OWNER_DIRECTORY_MODE: u32 = 0o700;
+const OWNER_FILE_MODE: u32 = 0o600;
 
 #[derive(Debug)]
 pub struct LocalRuntimeHost {
@@ -40,36 +42,39 @@ impl LocalRuntimeHost {
         profile: Option<String>,
     ) -> Result<Self, io::Error> {
         fs::create_dir_all(&runtime_root)?;
+        fs::set_permissions(
+            &runtime_root,
+            fs::Permissions::from_mode(OWNER_DIRECTORY_MODE),
+        )?;
         let host_lock_path = runtime_root.join(HOST_LOCK_FILE);
-        let host_lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&host_lock_path)?;
-        host_lock
-            .try_lock_exclusive()
-            .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, format!(
-                "another Runtime Host owns {}: {error}",
-                runtime_root.display()
-            )))?;
+        let host_lock = open_host_lock(&host_lock_path)?;
+        host_lock.try_lock_exclusive().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "another Runtime Host owns {}: {error}",
+                    runtime_root.display()
+                ),
+            )
+        })?;
 
         let mut bootstrap = RuntimeBootstrap::new();
-        let (instance_id, host_generation, first_bootstrap) =
-            match bootstrap.bootstrap_first_instance(&runtime_root) {
-                Ok(instance_id) => (instance_id, 1, true),
-                Err(BootstrapError::AlreadyBootstrapped) => {
-                    let instance_id = bootstrap
-                        .attach_existing(&runtime_root)
-                        .map_err(bootstrap_io)?;
-                    let generation = bootstrap.advance_host_generation().map_err(bootstrap_io)?;
-                    (instance_id, generation, false)
-                }
-                Err(error) => return Err(bootstrap_io(error)),
-            };
+        let (instance_id, host_generation) = match bootstrap.bootstrap_first_instance(&runtime_root)
+        {
+            Ok(instance_id) => (instance_id, 1),
+            Err(BootstrapError::AlreadyBootstrapped) => {
+                let instance_id = bootstrap
+                    .attach_existing(&runtime_root)
+                    .map_err(bootstrap_io)?;
+                let generation = bootstrap.advance_host_generation().map_err(bootstrap_io)?;
+                (instance_id, generation)
+            }
+            Err(error) => return Err(bootstrap_io(error)),
+        };
         let endpoint_path = bootstrap
             .endpoint_path(&instance_id)
             .map_err(bootstrap_io)?;
-        replace_bootstrap_or_stale_endpoint(&endpoint_path, first_bootstrap)?;
+        replace_bootstrap_or_stale_endpoint(&endpoint_path)?;
 
         let application = Arc::new(ApplicationMutator::new());
         let security = Arc::new(Mutex::new(SecurityState::new()));
@@ -149,6 +154,28 @@ impl Drop for LocalRuntimeHost {
     }
 }
 
+fn open_host_lock(path: &Path) -> Result<File, io::Error> {
+    let file = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("Runtime Host lock is not a direct regular file: {}", path.display()),
+                ));
+            }
+            OpenOptions::new().read(true).write(true).open(path)?
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?,
+        Err(error) => return Err(error),
+    };
+    fs::set_permissions(path, fs::Permissions::from_mode(OWNER_FILE_MODE))?;
+    Ok(file)
+}
+
 fn publish_discovery(root: &Path, endpoint: DiscoveryEndpoint) -> Result<(), io::Error> {
     let mut state = DiscoveryState::load_state(root).map_err(bootstrap_io)?;
     state
@@ -157,7 +184,7 @@ fn publish_discovery(root: &Path, endpoint: DiscoveryEndpoint) -> Result<(), io:
     state.save_state(root).map_err(bootstrap_io)
 }
 
-fn replace_bootstrap_or_stale_endpoint(path: &Path, _first_bootstrap: bool) -> Result<(), io::Error> {
+fn replace_bootstrap_or_stale_endpoint(path: &Path) -> Result<(), io::Error> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             let file_type = metadata.file_type();
@@ -199,9 +226,10 @@ fn bootstrap_io(error: BootstrapError) -> io::Error {
         BootstrapError::InstanceNotFound => {
             io::Error::new(io::ErrorKind::NotFound, "Runtime Instance not found")
         }
-        BootstrapError::NoStateRoot => {
-            io::Error::new(io::ErrorKind::InvalidInput, "Runtime state root is unavailable")
-        }
+        BootstrapError::NoStateRoot => io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Runtime state root is unavailable",
+        ),
         BootstrapError::CorruptState(message) | BootstrapError::Io(message) => {
             io::Error::other(message)
         }
