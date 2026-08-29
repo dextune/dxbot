@@ -13,7 +13,7 @@ use application::ApplicationMutator;
 use application::mutation::AppError;
 use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
 use dxbot_core::types::*;
-use provider_host::{HarnessError, ProviderHost, ProviderInfo};
+use provider_host::{HarnessError, ProviderHost, ProviderInfo, ProviderStatus};
 use runtime_security::{
     ApprovalDecision, ApprovalDecisionDelta, ApprovalRecord, ApprovalState,
     MembershipAuthorityBinding, MembershipBindingDelta, PrincipalStatus, SecurityAuditIntent,
@@ -27,12 +27,14 @@ const OPERATION_ROLE: &str = "mutator";
 const LOCAL_OPERATOR_ROLE: &str = "operator";
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 1000;
+const TASK_PROVIDER_CAPABILITY: &str = "llm-chat";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerError {
     PermissionDenied(String),
     NotFound(String),
     Conflict(String),
+    ProviderUnavailable(String),
     GapDetected(String),
     Timeout(String),
     RecoveryRequired(String),
@@ -59,6 +61,12 @@ impl ServerError {
                 ErrorCategory::Conflict,
                 message.clone(),
                 false,
+            ),
+            Self::ProviderUnavailable(message) => (
+                ErrorCode::ProviderUnavailable,
+                ErrorCategory::Availability,
+                message.clone(),
+                true,
             ),
             Self::GapDetected(message) => (
                 ErrorCode::PartialOrResync,
@@ -157,9 +165,9 @@ impl ControlServer {
             coordination_store: Some(coordination_store),
             coordination_lock: Mutex::new(()),
         };
-        let _guard = server.coordination_guard()?;
+        let guard = server.coordination_guard()?;
         server.recover_pending_locked()?;
-        drop(_guard);
+        drop(guard);
         Ok(server)
     }
 
@@ -246,6 +254,7 @@ impl ControlServer {
             return Ok(result);
         }
 
+        self.require_provider_admission(&request.payload)?;
         let delta = self.security_delta(authenticated_principal, request)?;
         if delta.is_empty() {
             return self.application.mutate(request).map_err(map_app_error);
@@ -318,6 +327,27 @@ impl ControlServer {
         self.application
             .lookup_binding(command_id, key)
             .map_err(map_app_error)
+    }
+
+    fn require_provider_admission(&self, payload: &CommandPayload) -> Result<(), ServerError> {
+        if !matches!(payload.command_key.as_str(), "bot-activate" | "task-submit") {
+            return Ok(());
+        }
+        let providers = self.providers.lock().map_err(|_| {
+            ServerError::InternalInvariant("provider host lock unavailable".to_owned())
+        })?;
+        let ready = providers
+            .list_providers(Some(TASK_PROVIDER_CAPABILITY))
+            .into_iter()
+            .any(|provider| provider.status == ProviderStatus::Ready);
+        if ready {
+            Ok(())
+        } else {
+            Err(ServerError::ProviderUnavailable(format!(
+                "{} requires a Ready provider with capability {TASK_PROVIDER_CAPABILITY}",
+                payload.command_key
+            )))
+        }
     }
 
     fn security_delta(
@@ -414,6 +444,9 @@ impl ControlServer {
                     .find(|record| record.scope == *scope && record.member_bot == *member_bot)
                     .cloned()
                     .ok_or_else(|| ServerError::NotFound("membership does not exist".to_owned()))?;
+                if !current.active {
+                    return Err(ServerError::NotFound("membership is not active".to_owned()));
+                }
                 let expected = payload
                     .cas
                     .as_ref()
@@ -617,11 +650,7 @@ impl ControlServer {
                         })
                     })
                     .filter(|record| {
-                        scope_filter.is_none_or(|scope| {
-                            record.binding.target == scope
-                                || record.binding.target.starts_with(&format!("{scope}/"))
-                                || record.binding.target.contains(scope)
-                        })
+                        scope_filter.is_none_or(|scope| approval_scope_matches(&record.binding.target, scope))
                     })
                     .collect();
                 page_approval_records(records, payload)
@@ -858,6 +887,13 @@ fn approval_state_name(state: ApprovalState) -> &'static str {
     }
 }
 
+fn approval_scope_matches(target: &str, scope: &str) -> bool {
+    target == scope
+        || target
+            .strip_prefix(scope)
+            .is_some_and(|suffix| suffix.starts_with('/') || suffix.starts_with(':'))
+}
+
 fn provider_value(record: &ProviderInfo) -> Value {
     json!({
         "provider_ref": format!("provider:{}", record.id.0),
@@ -968,7 +1004,7 @@ fn map_provider_error(error: HarnessError) -> ServerError {
             ServerError::NotFound(format!("provider {} not found", id.0))
         }
         HarnessError::ProviderUnavailable { id } => {
-            ServerError::Conflict(format!("provider {} is unavailable", id.0))
+            ServerError::ProviderUnavailable(format!("provider {} is unavailable", id.0))
         }
         other => ServerError::InternalInvariant(format!("provider owner error: {other:?}")),
     }
