@@ -15,6 +15,7 @@ use dxbot_core::types::{
     OperationResult, VersionInfo,
 };
 
+use crate::backend::SubmissionJournal;
 use crate::crash::CrashPoint;
 use crate::journal::JournalStore;
 
@@ -89,7 +90,7 @@ impl std::error::Error for ClientError {}
 pub struct SubmissionClient {
     pub instance_id: InstanceId,
     hard_crash: bool,
-    journal: RefCell<JournalStore>,
+    journal: RefCell<Box<dyn SubmissionJournal>>,
     transport: Option<RefCell<Transport>>,
     version: VersionInfo,
 }
@@ -110,7 +111,7 @@ impl fmt::Debug for SubmissionClient {
 pub struct SubmissionClientBuilder {
     instance_id: InstanceId,
     hard_crash: bool,
-    journal: JournalStore,
+    journal: Box<dyn SubmissionJournal>,
     transport: Option<Transport>,
     version: VersionInfo,
 }
@@ -138,8 +139,11 @@ impl SubmissionClientBuilder {
         self
     }
 
-    pub fn with_journal(mut self, journal: JournalStore) -> Self {
-        self.journal = journal;
+    pub fn with_journal<J>(mut self, journal: J) -> Self
+    where
+        J: SubmissionJournal + 'static,
+    {
+        self.journal = Box::new(journal);
         self
     }
 
@@ -168,7 +172,7 @@ impl SubmissionClient {
         SubmissionClientBuilder {
             instance_id,
             hard_crash: false,
-            journal: JournalStore::new(),
+            journal: Box::new(JournalStore::new()),
             transport: None,
             version: default_version(),
         }
