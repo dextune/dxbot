@@ -123,7 +123,7 @@ impl AuthorityManager {
     ) -> Result<(), Error> {
         match self.membership_bindings.get(&binding.binding_id) {
             Some(existing) if existing == &binding => return Ok(()),
-            Some(existing) if binding.generation < existing.generation => {
+            Some(existing) if binding.generation <= existing.generation => {
                 return Err(Error::StaleAuthorityBinding(binding.binding_id));
             }
             _ => {}
@@ -208,5 +208,27 @@ mod tests {
         };
         manager.apply_membership_binding(binding.clone()).unwrap();
         assert_eq!(manager.membership_binding("membership-1"), Some(binding));
+    }
+
+    #[test]
+    fn same_generation_cannot_change_membership_binding_state() {
+        let mut manager = AuthorityManager::new();
+        let binding = MembershipAuthorityBinding {
+            binding_id: "membership-1".to_owned(),
+            scope: ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
+                "project-a".to_owned(),
+            ))),
+            member_bot: BotSelector::CanonicalId(BotId("bot-a".to_owned())),
+            role: "member".to_owned(),
+            generation: 4,
+            active: true,
+        };
+        manager.apply_membership_binding(binding.clone()).unwrap();
+        let mut stale = binding;
+        stale.active = false;
+        assert!(matches!(
+            manager.apply_membership_binding(stale),
+            Err(Error::StaleAuthorityBinding(_))
+        ));
     }
 }
