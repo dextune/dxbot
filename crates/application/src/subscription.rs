@@ -1,8 +1,9 @@
 //! AT-APP-007: application subscription over bounded in-memory event streams.
 //!
 //! Subscriptions use per-target monotonic cursors. Falling behind retained
-//! history fails explicitly with a resync hint; only an explicit no-cursor
-//! subscription is positioned at the start of the *currently retained* window.
+//! history fails explicitly with a resync hint. Production local-control watch
+//! uses stateless target+cursor reads so reconnect does not accumulate server
+//! subscription handles; the handle API remains for component users.
 
 #![forbid(unsafe_code)]
 
@@ -11,16 +12,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dxbot_core::types::{ProcessId, TaskId};
+use serde::{Deserialize, Serialize};
 
 use crate::mutation::AppError;
 use crate::state::DomainState;
 
-/// Maximum number of events retained per target stream.
 pub const MAX_EVENTS_PER_STREAM: usize = 1000;
 const SUBSCRIPTION_LEASE_SECONDS: i64 = 3600;
 
-/// A structured event delivered on a subscription.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum StreamEvent {
     Progress { message: String, percent: Option<u8> },
     StatusChange { from: String, to: String },
@@ -29,27 +30,22 @@ pub enum StreamEvent {
     Error { message: String },
 }
 
-/// The terminal result of a task observed through a subscription.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskResult {
     pub task_id: TaskId,
     pub status: String,
     pub output: Option<String>,
 }
 
-/// The public handle returned to a subscriber.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Subscription {
     pub id: String,
     pub target_id: String,
-    /// The cursor supplied by the caller. `None` means explicit resync from the
-    /// start of the retained window at subscription creation time.
     pub cursor: Option<String>,
     pub created_at: i64,
     pub expires_at: Option<i64>,
 }
 
-/// Per-target retained event window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamState {
     pub target_id: String,
@@ -77,18 +73,14 @@ struct StreamEntry {
     event: StreamEvent,
 }
 
-/// A subscription's durable-in-fixture position within a target stream.
 #[derive(Debug, Clone, PartialEq)]
 struct SubscriptionRecord {
     target_id: String,
     created_at: i64,
     expires_at: Option<i64>,
-    /// Last delivered cursor. For explicit resync this starts immediately
-    /// before the oldest retained event rather than at an artificial zero.
     delivered_cursor: u64,
 }
 
-/// AT-APP-007 registry of target streams and subscription positions.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SubscriptionRegistry {
     streams: HashMap<String, StreamState>,
@@ -96,7 +88,6 @@ pub struct SubscriptionRegistry {
     next_subscription_seq: u64,
 }
 
-/// Application subscription manager over a shared in-memory domain state.
 #[derive(Debug)]
 pub struct SubscriptionManager {
     state: Arc<Mutex<DomainState>>,
@@ -123,31 +114,13 @@ impl SubscriptionManager {
         self.subscribe(&process_id.0, cursor.as_deref())
     }
 
-    /// Explicitly resync from the oldest event that is still retained now.
     pub fn explicit_resync(&self, target_id: &str) -> Result<Subscription, AppError> {
         self.subscribe(target_id, None)
     }
 
     pub fn emit(&self, target_id: &str, event: StreamEvent) -> Result<String, AppError> {
         let mut guard = self.lock()?;
-        let stream = guard
-            .subscriptions
-            .streams
-            .entry(target_id.to_owned())
-            .or_insert_with(|| StreamState::new(target_id));
-
-        let cursor = stream.next_cursor;
-        let next_cursor = cursor.checked_add(1).ok_or_else(|| {
-            AppError::Internal(format!("cursor space exhausted for target {target_id}"))
-        })?;
-        stream.entries.push_back(StreamEntry { cursor, event });
-        stream.next_cursor = next_cursor;
-
-        while stream.entries.len() > MAX_EVENTS_PER_STREAM {
-            stream.entries.pop_front();
-        }
-
-        Ok(cursor.to_string())
+        emit_in_state(&mut guard, target_id, event)
     }
 
     pub fn emit_task(&self, task_id: &TaskId, event: StreamEvent) -> Result<String, AppError> {
@@ -162,8 +135,32 @@ impl SubscriptionManager {
         self.emit(&process_id.0, event)
     }
 
-    /// Reconnect an existing subscription from the caller's last observed
-    /// cursor. A future cursor or a pruned gap fails closed.
+    /// Stateless production watch primitive. `cursor` is the last event already
+    /// observed by the caller; the returned cursor is the event delivered now.
+    /// No server-side subscription handle is retained between calls.
+    pub fn next_event_from(
+        &self,
+        target_id: &str,
+        cursor: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(StreamEvent, String), AppError> {
+        let delivered = parse_cursor(cursor)?;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            AppError::Internal("subscription timeout exceeds monotonic clock range".to_owned())
+        })?;
+        loop {
+            if let Some(next) = self.try_next_event_from(target_id, delivered)? {
+                return Ok(next);
+            }
+            if Instant::now() >= deadline {
+                return Err(AppError::Timeout(format!(
+                    "no event on target {target_id} within {timeout:?}"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     pub fn reconnect(
         &self,
         subscription_id: &str,
@@ -234,6 +231,25 @@ impl SubscriptionManager {
             return None;
         }
         (record.delivered_cursor > 0).then(|| record.delivered_cursor.to_string())
+    }
+
+    fn try_next_event_from(
+        &self,
+        target_id: &str,
+        delivered: u64,
+    ) -> Result<Option<(StreamEvent, String)>, AppError> {
+        let guard = self.lock()?;
+        let stream = guard
+            .subscriptions
+            .streams
+            .get(target_id)
+            .ok_or_else(|| AppError::NotFound(format!("no stream for target {target_id}")))?;
+        validate_resume_cursor(target_id, delivered, stream)?;
+        Ok(stream
+            .entries
+            .iter()
+            .find(|entry| entry.cursor > delivered)
+            .map(|entry| (entry.event.clone(), entry.cursor.to_string())))
     }
 
     fn try_next_event(
@@ -340,8 +356,27 @@ impl SubscriptionManager {
     }
 }
 
-/// Validate that the next cursor required by a subscriber is still retained
-/// and that the caller did not claim a cursor from the future.
+pub(crate) fn emit_in_state(
+    state: &mut DomainState,
+    target_id: &str,
+    event: StreamEvent,
+) -> Result<String, AppError> {
+    let stream = state
+        .subscriptions
+        .streams
+        .entry(target_id.to_owned())
+        .or_insert_with(|| StreamState::new(target_id));
+    let cursor = stream.next_cursor;
+    stream.next_cursor = cursor.checked_add(1).ok_or_else(|| {
+        AppError::Internal(format!("cursor space exhausted for target {target_id}"))
+    })?;
+    stream.entries.push_back(StreamEntry { cursor, event });
+    while stream.entries.len() > MAX_EVENTS_PER_STREAM {
+        stream.entries.pop_front();
+    }
+    Ok(cursor.to_string())
+}
+
 fn validate_resume_cursor(
     target_id: &str,
     requested: u64,
@@ -385,9 +420,9 @@ fn resync_hint(target_id: &str, oldest: u64, next: u64) -> String {
 fn parse_cursor(cursor: Option<&str>) -> Result<u64, AppError> {
     match cursor {
         None => Ok(0),
-        Some(cursor) => cursor.parse::<u64>().map_err(|_| {
-            AppError::Conflict(format!("invalid subscription cursor: {cursor}"))
-        }),
+        Some(cursor) => cursor
+            .parse::<u64>()
+            .map_err(|_| AppError::Conflict(format!("invalid subscription cursor: {cursor}"))),
     }
 }
 
