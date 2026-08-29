@@ -1,9 +1,5 @@
 //! Domain query: bounded pagination, cursor continuation, `--all` bounding and
-//! resync over the in-memory [`DomainState`].
-//!
-//! Every listing uses a stable canonical-id keyset order. Each page is a
-//! bounded observation of current state; continuation resumes strictly after
-//! the prior key and never relies on an offset that would shift under mutation.
+//! resync over the canonical [`DomainState`].
 
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
@@ -15,19 +11,17 @@ use dxbot_core::types::{
 
 use crate::mutation::AppError;
 use crate::state::{
-    BotState, ConversationState, DomainState, LifecycleState, TaskState, TaskStatus, ThreadState,
+    BotState, ConversationOwner, ConversationState, DomainState, LifecycleState, TaskState,
+    TaskStatus, ThreadState,
 };
 
-/// A single bounded, cursor-ordered page of results.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<T> {
     pub items: Vec<T>,
-    /// The cursor at which the *next* page resumes, when [`Self::has_more`].
     pub next_cursor: Option<String>,
     pub has_more: bool,
 }
 
-/// Snapshot summary of a bot identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BotSummary {
     pub id: BotId,
@@ -36,7 +30,6 @@ pub struct BotSummary {
     pub revision: i64,
 }
 
-/// Snapshot summary of a conversation identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationSummary {
     pub id: ConversationId,
@@ -44,7 +37,6 @@ pub struct ConversationSummary {
     pub revision: i64,
 }
 
-/// Snapshot summary of a thread identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadSummary {
     pub id: ThreadId,
@@ -53,7 +45,6 @@ pub struct ThreadSummary {
     pub title: String,
 }
 
-/// Snapshot summary of a task identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSummary {
     pub id: TaskId,
@@ -62,41 +53,33 @@ pub struct TaskSummary {
     pub revision: i64,
 }
 
-/// Result of a bounded `--all` traversal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AllLoopResult<T> {
-    /// The source was exhausted without exceeding the local ceiling.
     Complete { items: Vec<T> },
-    /// The local ceiling was reached before the source was exhausted; the
-    /// caller should resume from `next_cursor`.
     Partial {
         items: Vec<T>,
         next_cursor: Option<String>,
     },
 }
 
-/// Presents canonical domain state as cursor-based paged query access.
 #[derive(Debug)]
 pub struct ApplicationQuery {
     state: Arc<Mutex<DomainState>>,
 }
 
 impl ApplicationQuery {
-    /// Create a query over a shared in-memory domain state store.
     pub fn new(state: Arc<Mutex<DomainState>>) -> Self {
         Self { state }
     }
 
-    /// List bots as a bounded, cursor-ordered page.
     pub fn list_bots(
         &self,
         page_size: usize,
         cursor: Option<String>,
     ) -> Result<Page<BotSummary>, AppError> {
         let guard = self.lock()?;
-        let bots: Vec<BotState> = guard.bots.values().cloned().collect();
         Ok(paginate(
-            bots,
+            guard.bots.values().cloned().collect(),
             |bot| bot.id.0.clone(),
             to_bot_summary,
             page_size,
@@ -104,7 +87,6 @@ impl ApplicationQuery {
         ))
     }
 
-    /// List conversations scoped to one bot as a bounded, cursor-ordered page.
     pub fn list_conversations(
         &self,
         bot_id: &BotId,
@@ -112,10 +94,15 @@ impl ApplicationQuery {
         cursor: Option<String>,
     ) -> Result<Page<ConversationSummary>, AppError> {
         let guard = self.lock()?;
-        let conversations: Vec<ConversationState> = guard
+        let conversations = guard
             .conversations
             .values()
-            .filter(|conversation| conversation.bot_id == *bot_id)
+            .filter(|conversation| {
+                matches!(
+                    &conversation.owner,
+                    ConversationOwner::Bot { bot_id: owner } if owner == bot_id
+                )
+            })
             .cloned()
             .collect();
         Ok(paginate(
@@ -127,7 +114,6 @@ impl ApplicationQuery {
         ))
     }
 
-    /// List threads scoped to one conversation as a bounded, cursor-ordered page.
     pub fn list_threads(
         &self,
         conversation_id: &ConversationId,
@@ -135,7 +121,7 @@ impl ApplicationQuery {
         cursor: Option<String>,
     ) -> Result<Page<ThreadSummary>, AppError> {
         let guard = self.lock()?;
-        let threads: Vec<ThreadState> = guard
+        let threads = guard
             .threads
             .values()
             .filter(|thread| thread.conversation_id == *conversation_id)
@@ -150,17 +136,15 @@ impl ApplicationQuery {
         ))
     }
 
-    /// List tasks scoped to a bot/project/channel as a bounded, cursor-ordered page.
     pub fn list_tasks(
         &self,
         scope: &ScopeSelector,
         page_size: usize,
         cursor: Option<String>,
     ) -> Result<Page<TaskSummary>, AppError> {
-        let owner = scope_owner(scope)
-            .ok_or_else(|| AppError::Internal("scope has no owner key".to_owned()))?;
+        let owner = scope_owner(scope);
         let guard = self.lock()?;
-        let tasks: Vec<TaskState> = guard
+        let tasks = guard
             .tasks
             .values()
             .filter(|task| task.owner == owner)
@@ -182,10 +166,6 @@ impl ApplicationQuery {
     }
 }
 
-/// Bounded `--all` traversal over a paged fetch.
-///
-/// Every request is clamped to the remaining local capacity, so a remote page
-/// can never cause the accumulator to overshoot `local_ceiling`.
 pub fn all_loop<T: Debug + Clone + PartialEq>(
     mut fetch: impl FnMut(usize, Option<String>) -> Result<Page<T>, AppError>,
     page_size: usize,
@@ -194,7 +174,6 @@ pub fn all_loop<T: Debug + Clone + PartialEq>(
     drain_all(&mut fetch, page_size, local_ceiling, None)
 }
 
-/// Restarts a bounded `--all` traversal from a previously captured cursor.
 pub fn resync<T: Debug + Clone + PartialEq>(
     mut fetch: impl FnMut(usize, Option<String>) -> Result<Page<T>, AppError>,
     from_cursor: Option<String>,
@@ -227,7 +206,6 @@ fn drain_all<T: Debug + Clone + PartialEq>(
                 next_cursor: cursor,
             });
         }
-
         let request_size = page_size.min(remaining);
         let request_cursor = cursor.clone();
         let page = fetch(request_size, request_cursor.clone())?;
@@ -242,15 +220,12 @@ fn drain_all<T: Debug + Clone + PartialEq>(
                 "paged fetch reported has_more without making item progress".to_owned(),
             ));
         }
-
         let has_more = page.has_more;
         let next_cursor = page.next_cursor;
         items.extend(page.items);
-
         if !has_more {
             return Ok(AllLoopResult::Complete { items });
         }
-
         let next_cursor = next_cursor.ok_or_else(|| {
             AppError::Internal("paged fetch reported has_more without next_cursor".to_owned())
         })?;
@@ -260,7 +235,6 @@ fn drain_all<T: Debug + Clone + PartialEq>(
             ));
         }
         cursor = Some(next_cursor);
-
         if items.len() == local_ceiling {
             return Ok(AllLoopResult::Partial {
                 items,
@@ -270,16 +244,17 @@ fn drain_all<T: Debug + Clone + PartialEq>(
     }
 }
 
-/// Maps an owner key out of a scope selector for task scoping.
-fn scope_owner(scope: &ScopeSelector) -> Option<String> {
+pub(crate) fn scope_owner(scope: &ScopeSelector) -> String {
     match scope {
-        ScopeSelector::Bot(BotSelector::CanonicalId(id)) => Some(id.0.clone()),
-        ScopeSelector::Bot(BotSelector::ScopedExact(name)) => Some(name.clone()),
-        ScopeSelector::Project(ProjectSelector::CanonicalId(id)) => Some(id.0.clone()),
-        ScopeSelector::Project(ProjectSelector::VisibleExact(name)) => Some(name.clone()),
-        ScopeSelector::Channel(ChannelSelector::CanonicalId(id)) => Some(id.0.clone()),
+        ScopeSelector::Bot(BotSelector::CanonicalId(id)) => format!("bot:{}", id.0),
+        ScopeSelector::Bot(BotSelector::ScopedExact(name)) => format!("bot:exact:{name}"),
+        ScopeSelector::Project(ProjectSelector::CanonicalId(id)) => format!("project:{}", id.0),
+        ScopeSelector::Project(ProjectSelector::VisibleExact(name)) => {
+            format!("project:exact:{name}")
+        }
+        ScopeSelector::Channel(ChannelSelector::CanonicalId(id)) => format!("channel:{}", id.0),
         ScopeSelector::Channel(ChannelSelector::ProjectExact { project, name }) => {
-            Some(format!("{project}:{name}"))
+            format!("channel:{project}:{name}")
         }
     }
 }
@@ -294,20 +269,22 @@ fn to_bot_summary(bot: BotState) -> BotSummary {
 }
 
 fn to_conversation_summary(conversation: ConversationState) -> ConversationSummary {
+    let ConversationOwner::Bot { bot_id } = conversation.owner else {
+        unreachable!("list_conversations filters channel-owned conversations")
+    };
     ConversationSummary {
         id: conversation.id,
-        bot_id: conversation.bot_id,
+        bot_id,
         revision: conversation.revision,
     }
 }
 
 fn to_thread_summary(thread: ThreadState) -> ThreadSummary {
-    let title = thread.id.0.clone();
     ThreadSummary {
         id: thread.id,
         conversation_id: thread.conversation_id,
         revision: thread.revision,
-        title,
+        title: thread.title,
     }
 }
 
@@ -320,8 +297,6 @@ fn to_task_summary(task: TaskState) -> TaskSummary {
     }
 }
 
-/// Orders `source` by a stable sort key, applies cursor continuation, and cuts
-/// a single page of at most `page_size` items.
 pub(crate) fn paginate<S, T>(
     mut source: Vec<S>,
     key_of: impl Fn(&S) -> String,
@@ -340,7 +315,7 @@ pub(crate) fn paginate<S, T>(
     } else {
         None
     };
-    let items: Vec<T> = source.into_iter().take(page_size).map(map).collect();
+    let items = source.into_iter().take(page_size).map(map).collect();
     Page {
         items,
         next_cursor,
