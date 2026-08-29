@@ -133,6 +133,10 @@ impl AuthorityManager {
         Ok(())
     }
 
+    /// Revokes an active membership using the caller's pre-removal generation.
+    /// The canonical binding generation advances exactly once; replaying the
+    /// same revocation is accepted only when the resulting tombstone already
+    /// exists at `expected_generation + 1`.
     pub fn revoke_membership_binding(
         &mut self,
         binding_id: &str,
@@ -141,9 +145,16 @@ impl AuthorityManager {
         let Some(existing) = self.membership_bindings.get_mut(binding_id) else {
             return Err(Error::UnknownAuthorityBinding(binding_id.to_owned()));
         };
-        if existing.generation != expected_generation {
+        let tombstone_generation = expected_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::StaleAuthorityBinding(binding_id.to_owned()))?;
+        if !existing.active && existing.generation == tombstone_generation {
+            return Ok(());
+        }
+        if !existing.active || existing.generation != expected_generation {
             return Err(Error::StaleAuthorityBinding(binding_id.to_owned()));
         }
+        existing.generation = tombstone_generation;
         existing.active = false;
         Ok(())
     }
@@ -176,6 +187,19 @@ mod tests {
 
     use super::*;
 
+    fn membership_binding(generation: i64, active: bool) -> MembershipAuthorityBinding {
+        MembershipAuthorityBinding {
+            binding_id: "membership-1".to_owned(),
+            scope: ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
+                "project-a".to_owned(),
+            ))),
+            member_bot: BotSelector::CanonicalId(BotId("bot-a".to_owned())),
+            role: "member".to_owned(),
+            generation,
+            active,
+        }
+    }
+
     #[test]
     fn registration_does_not_imply_global_authority() {
         let manager = AuthorityManager::new();
@@ -196,16 +220,7 @@ mod tests {
     #[test]
     fn membership_binding_keeps_bot_subject_separate_from_principal() {
         let mut manager = AuthorityManager::new();
-        let binding = MembershipAuthorityBinding {
-            binding_id: "membership-1".to_owned(),
-            scope: ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
-                "project-a".to_owned(),
-            ))),
-            member_bot: BotSelector::CanonicalId(BotId("bot-a".to_owned())),
-            role: "member".to_owned(),
-            generation: 1,
-            active: true,
-        };
+        let binding = membership_binding(1, true);
         manager.apply_membership_binding(binding.clone()).unwrap();
         assert_eq!(manager.membership_binding("membership-1"), Some(binding));
     }
@@ -213,16 +228,7 @@ mod tests {
     #[test]
     fn same_generation_cannot_change_membership_binding_state() {
         let mut manager = AuthorityManager::new();
-        let binding = MembershipAuthorityBinding {
-            binding_id: "membership-1".to_owned(),
-            scope: ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
-                "project-a".to_owned(),
-            ))),
-            member_bot: BotSelector::CanonicalId(BotId("bot-a".to_owned())),
-            role: "member".to_owned(),
-            generation: 4,
-            active: true,
-        };
+        let binding = membership_binding(4, true);
         manager.apply_membership_binding(binding.clone()).unwrap();
         let mut stale = binding;
         stale.active = false;
@@ -230,5 +236,19 @@ mod tests {
             manager.apply_membership_binding(stale),
             Err(Error::StaleAuthorityBinding(_))
         ));
+    }
+
+    #[test]
+    fn revocation_advances_generation_once_and_replay_is_idempotent() {
+        let mut manager = AuthorityManager::new();
+        manager
+            .apply_membership_binding(membership_binding(4, true))
+            .unwrap();
+        manager.revoke_membership_binding("membership-1", 4).unwrap();
+        let tombstone = manager.membership_binding("membership-1").unwrap();
+        assert!(!tombstone.active);
+        assert_eq!(tombstone.generation, 5);
+        manager.revoke_membership_binding("membership-1", 4).unwrap();
+        assert_eq!(manager.membership_binding("membership-1").unwrap(), tombstone);
     }
 }
