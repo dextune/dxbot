@@ -1,10 +1,8 @@
 //! Owner-verified, bounded Unix-domain local control client.
 //!
-//! The endpoint path is validated immediately before each connection: it must
-//! be a socket (not a symlink/regular file), have the discovery-state owner UID,
-//! and grant no group/world permissions. The Runtime then authenticates the
-//! local principal server-side and returns that principal in the versioned
-//! handshake.
+//! Endpoint metadata is validated before every connection. Runtime identity,
+//! HostGeneration and the server-derived local Principal are then bound by the
+//! versioned handshake before preflight, query, submit or recovery lookup.
 
 #![cfg(unix)]
 
@@ -20,8 +18,10 @@ use application_contract::{
     write_local_control_frame,
 };
 use dxbot_core::types::{
-    CommandId, IdempotencyKey, InstanceId, OperationRequest, OperationResult, PrincipalRef,
+    CanonicalTarget, CasConditions, CommandId, CommandPayload, IdempotencyKey, InstanceId,
+    OperationRequest, OperationResult, PrincipalRef,
 };
+use serde_json::Value;
 
 use crate::{ClientError, Transport};
 
@@ -72,6 +72,52 @@ impl LocalControlClient {
         Ok(handshake)
     }
 
+    pub fn preflight(
+        &self,
+        payload: &CommandPayload,
+        raw_selector: Option<Value>,
+    ) -> Result<(CanonicalTarget, CasConditions), ClientError> {
+        let (mut stream, handshake) = self.connect_and_handshake()?;
+        validate_payload_identity(payload, &handshake)?;
+        write_local_control_frame(
+            &mut stream,
+            &LocalControlRequest::Preflight {
+                payload: payload.clone(),
+                raw_selector,
+            },
+        )
+        .map_err(codec_error)?;
+        match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
+            LocalControlResponse::Preflight {
+                canonical_target,
+                cas,
+            } => Ok((canonical_target, cas)),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
+            _ => Err(ClientError::Transport(
+                "unexpected response after preflight".to_owned(),
+            )),
+        }
+    }
+
+    pub fn query(&self, payload: &CommandPayload) -> Result<Value, ClientError> {
+        let (mut stream, handshake) = self.connect_and_handshake()?;
+        validate_payload_identity(payload, &handshake)?;
+        write_local_control_frame(
+            &mut stream,
+            &LocalControlRequest::Query {
+                payload: payload.clone(),
+            },
+        )
+        .map_err(codec_error)?;
+        match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
+            LocalControlResponse::Data { value } => Ok(value),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
+            _ => Err(ClientError::Transport(
+                "unexpected response after query".to_owned(),
+            )),
+        }
+    }
+
     pub fn into_transport(self) -> Transport {
         Box::new(move |request| self.submit(request))
     }
@@ -91,7 +137,6 @@ impl LocalControlClient {
                 "request principal does not match authenticated local principal".to_owned(),
             ));
         }
-
         write_local_control_frame(
             &mut stream,
             &LocalControlRequest::Submit {
@@ -99,19 +144,15 @@ impl LocalControlClient {
             },
         )
         .map_err(codec_error)?;
-
         match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
             LocalControlResponse::Operation { result } => Ok(result),
             LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
-            LocalControlResponse::Handshake { .. } | LocalControlResponse::Binding { .. } => {
-                Err(ClientError::Transport(
-                    "unexpected response after operation submit".to_owned(),
-                ))
-            }
+            _ => Err(ClientError::Transport(
+                "unexpected response after operation submit".to_owned(),
+            )),
         }
     }
 
-    /// Read-only canonical binding lookup for response-loss/restart recovery.
     pub fn lookup_binding(
         &self,
         command_id: &CommandId,
@@ -134,11 +175,9 @@ impl LocalControlClient {
         match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
             LocalControlResponse::Binding { result } => Ok(result),
             LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
-            LocalControlResponse::Handshake { .. } | LocalControlResponse::Operation { .. } => {
-                Err(ClientError::Transport(
-                    "unexpected response after binding lookup".to_owned(),
-                ))
-            }
+            _ => Err(ClientError::Transport(
+                "unexpected response after binding lookup".to_owned(),
+            )),
         }
     }
 
@@ -152,7 +191,6 @@ impl LocalControlClient {
         stream
             .set_write_timeout(Some(self.io_timeout))
             .map_err(|error| transport_io("set write timeout", error))?;
-
         write_local_control_frame(
             &mut stream,
             &LocalControlRequest::Hello {
@@ -160,13 +198,12 @@ impl LocalControlClient {
             },
         )
         .map_err(codec_error)?;
-
         let response =
             read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)?;
         let handshake = match response {
             LocalControlResponse::Handshake { handshake } => handshake,
             LocalControlResponse::Error { error } => return Err(ClientError::Remote(error)),
-            LocalControlResponse::Operation { .. } | LocalControlResponse::Binding { .. } => {
+            _ => {
                 return Err(ClientError::Transport(
                     "non-handshake response received before handshake".to_owned(),
                 ));
@@ -197,7 +234,11 @@ impl LocalControlClient {
                 handshake.protocol_version, handshake.schema_version
             )));
         }
-        validate_principal(&self.instance_id, &handshake.principal_ref, self.expected_owner_uid)
+        validate_principal(
+            &self.instance_id,
+            &handshake.principal_ref,
+            self.expected_owner_uid,
+        )
     }
 
     fn validate_endpoint(&self) -> Result<(), ClientError> {
@@ -226,6 +267,24 @@ impl LocalControlClient {
         }
         Ok(())
     }
+}
+
+fn validate_payload_identity(
+    payload: &CommandPayload,
+    handshake: &LocalControlHandshake,
+) -> Result<(), ClientError> {
+    if payload.instance_id != handshake.instance_id {
+        return Err(ClientError::InstanceMismatch {
+            client: handshake.instance_id.clone(),
+            request: payload.instance_id.clone(),
+        });
+    }
+    if payload.principal_ref != handshake.principal_ref {
+        return Err(ClientError::Transport(
+            "payload principal does not match authenticated local principal".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_principal(
