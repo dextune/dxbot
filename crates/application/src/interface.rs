@@ -7,7 +7,7 @@
 use dxbot_core::types::*;
 use serde_json::{Value, json};
 
-use crate::membership::MembershipRecord;
+use crate::membership::{MembershipRecord, membership_key};
 use crate::mutation::{AppError, ApplicationMutator};
 use crate::query::scope_owner;
 use crate::state::{ConversationOwner, DomainState, MemoryAssertionStatus, ProcessState};
@@ -28,7 +28,7 @@ impl ApplicationMutator {
             .unwrap_or_default();
         let target = resolve_target(&state, payload, raw)?;
         let mut cas = payload.cas.unwrap_or_else(empty_cas);
-        materialize_cas(&state, &payload.command_key, &target, &mut cas)?;
+        materialize_cas(&state, payload, &target, &mut cas)?;
         Ok((target, cas))
     }
 
@@ -75,7 +75,11 @@ fn resolve_target(
                 revision: *revision,
             })
         }
-        CanonicalTarget::Thread { id, parent_id, revision } => {
+        CanonicalTarget::Thread {
+            id,
+            parent_id,
+            revision,
+        } => {
             let candidates = state
                 .threads
                 .values()
@@ -84,11 +88,17 @@ fn resolve_target(
             let thread = exactly_one(candidates, "thread", raw)?;
             Ok(CanonicalTarget::Thread {
                 id: thread.id.clone(),
-                parent_id: parent_id.clone().or_else(|| Some(thread.conversation_id.clone())),
+                parent_id: parent_id
+                    .clone()
+                    .or_else(|| Some(thread.conversation_id.clone())),
                 revision: *revision,
             })
         }
-        CanonicalTarget::Task { id, revision, execution_generation } => {
+        CanonicalTarget::Task {
+            id,
+            revision,
+            execution_generation,
+        } => {
             let task = state
                 .tasks
                 .get(id)
@@ -110,7 +120,11 @@ fn resolve_target(
                 revision: *revision,
             })
         }
-        CanonicalTarget::Channel { id, project_id, revision } => {
+        CanonicalTarget::Channel {
+            id,
+            project_id,
+            revision,
+        } => {
             let candidates = state
                 .channels
                 .values()
@@ -141,32 +155,25 @@ fn resolve_target(
                 revision: *revision,
             })
         }
-        CanonicalTarget::Operation { operation_id, command_id } => {
-            if let Some(result) = state.results.get(operation_id) {
-                return Ok(CanonicalTarget::Operation {
-                    operation_id: result.operation_id.clone(),
-                    command_id: result.command_id.clone(),
-                });
-            }
-            if let Some(operation_id) = state.command_bindings.get(&CommandId(raw.to_owned())) {
-                return Ok(CanonicalTarget::Operation {
-                    operation_id: operation_id.clone(),
-                    command_id: CommandId(raw.to_owned()),
-                });
-            }
-            Ok(CanonicalTarget::Operation {
-                operation_id: operation_id.clone(),
-                command_id: command_id.clone(),
+        CanonicalTarget::Operation {
+            operation_id,
+            command_id,
+        } => resolve_operation_target(state, operation_id, command_id, raw),
+        CanonicalTarget::Membership { scope, member_bot } => {
+            Ok(CanonicalTarget::Membership {
+                scope: resolve_scope(state, scope)?,
+                member_bot: resolve_bot_selector(state, member_bot)?,
             })
         }
-        CanonicalTarget::Membership { scope, member_bot } => Ok(CanonicalTarget::Membership {
-            scope: resolve_scope(state, scope)?,
-            member_bot: resolve_bot_selector(state, member_bot)?,
-        }),
-        CanonicalTarget::SideEffect { id, revision } => Ok(CanonicalTarget::SideEffect {
-            id: id.clone(),
-            revision: *revision,
-        }),
+        CanonicalTarget::SideEffect { id, revision } => {
+            if !state.side_effects.contains_key(id) {
+                return Err(AppError::NotFound(format!("side effect not found: {raw}")));
+            }
+            Ok(CanonicalTarget::SideEffect {
+                id: id.clone(),
+                revision: *revision,
+            })
+        }
         CanonicalTarget::Process { id } => {
             let row = state
                 .processes
@@ -181,16 +188,73 @@ fn resolve_target(
     }
 }
 
+fn resolve_operation_target(
+    state: &DomainState,
+    operation_id: &OperationId,
+    command_id: &CommandId,
+    raw: &str,
+) -> Result<CanonicalTarget, AppError> {
+    if let Some(result) = state.results.get(operation_id) {
+        return Ok(CanonicalTarget::Operation {
+            operation_id: result.operation_id.clone(),
+            command_id: result.command_id.clone(),
+        });
+    }
+
+    let raw = raw
+        .strip_prefix("operation:")
+        .or_else(|| raw.strip_prefix("command:"))
+        .or_else(|| raw.strip_prefix("idempotency:"))
+        .unwrap_or(raw);
+    if let Some(bound_operation) = state.command_bindings.get(&CommandId(raw.to_owned())) {
+        return Ok(CanonicalTarget::Operation {
+            operation_id: bound_operation.clone(),
+            command_id: CommandId(raw.to_owned()),
+        });
+    }
+
+    let matching_commands = state
+        .idempotency_bindings
+        .iter()
+        .filter(|((_, key_digest), _)| key_digest == raw)
+        .map(|(_, binding)| binding.command_id.clone())
+        .collect::<Vec<_>>();
+    match matching_commands.as_slice() {
+        [matching_command] => {
+            let bound_operation = state.command_bindings.get(matching_command).ok_or_else(|| {
+                AppError::Internal(
+                    "idempotency binding exists without command binding".to_owned(),
+                )
+            })?;
+            Ok(CanonicalTarget::Operation {
+                operation_id: bound_operation.clone(),
+                command_id: matching_command.clone(),
+            })
+        }
+        [] => Err(AppError::NotFound(format!(
+            "operation selector not found: {raw}; projected={}:{}",
+            operation_id.0, command_id.0
+        ))),
+        _ => Err(AppError::Conflict(format!(
+            "ambiguous idempotency selector: {raw}"
+        ))),
+    }
+}
+
 fn resolve_scope(state: &DomainState, scope: &ScopeSelector) -> Result<ScopeSelector, AppError> {
     match scope {
-        ScopeSelector::Bot(selector) => Ok(ScopeSelector::Bot(resolve_bot_selector(state, selector)?)),
+        ScopeSelector::Bot(selector) => {
+            Ok(ScopeSelector::Bot(resolve_bot_selector(state, selector)?))
+        }
         ScopeSelector::Project(ProjectSelector::CanonicalId(id)) => {
             let row = state
                 .projects
                 .get(id)
                 .or_else(|| state.projects.values().find(|project| project.name == id.0))
                 .ok_or_else(|| AppError::NotFound(format!("project not found: {}", id.0)))?;
-            Ok(ScopeSelector::Project(ProjectSelector::CanonicalId(row.id.clone())))
+            Ok(ScopeSelector::Project(ProjectSelector::CanonicalId(
+                row.id.clone(),
+            )))
         }
         ScopeSelector::Project(ProjectSelector::VisibleExact(name)) => {
             let row = state
@@ -198,14 +262,18 @@ fn resolve_scope(state: &DomainState, scope: &ScopeSelector) -> Result<ScopeSele
                 .values()
                 .find(|project| project.name == *name)
                 .ok_or_else(|| AppError::NotFound(format!("project not found: {name}")))?;
-            Ok(ScopeSelector::Project(ProjectSelector::CanonicalId(row.id.clone())))
+            Ok(ScopeSelector::Project(ProjectSelector::CanonicalId(
+                row.id.clone(),
+            )))
         }
         ScopeSelector::Channel(ChannelSelector::CanonicalId(id)) => {
             let row = state
                 .channels
                 .get(id)
                 .ok_or_else(|| AppError::NotFound(format!("channel not found: {}", id.0)))?;
-            Ok(ScopeSelector::Channel(ChannelSelector::CanonicalId(row.id.clone())))
+            Ok(ScopeSelector::Channel(ChannelSelector::CanonicalId(
+                row.id.clone(),
+            )))
         }
         ScopeSelector::Channel(ChannelSelector::ProjectExact { project, name }) => {
             let candidates = state
@@ -221,12 +289,17 @@ fn resolve_scope(state: &DomainState, scope: &ScopeSelector) -> Result<ScopeSele
                 })
                 .collect::<Vec<_>>();
             let row = exactly_one(candidates, "channel", &format!("{project}/{name}"))?;
-            Ok(ScopeSelector::Channel(ChannelSelector::CanonicalId(row.id.clone())))
+            Ok(ScopeSelector::Channel(ChannelSelector::CanonicalId(
+                row.id.clone(),
+            )))
         }
     }
 }
 
-fn resolve_bot_selector(state: &DomainState, selector: &BotSelector) -> Result<BotSelector, AppError> {
+fn resolve_bot_selector(
+    state: &DomainState,
+    selector: &BotSelector,
+) -> Result<BotSelector, AppError> {
     match selector {
         BotSelector::CanonicalId(id) => {
             let bot = state
@@ -237,11 +310,12 @@ fn resolve_bot_selector(state: &DomainState, selector: &BotSelector) -> Result<B
             Ok(BotSelector::CanonicalId(bot.id.clone()))
         }
         BotSelector::ScopedExact(name) => {
-            let bot = state
+            let candidates = state
                 .bots
                 .values()
-                .find(|bot| bot.name == *name)
-                .ok_or_else(|| AppError::NotFound(format!("bot not found: {name}")))?;
+                .filter(|bot| bot.name == *name)
+                .collect::<Vec<_>>();
+            let bot = exactly_one(candidates, "bot", name)?;
             Ok(BotSelector::CanonicalId(bot.id.clone()))
         }
     }
@@ -249,10 +323,11 @@ fn resolve_bot_selector(state: &DomainState, selector: &BotSelector) -> Result<B
 
 fn materialize_cas(
     state: &DomainState,
-    command: &str,
+    payload: &CommandPayload,
     target: &CanonicalTarget,
     cas: &mut CasConditions,
 ) -> Result<(), AppError> {
+    let command = payload.command_key.as_str();
     match target {
         CanonicalTarget::Bot { id, .. } => {
             let revision = state.bots.get(id).map(|row| row.revision).unwrap_or(0);
@@ -263,11 +338,19 @@ fn materialize_cas(
             }
         }
         CanonicalTarget::Conversation { id, .. } => {
-            let revision = state.conversations.get(id).map(|row| row.revision).unwrap_or(0);
+            let revision = state
+                .conversations
+                .get(id)
+                .map(|row| row.revision)
+                .unwrap_or(0);
             cas.if_revision.get_or_insert(revision);
         }
         CanonicalTarget::Thread { id, .. } => {
-            let revision = state.threads.get(id).map(|row| row.revision).unwrap_or(0);
+            let revision = state
+                .threads
+                .get(id)
+                .map(|row| row.revision)
+                .unwrap_or(0);
             if command == "thread-branch" {
                 cas.if_source_revision.get_or_insert(revision);
             } else {
@@ -281,14 +364,22 @@ fn materialize_cas(
                 .ok_or_else(|| AppError::NotFound(format!("task not found: {}", id.0)))?;
             cas.if_revision.get_or_insert(task.revision);
             if matches!(command, "task-cancel" | "task-suspend") {
-                cas.if_execution_generation.get_or_insert(task.execution_generation);
+                cas.if_execution_generation
+                    .get_or_insert(task.execution_generation);
             }
         }
         CanonicalTarget::Project { id, .. } => {
-            let revision = state.projects.get(id).map(|row| row.revision).unwrap_or(0);
+            let revision = state
+                .projects
+                .get(id)
+                .map(|row| row.revision)
+                .unwrap_or(0);
             if matches!(command, "task-submit" | "memory-propose") {
                 cas.if_scope_revision.get_or_insert(revision);
-            } else if matches!(command, "channel-create" | "project-member-set" | "project-member-remove") {
+            } else if matches!(
+                command,
+                "channel-create" | "project-member-set" | "project-member-remove"
+            ) {
                 cas.if_project_revision.get_or_insert(revision);
             } else {
                 cas.if_revision.get_or_insert(revision);
@@ -313,9 +404,18 @@ fn materialize_cas(
             }
         }
         CanonicalTarget::Memory { id, .. } => {
-            let revision = state.memories.get(id).map(|row| row.revision).unwrap_or(0);
+            let revision = state
+                .memories
+                .get(id)
+                .map(|row| row.revision)
+                .unwrap_or(0);
             if command == "memory-promote" {
                 cas.if_proposal_revision.get_or_insert(revision);
+                if cas.if_target_scope_revision.is_none() {
+                    let target_scope = parse_scope(required_string(payload, "target_scope")?);
+                    let target_scope = resolve_scope(state, &target_scope)?;
+                    cas.if_target_scope_revision = Some(scope_revision(state, &target_scope)?);
+                }
             } else {
                 cas.if_revision.get_or_insert(revision);
             }
@@ -340,7 +440,8 @@ fn materialize_cas(
         }
         CanonicalTarget::Operation { operation_id, .. } => {
             if let Some(result) = state.results.get(operation_id) {
-                cas.if_receipt_revision.get_or_insert(result.receipt.last_progress);
+                cas.if_receipt_revision
+                    .get_or_insert(result.receipt.last_progress);
             }
         }
         CanonicalTarget::SideEffect { id, .. } => {
@@ -348,7 +449,10 @@ fn materialize_cas(
                 cas.if_revision.get_or_insert(row.revision);
             }
         }
-        _ => {}
+        CanonicalTarget::Approval { .. }
+        | CanonicalTarget::Provider { .. }
+        | CanonicalTarget::Process { .. }
+        | CanonicalTarget::Instance(_) => {}
     }
     Ok(())
 }
@@ -357,86 +461,297 @@ fn query_state(state: &DomainState, payload: &CommandPayload) -> Result<Value, A
     let page_size = page_size(payload)?;
     let cursor = optional_string(payload, "cursor");
     match payload.command_key.as_str() {
-        "bot-list" => page_values(state.bots.values().map(|row| (row.id.0.clone(), json!({"bot_ref": format!("bot:{}", row.id.0), "name": row.name, "revision": row.revision, "lifecycle": format!("{:?}", row.lifecycle).to_lowercase()}))).collect(), page_size, cursor.as_deref()),
+        "bot-list" => page_values(
+            state
+                .bots
+                .values()
+                .map(|row| {
+                    (
+                        row.id.0.clone(),
+                        json!({
+                            "bot_ref": format!("bot:{}", row.id.0),
+                            "name": row.name,
+                            "revision": row.revision,
+                            "lifecycle": format!("{:?}", row.lifecycle).to_ascii_lowercase()
+                        }),
+                    )
+                })
+                .collect(),
+            page_size,
+            cursor.as_deref(),
+        ),
         "bot-show" => {
-            let CanonicalTarget::Bot { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-            let row = state.bots.get(id).ok_or_else(|| AppError::NotFound(format!("bot {} does not exist", id.0)))?;
-            Ok(json!({"bot_ref": format!("bot:{}", id.0), "name": row.name, "revision": row.revision, "lifecycle": format!("{:?}", row.lifecycle).to_lowercase()}))
+            let CanonicalTarget::Bot { id, .. } = &payload.canonical_target else {
+                return Err(target_error(payload));
+            };
+            let row = state
+                .bots
+                .get(id)
+                .ok_or_else(|| AppError::NotFound(format!("bot {} does not exist", id.0)))?;
+            Ok(json!({
+                "bot_ref": format!("bot:{}", id.0),
+                "name": row.name,
+                "revision": row.revision,
+                "lifecycle": format!("{:?}", row.lifecycle).to_ascii_lowercase()
+            }))
         }
         "conversation-show" => conversation_value(state, payload),
-        "conversation-history" => message_page_for_conversation(state, payload, page_size, cursor.as_deref()),
+        "conversation-history" => {
+            message_page_for_conversation(state, payload, page_size, cursor.as_deref())
+        }
         "thread-list" => {
-            let CanonicalTarget::Conversation { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-            page_values(state.threads.values().filter(|row| row.conversation_id == *id).map(|row| (row.id.0.clone(), json!({"thread_ref": format!("thread:{}", row.id.0), "conversation_ref": format!("conversation:{}", row.conversation_id.0), "revision": row.revision, "title": row.title}))).collect(), page_size, cursor.as_deref())
+            let CanonicalTarget::Conversation { id, .. } = &payload.canonical_target else {
+                return Err(target_error(payload));
+            };
+            page_values(
+                state
+                    .threads
+                    .values()
+                    .filter(|row| row.conversation_id == *id)
+                    .map(|row| {
+                        (
+                            row.id.0.clone(),
+                            json!({
+                                "thread_ref": format!("thread:{}", row.id.0),
+                                "conversation_ref": format!("conversation:{}", row.conversation_id.0),
+                                "revision": row.revision,
+                                "title": row.title
+                            }),
+                        )
+                    })
+                    .collect(),
+                page_size,
+                cursor.as_deref(),
+            )
         }
         "thread-show" => {
-            let CanonicalTarget::Thread { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-            let row = state.threads.get(id).ok_or_else(|| AppError::NotFound(format!("thread {} does not exist", id.0)))?;
-            Ok(json!({"thread_ref": format!("thread:{}", id.0), "conversation_ref": format!("conversation:{}", row.conversation_id.0), "revision": row.revision, "title": row.title, "parent_message_ref": row.parent_message_id.as_ref().map(|id| format!("message:{}", id.0))}))
+            let CanonicalTarget::Thread { id, .. } = &payload.canonical_target else {
+                return Err(target_error(payload));
+            };
+            let row = state
+                .threads
+                .get(id)
+                .ok_or_else(|| AppError::NotFound(format!("thread {} does not exist", id.0)))?;
+            Ok(json!({
+                "thread_ref": format!("thread:{}", id.0),
+                "conversation_ref": format!("conversation:{}", row.conversation_id.0),
+                "revision": row.revision,
+                "title": row.title,
+                "parent_message_ref": row.parent_message_id.as_ref().map(|id| format!("message:{}", id.0))
+            }))
         }
-        "thread-history" => message_page_for_thread(state, payload, page_size, cursor.as_deref()),
-        "task-list" => {
-            let scope = scope_from_target(&payload.canonical_target)?;
-            let owner = scope_owner(&scope);
-            page_values(state.tasks.values().filter(|row| row.owner == owner).map(|row| (row.id.0.clone(), task_value(row))).collect(), page_size, cursor.as_deref())
+        "thread-history" => {
+            message_page_for_thread(state, payload, page_size, cursor.as_deref())
         }
+        "task-list" => task_page(state, payload, page_size, cursor.as_deref()),
         "task-show" => task_query(state, payload),
         "task-result" => {
-            let CanonicalTarget::Task { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-            let row = state.tasks.get(id).ok_or_else(|| AppError::NotFound(format!("task {} does not exist", id.0)))?;
-            Ok(json!({"task_ref": format!("task:{}", id.0), "state": format!("{:?}", row.status).to_lowercase(), "result": row.result}))
+            let CanonicalTarget::Task { id, .. } = &payload.canonical_target else {
+                return Err(target_error(payload));
+            };
+            let row = state
+                .tasks
+                .get(id)
+                .ok_or_else(|| AppError::NotFound(format!("task {} does not exist", id.0)))?;
+            Ok(json!({
+                "task_ref": format!("task:{}", id.0),
+                "state": format!("{:?}", row.status).to_ascii_lowercase(),
+                "result": row.result
+            }))
         }
         "memory-get" => memory_query(state, payload),
         "memory-search" => memory_search(state, payload, page_size, cursor.as_deref()),
         "memory-history" => memory_history(state, payload, page_size, cursor.as_deref()),
-        "project-list" => page_values(state.projects.values().map(|row| (row.id.0.clone(), json!({"project_ref": format!("project:{}", row.id.0), "name": row.name, "revision": row.revision, "lifecycle": format!("{:?}", row.lifecycle).to_lowercase(), "owner_bot_ref": format!("bot:{}", row.owner_bot.0)}))).collect(), page_size, cursor.as_deref()),
+        "project-list" => page_values(
+            state
+                .projects
+                .values()
+                .map(|row| {
+                    (
+                        row.id.0.clone(),
+                        json!({
+                            "project_ref": format!("project:{}", row.id.0),
+                            "name": row.name,
+                            "revision": row.revision,
+                            "lifecycle": format!("{:?}", row.lifecycle).to_ascii_lowercase(),
+                            "owner_bot_ref": format!("bot:{}", row.owner_bot.0)
+                        }),
+                    )
+                })
+                .collect(),
+            page_size,
+            cursor.as_deref(),
+        ),
         "project-show" => project_query(state, payload),
-        "project-member-list" | "channel-member-list" => membership_page(state, payload, page_size, cursor.as_deref()),
+        "project-member-list" | "channel-member-list" => {
+            membership_page(state, payload, page_size, cursor.as_deref())
+        }
         "channel-list" => {
-            let CanonicalTarget::Project { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-            page_values(state.channels.values().filter(|row| row.project_id == *id).map(|row| (row.id.0.clone(), channel_value(row))).collect(), page_size, cursor.as_deref())
+            let CanonicalTarget::Project { id, .. } = &payload.canonical_target else {
+                return Err(target_error(payload));
+            };
+            page_values(
+                state
+                    .channels
+                    .values()
+                    .filter(|row| row.project_id == *id)
+                    .map(|row| (row.id.0.clone(), channel_value(row)))
+                    .collect(),
+                page_size,
+                cursor.as_deref(),
+            )
         }
         "channel-show" => channel_query(state, payload),
         "channel-history" => channel_history(state, payload, page_size, cursor.as_deref()),
         "process-show" => process_query(state, payload),
         "operation-show" => operation_query(state, payload),
-        other => Err(AppError::NotFound(format!("no Application query owner for command {other}"))),
+        other => Err(AppError::NotFound(format!(
+            "no Application query owner for command {other}"
+        ))),
     }
 }
 
 fn conversation_value(state: &DomainState, payload: &CommandPayload) -> Result<Value, AppError> {
-    let CanonicalTarget::Conversation { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-    let row = state.conversations.get(id).ok_or_else(|| AppError::NotFound(format!("conversation {} does not exist", id.0)))?;
-    let owner = match &row.owner { ConversationOwner::Bot { bot_id } => json!({"kind":"bot","ref":format!("bot:{}",bot_id.0)}), ConversationOwner::Channel { project_id, channel_id } => json!({"kind":"channel","project_ref":format!("project:{}",project_id.0),"channel_ref":format!("channel:{}",channel_id.0)}) };
-    Ok(json!({"conversation_ref": format!("conversation:{}", id.0), "revision": row.revision, "owner": owner, "message_count": row.messages.len()}))
+    let CanonicalTarget::Conversation { id, .. } = &payload.canonical_target else {
+        return Err(target_error(payload));
+    };
+    let row = state
+        .conversations
+        .get(id)
+        .ok_or_else(|| AppError::NotFound(format!("conversation {} does not exist", id.0)))?;
+    let owner = match &row.owner {
+        ConversationOwner::Bot { bot_id } => {
+            json!({"kind":"bot","ref":format!("bot:{}",bot_id.0)})
+        }
+        ConversationOwner::Channel {
+            project_id,
+            channel_id,
+        } => json!({
+            "kind":"channel",
+            "project_ref":format!("project:{}",project_id.0),
+            "channel_ref":format!("channel:{}",channel_id.0)
+        }),
+    };
+    Ok(json!({
+        "conversation_ref": format!("conversation:{}", id.0),
+        "revision": row.revision,
+        "owner": owner,
+        "message_count": row.messages.len()
+    }))
 }
 
-fn message_page_for_conversation(state: &DomainState, payload: &CommandPayload, page_size: usize, cursor: Option<&str>) -> Result<Value, AppError> {
-    let CanonicalTarget::Conversation { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-    let row = state.conversations.get(id).ok_or_else(|| AppError::NotFound(format!("conversation {} does not exist", id.0)))?;
+fn message_page_for_conversation(
+    state: &DomainState,
+    payload: &CommandPayload,
+    page_size: usize,
+    cursor: Option<&str>,
+) -> Result<Value, AppError> {
+    let CanonicalTarget::Conversation { id, .. } = &payload.canonical_target else {
+        return Err(target_error(payload));
+    };
+    let row = state
+        .conversations
+        .get(id)
+        .ok_or_else(|| AppError::NotFound(format!("conversation {} does not exist", id.0)))?;
     message_page(state, &row.messages, page_size, cursor)
 }
 
-fn message_page_for_thread(state: &DomainState, payload: &CommandPayload, page_size: usize, cursor: Option<&str>) -> Result<Value, AppError> {
-    let CanonicalTarget::Thread { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-    let row = state.threads.get(id).ok_or_else(|| AppError::NotFound(format!("thread {} does not exist", id.0)))?;
+fn message_page_for_thread(
+    state: &DomainState,
+    payload: &CommandPayload,
+    page_size: usize,
+    cursor: Option<&str>,
+) -> Result<Value, AppError> {
+    let CanonicalTarget::Thread { id, .. } = &payload.canonical_target else {
+        return Err(target_error(payload));
+    };
+    let row = state
+        .threads
+        .get(id)
+        .ok_or_else(|| AppError::NotFound(format!("thread {} does not exist", id.0)))?;
     message_page(state, &row.messages, page_size, cursor)
 }
 
-fn message_page(state: &DomainState, ids: &[MessageId], page_size: usize, cursor: Option<&str>) -> Result<Value, AppError> {
-    page_values(ids.iter().filter_map(|id| state.messages.get(id)).map(|row| (row.id.0.clone(), json!({"message_ref": format!("message:{}", row.id.0), "sequence": row.sequence, "content": row.content}))).collect(), page_size, cursor)
+fn message_page(
+    state: &DomainState,
+    ids: &[MessageId],
+    page_size: usize,
+    cursor: Option<&str>,
+) -> Result<Value, AppError> {
+    page_values(
+        ids.iter()
+            .filter_map(|id| state.messages.get(id))
+            .map(|row| {
+                (
+                    row.id.0.clone(),
+                    json!({
+                        "message_ref": format!("message:{}", row.id.0),
+                        "sequence": row.sequence,
+                        "content": row.content
+                    }),
+                )
+            })
+            .collect(),
+        page_size,
+        cursor,
+    )
+}
+
+fn task_page(
+    state: &DomainState,
+    payload: &CommandPayload,
+    page_size: usize,
+    cursor: Option<&str>,
+) -> Result<Value, AppError> {
+    let scope = scope_from_target(&payload.canonical_target)?;
+    let owner = scope_owner(&scope);
+    let state_filter = optional_string(payload, "state").map(|value| value.to_ascii_lowercase());
+    page_values(
+        state
+            .tasks
+            .values()
+            .filter(|row| row.owner == owner)
+            .filter(|row| {
+                state_filter.as_ref().is_none_or(|wanted| {
+                    format!("{:?}", row.status).to_ascii_lowercase() == *wanted
+                })
+            })
+            .map(|row| (row.id.0.clone(), task_value(row)))
+            .collect(),
+        page_size,
+        cursor,
+    )
 }
 
 fn task_query(state: &DomainState, payload: &CommandPayload) -> Result<Value, AppError> {
-    let CanonicalTarget::Task { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-    let row = state.tasks.get(id).ok_or_else(|| AppError::NotFound(format!("task {} does not exist", id.0)))?;
+    let CanonicalTarget::Task { id, .. } = &payload.canonical_target else {
+        return Err(target_error(payload));
+    };
+    let row = state
+        .tasks
+        .get(id)
+        .ok_or_else(|| AppError::NotFound(format!("task {} does not exist", id.0)))?;
     Ok(task_value(row))
 }
-fn task_value(row: &crate::state::TaskState) -> Value { json!({"task_ref": format!("task:{}", row.id.0), "owner": row.owner, "revision": row.revision, "execution_generation": row.execution_generation, "state": format!("{:?}", row.status).to_lowercase()}) }
+
+fn task_value(row: &crate::state::TaskState) -> Value {
+    json!({
+        "task_ref": format!("task:{}", row.id.0),
+        "owner": row.owner,
+        "revision": row.revision,
+        "execution_generation": row.execution_generation,
+        "state": format!("{:?}", row.status).to_ascii_lowercase()
+    })
+}
 
 fn process_query(state: &DomainState, payload: &CommandPayload) -> Result<Value, AppError> {
-    let CanonicalTarget::Process { id } = &payload.canonical_target else { return Err(target_error(payload)); };
-    let row = state.processes.get(id).ok_or_else(|| AppError::NotFound(format!("process {} does not exist", id.0)))?;
+    let CanonicalTarget::Process { id } = &payload.canonical_target else {
+        return Err(target_error(payload));
+    };
+    let row = state
+        .processes
+        .get(id)
+        .ok_or_else(|| AppError::NotFound(format!("process {} does not exist", id.0)))?;
     Ok(process_value(row))
 }
 
@@ -458,85 +773,424 @@ fn process_value(row: &ProcessState) -> Value {
 }
 
 fn memory_query(state: &DomainState, payload: &CommandPayload) -> Result<Value, AppError> {
-    let CanonicalTarget::Memory { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-    let row = state.memories.get(id).ok_or_else(|| AppError::NotFound(format!("memory {} does not exist", id.0)))?;
+    let CanonicalTarget::Memory { id, .. } = &payload.canonical_target else {
+        return Err(target_error(payload));
+    };
+    let row = state
+        .memories
+        .get(id)
+        .ok_or_else(|| AppError::NotFound(format!("memory {} does not exist", id.0)))?;
     Ok(memory_value(row))
 }
-fn memory_value(row: &crate::state::MemoryState) -> Value { json!({"memory_ref": format!("memory:{}", row.id.0), "scope": row.scope_key, "revision": row.revision, "state": format!("{:?}", row.status).to_lowercase(), "statement": row.statement, "evidence": row.evidence}) }
 
-fn memory_search(state: &DomainState, payload: &CommandPayload, page_size: usize, cursor: Option<&str>) -> Result<Value, AppError> {
+fn memory_value(row: &crate::state::MemoryState) -> Value {
+    json!({
+        "memory_ref": format!("memory:{}", row.id.0),
+        "scope": row.scope_key,
+        "revision": row.revision,
+        "state": format!("{:?}", row.status).to_ascii_lowercase(),
+        "statement": row.statement,
+        "evidence": row.evidence
+    })
+}
+
+fn memory_search(
+    state: &DomainState,
+    payload: &CommandPayload,
+    page_size: usize,
+    cursor: Option<&str>,
+) -> Result<Value, AppError> {
     let scope = scope_from_target(&payload.canonical_target)?;
     let owner = scope_owner(&scope);
     let query = required_string(payload, "query")?.to_ascii_lowercase();
-    page_values(state.memories.values().filter(|row| row.scope_key == owner && row.status == MemoryAssertionStatus::Accepted && content_contains(&row.statement, &query)).map(|row| (row.id.0.clone(), memory_value(row))).collect(), page_size, cursor)
+    page_values(
+        state
+            .memories
+            .values()
+            .filter(|row| {
+                row.scope_key == owner
+                    && row.status == MemoryAssertionStatus::Accepted
+                    && content_contains(&row.statement, &query)
+            })
+            .map(|row| (row.id.0.clone(), memory_value(row)))
+            .collect(),
+        page_size,
+        cursor,
+    )
 }
 
-fn memory_history(state: &DomainState, payload: &CommandPayload, page_size: usize, cursor: Option<&str>) -> Result<Value, AppError> {
-    let CanonicalTarget::Memory { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-    let row = state.memories.get(id).ok_or_else(|| AppError::NotFound(format!("memory {} does not exist", id.0)))?;
-    page_values(row.history.iter().map(|revision| (format!("{:020}", revision.revision), json!({"revision": revision.revision, "state": format!("{:?}", revision.status).to_lowercase(), "statement": revision.statement, "evidence": revision.evidence}))).collect(), page_size, cursor)
+fn memory_history(
+    state: &DomainState,
+    payload: &CommandPayload,
+    page_size: usize,
+    cursor: Option<&str>,
+) -> Result<Value, AppError> {
+    let CanonicalTarget::Memory { id, .. } = &payload.canonical_target else {
+        return Err(target_error(payload));
+    };
+    let row = state
+        .memories
+        .get(id)
+        .ok_or_else(|| AppError::NotFound(format!("memory {} does not exist", id.0)))?;
+    page_values(
+        row.history
+            .iter()
+            .map(|revision| {
+                (
+                    format!("{:020}", revision.revision),
+                    json!({
+                        "revision": revision.revision,
+                        "state": format!("{:?}", revision.status).to_ascii_lowercase(),
+                        "statement": revision.statement,
+                        "evidence": revision.evidence
+                    }),
+                )
+            })
+            .collect(),
+        page_size,
+        cursor,
+    )
 }
 
 fn project_query(state: &DomainState, payload: &CommandPayload) -> Result<Value, AppError> {
-    let CanonicalTarget::Project { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-    let row = state.projects.get(id).ok_or_else(|| AppError::NotFound(format!("project {} does not exist", id.0)))?;
-    Ok(json!({"project_ref": format!("project:{}", row.id.0), "name": row.name, "revision": row.revision, "lifecycle": format!("{:?}", row.lifecycle).to_lowercase(), "owner_bot_ref": format!("bot:{}", row.owner_bot.0)}))
+    let CanonicalTarget::Project { id, .. } = &payload.canonical_target else {
+        return Err(target_error(payload));
+    };
+    let row = state
+        .projects
+        .get(id)
+        .ok_or_else(|| AppError::NotFound(format!("project {} does not exist", id.0)))?;
+    Ok(json!({
+        "project_ref": format!("project:{}", row.id.0),
+        "name": row.name,
+        "revision": row.revision,
+        "lifecycle": format!("{:?}", row.lifecycle).to_ascii_lowercase(),
+        "owner_bot_ref": format!("bot:{}", row.owner_bot.0)
+    }))
 }
 
 fn channel_query(state: &DomainState, payload: &CommandPayload) -> Result<Value, AppError> {
-    let CanonicalTarget::Channel { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-    let row = state.channels.get(id).ok_or_else(|| AppError::NotFound(format!("channel {} does not exist", id.0)))?;
+    let CanonicalTarget::Channel { id, .. } = &payload.canonical_target else {
+        return Err(target_error(payload));
+    };
+    let row = state
+        .channels
+        .get(id)
+        .ok_or_else(|| AppError::NotFound(format!("channel {} does not exist", id.0)))?;
     Ok(channel_value(row))
 }
-fn channel_value(row: &crate::state::ChannelState) -> Value { json!({"channel_ref": format!("channel:{}", row.id.0), "project_ref": format!("project:{}", row.project_id.0), "name": row.name, "revision": row.revision, "conversation_ref": format!("conversation:{}", row.conversation_id.0)}) }
 
-fn channel_history(state: &DomainState, payload: &CommandPayload, page_size: usize, cursor: Option<&str>) -> Result<Value, AppError> {
-    let CanonicalTarget::Channel { id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-    let row = state.channels.get(id).ok_or_else(|| AppError::NotFound(format!("channel {} does not exist", id.0)))?;
-    let conversation = state.conversations.get(&row.conversation_id).ok_or_else(|| AppError::Internal("channel conversation missing".to_owned()))?;
+fn channel_value(row: &crate::state::ChannelState) -> Value {
+    json!({
+        "channel_ref": format!("channel:{}", row.id.0),
+        "project_ref": format!("project:{}", row.project_id.0),
+        "name": row.name,
+        "revision": row.revision,
+        "conversation_ref": format!("conversation:{}", row.conversation_id.0)
+    })
+}
+
+fn channel_history(
+    state: &DomainState,
+    payload: &CommandPayload,
+    page_size: usize,
+    cursor: Option<&str>,
+) -> Result<Value, AppError> {
+    let CanonicalTarget::Channel { id, .. } = &payload.canonical_target else {
+        return Err(target_error(payload));
+    };
+    let row = state
+        .channels
+        .get(id)
+        .ok_or_else(|| AppError::NotFound(format!("channel {} does not exist", id.0)))?;
+    let conversation = state
+        .conversations
+        .get(&row.conversation_id)
+        .ok_or_else(|| AppError::Internal("channel conversation missing".to_owned()))?;
     message_page(state, &conversation.messages, page_size, cursor)
 }
 
-fn membership_page(state: &DomainState, payload: &CommandPayload, page_size: usize, cursor: Option<&str>) -> Result<Value, AppError> {
+fn membership_page(
+    state: &DomainState,
+    payload: &CommandPayload,
+    page_size: usize,
+    cursor: Option<&str>,
+) -> Result<Value, AppError> {
     let scope = match &payload.canonical_target {
-        CanonicalTarget::Project { id, .. } => ScopeSelector::Project(ProjectSelector::CanonicalId(id.clone())),
-        CanonicalTarget::Channel { id, .. } => ScopeSelector::Channel(ChannelSelector::CanonicalId(id.clone())),
+        CanonicalTarget::Project { id, .. } => {
+            ScopeSelector::Project(ProjectSelector::CanonicalId(id.clone()))
+        }
+        CanonicalTarget::Channel { id, .. } => {
+            ScopeSelector::Channel(ChannelSelector::CanonicalId(id.clone()))
+        }
         _ => return Err(target_error(payload)),
     };
-    page_values(state.memberships.values().filter(|row| row.scope == scope).map(|row| (row.id.clone(), membership_value(row))).collect(), page_size, cursor)
+    page_values(
+        state
+            .memberships
+            .values()
+            .filter(|row| row.scope == scope)
+            .map(|row| (row.id.clone(), membership_value(row)))
+            .collect(),
+        page_size,
+        cursor,
+    )
 }
-fn membership_value(row: &MembershipRecord) -> Value { json!({"member_bot": row.member_bot, "role": row.role, "generation": row.generation}) }
+
+fn membership_value(row: &MembershipRecord) -> Value {
+    json!({
+        "member_bot": row.member_bot,
+        "role": row.role,
+        "generation": row.generation
+    })
+}
 
 fn operation_query(state: &DomainState, payload: &CommandPayload) -> Result<Value, AppError> {
-    let CanonicalTarget::Operation { operation_id, .. } = &payload.canonical_target else { return Err(target_error(payload)); };
-    let row = state.results.get(operation_id).ok_or_else(|| AppError::NotFound(format!("operation {} does not exist", operation_id.0)))?;
-    serde_json::to_value(row).map_err(|error| AppError::Internal(format!("cannot encode operation result: {error}")))
+    let CanonicalTarget::Operation { operation_id, .. } = &payload.canonical_target else {
+        return Err(target_error(payload));
+    };
+    let row = state.results.get(operation_id).ok_or_else(|| {
+        AppError::NotFound(format!("operation {} does not exist", operation_id.0))
+    })?;
+    serde_json::to_value(row)
+        .map_err(|error| AppError::Internal(format!("cannot encode operation result: {error}")))
 }
 
-fn page_values(mut rows: Vec<(String, Value)>, page_size: usize, cursor: Option<&str>) -> Result<Value, AppError> {
+fn page_values(
+    mut rows: Vec<(String, Value)>,
+    page_size: usize,
+    cursor: Option<&str>,
+) -> Result<Value, AppError> {
     rows.sort_by(|left, right| left.0.cmp(&right.0));
-    if let Some(cursor) = cursor { rows.retain(|(key, _)| key.as_str() > cursor); }
+    if let Some(cursor) = cursor {
+        rows.retain(|(key, _)| key.as_str() > cursor);
+    }
     let has_more = rows.len() > page_size;
     let rows = rows.into_iter().take(page_size).collect::<Vec<_>>();
-    let next_cursor = if has_more { rows.last().map(|(key, _)| key.clone()) } else { None };
-    Ok(json!({"items": rows.into_iter().map(|(_, value)| value).collect::<Vec<_>>(), "next_cursor": next_cursor, "has_more": has_more}))
+    let next_cursor = has_more
+        .then(|| rows.last().map(|(key, _)| key.clone()))
+        .flatten();
+    Ok(json!({
+        "items": rows.into_iter().map(|(_, value)| value).collect::<Vec<_>>(),
+        "next_cursor": next_cursor,
+        "has_more": has_more
+    }))
 }
 
 fn page_size(payload: &CommandPayload) -> Result<usize, AppError> {
-    match payload.semantic_options.get("page_size") {
-        Some(Value::String(value)) => value.parse::<usize>().map_err(|_| AppError::Conflict("page_size must be an integer".to_owned())).map(|size| size.clamp(1, MAX_PAGE_SIZE)),
-        Some(Value::Number(value)) => value.as_u64().and_then(|value| usize::try_from(value).ok()).ok_or_else(|| AppError::Conflict("page_size is invalid".to_owned())).map(|size| size.clamp(1, MAX_PAGE_SIZE)),
-        None => Ok(DEFAULT_PAGE_SIZE),
-        _ => Err(AppError::Conflict("page_size is invalid".to_owned())),
+    let size = match payload.semantic_options.get("page_size") {
+        Some(Value::String(value)) => value
+            .parse::<usize>()
+            .map_err(|_| AppError::Conflict("page_size must be an integer".to_owned()))?,
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| AppError::Conflict("page_size is invalid".to_owned()))?,
+        None => return Ok(DEFAULT_PAGE_SIZE),
+        _ => return Err(AppError::Conflict("page_size is invalid".to_owned())),
+    };
+    if (1..=MAX_PAGE_SIZE).contains(&size) {
+        Ok(size)
+    } else {
+        Err(AppError::Conflict(format!(
+            "page_size must be in 1..={MAX_PAGE_SIZE}"
+        )))
     }
 }
-fn optional_string(payload: &CommandPayload, name: &str) -> Option<String> { payload.semantic_options.get(name).and_then(Value::as_str).map(str::to_owned) }
-fn required_string<'a>(payload: &'a CommandPayload, name: &str) -> Result<&'a str, AppError> { payload.semantic_options.get(name).and_then(Value::as_str).ok_or_else(|| AppError::Conflict(format!("{} requires field '{name}'", payload.command_key))) }
-fn content_contains(content: &ContentSource, query: &str) -> bool { match content { ContentSource::Text { value } => value.to_ascii_lowercase().contains(query), ContentSource::ArtifactRef { artifact_id, digest } => artifact_id.to_ascii_lowercase().contains(query) || digest.to_ascii_lowercase().contains(query), ContentSource::InputFile { .. } | ContentSource::Stdin => false } }
-fn exactly_one<'a, T>(values: Vec<&'a T>, kind: &str, selector: &str) -> Result<&'a T, AppError> { match values.as_slice() { [one] => Ok(*one), [] => Err(AppError::NotFound(format!("{kind} not found: {selector}"))), _ => Err(AppError::Conflict(format!("ambiguous {kind} selector: {selector}"))) } }
-fn target_error(payload: &CommandPayload) -> AppError { AppError::Conflict(format!("invalid target for {}: {:?}", payload.command_key, payload.canonical_target)) }
 
-fn scope_from_target(target: &CanonicalTarget) -> Result<ScopeSelector, AppError> { match target { CanonicalTarget::Bot { id, .. } => Ok(ScopeSelector::Bot(BotSelector::CanonicalId(id.clone()))), CanonicalTarget::Project { id, .. } => Ok(ScopeSelector::Project(ProjectSelector::CanonicalId(id.clone()))), CanonicalTarget::Channel { id, .. } => Ok(ScopeSelector::Channel(ChannelSelector::CanonicalId(id.clone()))), _ => Err(AppError::Conflict("target is not a scope".to_owned())) } }
-fn scope_revision(state: &DomainState, scope: &ScopeSelector) -> Result<i64, AppError> { match scope { ScopeSelector::Bot(BotSelector::CanonicalId(id)) => state.bots.get(id).map(|row| row.revision), ScopeSelector::Project(ProjectSelector::CanonicalId(id)) => state.projects.get(id).map(|row| row.revision), ScopeSelector::Channel(ChannelSelector::CanonicalId(id)) => state.channels.get(id).map(|row| row.revision), _ => None }.ok_or_else(|| AppError::NotFound(format!("scope not found: {scope:?}"))) }
-fn membership_key(scope: &ScopeSelector, bot: &BotSelector) -> String { format!("{}|{}", scope_owner(scope), match bot { BotSelector::CanonicalId(id) => id.0.clone(), BotSelector::ScopedExact(name) => format!("exact:{name}") }) }
-fn empty_cas() -> CasConditions { CasConditions { if_revision: None, if_generation: None, if_host_generation: None, if_execution_generation: None, if_source_revision: None, if_scope_revision: None, if_project_revision: None, if_channel_revision: None, if_membership_generation: None, if_proposal_revision: None, if_target_scope_revision: None, if_receipt_revision: None } }
+fn optional_string(payload: &CommandPayload, name: &str) -> Option<String> {
+    payload
+        .semantic_options
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn required_string<'a>(
+    payload: &'a CommandPayload,
+    name: &str,
+) -> Result<&'a str, AppError> {
+    payload
+        .semantic_options
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AppError::Conflict(format!("{} requires field '{name}'", payload.command_key))
+        })
+}
+
+fn content_contains(content: &ContentSource, query: &str) -> bool {
+    match content {
+        ContentSource::Text { value } => value.to_ascii_lowercase().contains(query),
+        ContentSource::ArtifactRef {
+            artifact_id,
+            digest,
+        } => {
+            artifact_id.to_ascii_lowercase().contains(query)
+                || digest.to_ascii_lowercase().contains(query)
+        }
+        ContentSource::InputFile { .. } | ContentSource::Stdin => false,
+    }
+}
+
+fn exactly_one<'a, T>(
+    values: Vec<&'a T>,
+    kind: &str,
+    selector: &str,
+) -> Result<&'a T, AppError> {
+    match values.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(AppError::NotFound(format!(
+            "{kind} not found: {selector}"
+        ))),
+        _ => Err(AppError::Conflict(format!(
+            "ambiguous {kind} selector: {selector}"
+        ))),
+    }
+}
+
+fn target_error(payload: &CommandPayload) -> AppError {
+    AppError::Conflict(format!(
+        "invalid target for {}: {:?}",
+        payload.command_key, payload.canonical_target
+    ))
+}
+
+fn scope_from_target(target: &CanonicalTarget) -> Result<ScopeSelector, AppError> {
+    match target {
+        CanonicalTarget::Bot { id, .. } => {
+            Ok(ScopeSelector::Bot(BotSelector::CanonicalId(id.clone())))
+        }
+        CanonicalTarget::Project { id, .. } => Ok(ScopeSelector::Project(
+            ProjectSelector::CanonicalId(id.clone()),
+        )),
+        CanonicalTarget::Channel { id, .. } => Ok(ScopeSelector::Channel(
+            ChannelSelector::CanonicalId(id.clone()),
+        )),
+        _ => Err(AppError::Conflict("target is not a scope".to_owned())),
+    }
+}
+
+fn parse_scope(value: &str) -> ScopeSelector {
+    if let Some(id) = value.strip_prefix("project:") {
+        ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(id.to_owned())))
+    } else if let Some(id) = value.strip_prefix("channel:") {
+        ScopeSelector::Channel(ChannelSelector::CanonicalId(ChannelId(id.to_owned())))
+    } else if let Some(id) = value.strip_prefix("bot:") {
+        ScopeSelector::Bot(BotSelector::CanonicalId(BotId(id.to_owned())))
+    } else {
+        ScopeSelector::Bot(BotSelector::CanonicalId(BotId(value.to_owned())))
+    }
+}
+
+fn scope_revision(state: &DomainState, scope: &ScopeSelector) -> Result<i64, AppError> {
+    match scope {
+        ScopeSelector::Bot(BotSelector::CanonicalId(id)) => {
+            state.bots.get(id).map(|row| row.revision)
+        }
+        ScopeSelector::Project(ProjectSelector::CanonicalId(id)) => {
+            state.projects.get(id).map(|row| row.revision)
+        }
+        ScopeSelector::Channel(ChannelSelector::CanonicalId(id)) => {
+            state.channels.get(id).map(|row| row.revision)
+        }
+        _ => None,
+    }
+    .ok_or_else(|| AppError::NotFound(format!("scope not found: {scope:?}")))
+}
+
+fn empty_cas() -> CasConditions {
+    CasConditions {
+        if_revision: None,
+        if_generation: None,
+        if_host_generation: None,
+        if_execution_generation: None,
+        if_source_revision: None,
+        if_scope_revision: None,
+        if_project_revision: None,
+        if_channel_revision: None,
+        if_membership_generation: None,
+        if_proposal_revision: None,
+        if_target_scope_revision: None,
+        if_receipt_revision: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use crate::state::{BotState, LifecycleState, ProjectLifecycle, ProjectState};
+
+    #[test]
+    fn page_size_rejects_oversized_remote_value() {
+        let payload = CommandPayload {
+            command_key: "bot-list".to_owned(),
+            principal_ref: PrincipalRef("p".to_owned()),
+            instance_id: InstanceId("i".to_owned()),
+            canonical_target: CanonicalTarget::Instance(InstanceId("i".to_owned())),
+            cas: None,
+            content: None,
+            semantic_options: json!({"page_size": "1001"}),
+        };
+        assert!(page_size(&payload).is_err());
+    }
+
+    #[test]
+    fn memory_promote_materializes_target_scope_revision() {
+        let mut state = DomainState::new();
+        state.bots.insert(
+            BotId("bot-a".to_owned()),
+            BotState {
+                id: BotId("bot-a".to_owned()),
+                name: "a".to_owned(),
+                revision: 3,
+                lifecycle: LifecycleState::Active,
+            },
+        );
+        state.projects.insert(
+            ProjectId("project-a".to_owned()),
+            ProjectState {
+                id: ProjectId("project-a".to_owned()),
+                name: "a".to_owned(),
+                owner_bot: BotId("bot-a".to_owned()),
+                revision: 7,
+                lifecycle: ProjectLifecycle::Active,
+            },
+        );
+        let mut cas = empty_cas();
+        let payload = CommandPayload {
+            command_key: "memory-promote".to_owned(),
+            principal_ref: PrincipalRef("p".to_owned()),
+            instance_id: InstanceId("i".to_owned()),
+            canonical_target: CanonicalTarget::Memory {
+                id: MemoryId("memory-a".to_owned()),
+                revision: 1,
+            },
+            cas: None,
+            content: None,
+            semantic_options: json!({"target_scope": "project:project-a"}),
+        };
+        state.memories.insert(
+            MemoryId("memory-a".to_owned()),
+            crate::state::MemoryState {
+                id: MemoryId("memory-a".to_owned()),
+                scope_key: "bot:bot-a".to_owned(),
+                revision: 1,
+                status: MemoryAssertionStatus::Proposed,
+                statement: ContentSource::Text { value: "x".to_owned() },
+                evidence: Vec::new(),
+                history: Vec::new(),
+            },
+        );
+        materialize_cas(
+            &state,
+            &payload,
+            &payload.canonical_target,
+            &mut cas,
+        )
+        .expect("CAS materializes");
+        assert_eq!(cas.if_target_scope_revision, Some(7));
+    }
+}
