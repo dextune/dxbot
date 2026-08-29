@@ -5,6 +5,7 @@
 //! Security and Provider owners are routed behind the same authenticated boundary.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use application::ApplicationMutator;
 use application::mutation::AppError;
@@ -26,6 +27,8 @@ pub enum ServerError {
     PermissionDenied(String),
     NotFound(String),
     Conflict(String),
+    GapDetected(String),
+    Timeout(String),
     InternalInvariant(String),
 }
 
@@ -37,6 +40,12 @@ impl ServerError {
             }
             Self::NotFound(message) => (ErrorCode::NotFound, ErrorCategory::Input, message.clone()),
             Self::Conflict(message) => (ErrorCode::Conflict, ErrorCategory::Conflict, message.clone()),
+            Self::GapDetected(message) => (
+                ErrorCode::PartialOrResync,
+                ErrorCategory::Recovery,
+                message.clone(),
+            ),
+            Self::Timeout(message) => (ErrorCode::Timeout, ErrorCategory::Availability, message.clone()),
             Self::InternalInvariant(message) => (
                 ErrorCode::InternalInvariant,
                 ErrorCategory::Internal,
@@ -173,6 +182,20 @@ impl ControlServer {
         }
     }
 
+    pub fn watch_next(
+        &self,
+        authenticated_principal: &PrincipalRef,
+        payload: &CommandPayload,
+        cursor: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value, ServerError> {
+        self.authorize_payload_identity(authenticated_principal, payload)?;
+        self.require_local_operator_or_scope(authenticated_principal, &payload.canonical_target)?;
+        self.application
+            .watch_next(payload, cursor, timeout)
+            .map_err(map_app_error)
+    }
+
     pub fn handle_request(
         &self,
         authenticated_principal: &PrincipalRef,
@@ -240,10 +263,7 @@ impl ControlServer {
             ServerError::InternalInvariant("security state lock unavailable".to_owned())
         })?;
         match payload.command_key.as_str() {
-            "approval-list" => {
-                let records = security.approvals.list_approvals();
-                page_approval_records(records, payload)
-            }
+            "approval-list" => page_approval_records(security.approvals.list_approvals(), payload),
             "approval-show" => {
                 let CanonicalTarget::Approval { id, .. } = &payload.canonical_target else {
                     return Err(ServerError::Conflict(
@@ -398,41 +418,40 @@ fn active_principal(
 fn page_approval_records(records: Vec<ApprovalRecord>, payload: &CommandPayload) -> Result<Value, ServerError> {
     let size = page_size(payload)?;
     let cursor = cursor(payload);
-    let mut rows = records
+    let rows = records
         .into_iter()
         .map(|record| (record.id.0.clone(), approval_value(&record)))
         .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    page_rows(rows, size, cursor.as_deref())
+    Ok(page_rows(rows, size, cursor.as_deref()))
 }
 
 fn page_provider_records(records: Vec<ProviderInfo>, payload: &CommandPayload) -> Result<Value, ServerError> {
     let size = page_size(payload)?;
     let cursor = cursor(payload);
-    let mut rows = records
+    let rows = records
         .into_iter()
         .map(|record| (record.id.0.clone(), provider_value(&record)))
         .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    page_rows(rows, size, cursor.as_deref())
+    Ok(page_rows(rows, size, cursor.as_deref()))
 }
 
-fn page_rows(
-    mut rows: Vec<(String, Value)>,
-    page_size: usize,
-    cursor: Option<&str>,
-) -> Result<Value, ServerError> {
+fn page_rows(mut rows: Vec<(String, Value)>, page_size: usize, cursor: Option<&str>) -> Value {
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
     if let Some(cursor) = cursor {
         rows.retain(|(key, _)| key.as_str() > cursor);
     }
     let has_more = rows.len() > page_size;
     let rows = rows.into_iter().take(page_size).collect::<Vec<_>>();
-    let next_cursor = has_more.then(|| rows.last().map(|(key, _)| key.clone())).flatten();
-    Ok(json!({
+    let next_cursor = if has_more {
+        rows.last().map(|(key, _)| key.clone())
+    } else {
+        None
+    };
+    json!({
         "items": rows.into_iter().map(|(_, value)| value).collect::<Vec<_>>(),
         "next_cursor": next_cursor,
         "has_more": has_more,
-    }))
+    })
 }
 
 fn approval_value(record: &ApprovalRecord) -> Value {
@@ -527,12 +546,8 @@ fn map_app_error(error: AppError) -> ServerError {
         AppError::PermissionDenied(message) => ServerError::PermissionDenied(message),
         AppError::NotFound(message) => ServerError::NotFound(message),
         AppError::Conflict(message) => ServerError::Conflict(message),
-        AppError::GapDetected(_) => {
-            ServerError::InternalInvariant("subscription gap detected at boundary".to_owned())
-        }
-        AppError::Timeout(_) => {
-            ServerError::InternalInvariant("subscription timeout at boundary".to_owned())
-        }
+        AppError::GapDetected(message) => ServerError::GapDetected(message),
+        AppError::Timeout(message) => ServerError::Timeout(message),
         AppError::Internal(message) => ServerError::InternalInvariant(message),
     }
 }
