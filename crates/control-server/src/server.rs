@@ -1,9 +1,8 @@
 //! Control endpoint server: trusted authentication boundary plus binding-preserving delegation.
 //!
-//! Every authorized [`OperationRequest`] is passed intact to the application
-//! layer. The control boundary never regenerates or discards command,
-//! idempotency, request-digest, or operation identity, and it never trusts a
-//! client-supplied principal as authentication evidence.
+//! Every local operation first authenticates the peer. Client-supplied Principal
+//! fields are consistency bindings only; they never create authority. Application
+//! preflight/query/mutation all reuse the same authenticated boundary.
 
 use std::sync::{Arc, Mutex};
 
@@ -12,6 +11,7 @@ use application::mutation::AppError;
 use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
 use dxbot_core::types::*;
 use runtime_security::{ApprovalManager, AuthorityManager, PrincipalManager, PrincipalStatus};
+use serde_json::Value;
 
 const OPERATION_ROLE: &str = "mutator";
 const LOCAL_OPERATOR_ROLE: &str = "operator";
@@ -74,10 +74,6 @@ impl SecurityState {
         Self::default()
     }
 
-    /// Register and explicitly grant the P0 local operator role to the
-    /// server-authenticated Instance+UID principal. Repeated authentication by
-    /// the same local UID is idempotent; arbitrary registered principals still
-    /// receive no authority.
     pub fn ensure_local_operator(&mut self, principal: &PrincipalRef) -> Result<(), ServerError> {
         if self.principals.resolve_principal(principal).is_err() {
             self.principals
@@ -98,8 +94,6 @@ impl SecurityState {
     }
 }
 
-/// The mutator already owns synchronized domain state, so ControlServer keeps
-/// only an `Arc` rather than adding a second mutex around it.
 #[derive(Debug)]
 pub struct ControlServer {
     security: Arc<Mutex<SecurityState>>,
@@ -126,31 +120,44 @@ impl ControlServer {
             .ensure_local_operator(principal)
     }
 
-    /// Handle a mutation for a principal already derived by the trusted local
-    /// transport boundary (for P0: InstanceId + authenticated OS UID).
-    ///
-    /// `payload.principal_ref` and `idempotency_key.principal_ref` are treated
-    /// only as consistency bindings. They must match the authenticated
-    /// principal; neither is authentication evidence.
+    pub fn preflight(
+        &self,
+        authenticated_principal: &PrincipalRef,
+        payload: &CommandPayload,
+        raw_selector: Option<&Value>,
+    ) -> Result<(CanonicalTarget, CasConditions), ServerError> {
+        self.authorize_payload_identity(authenticated_principal, payload)?;
+        self.require_local_operator_or_scope(authenticated_principal, &payload.canonical_target)?;
+        self.application
+            .preflight(payload, raw_selector)
+            .map_err(map_app_error)
+    }
+
+    pub fn query(
+        &self,
+        authenticated_principal: &PrincipalRef,
+        payload: &CommandPayload,
+    ) -> Result<Value, ServerError> {
+        self.authorize_payload_identity(authenticated_principal, payload)?;
+        self.require_local_operator_or_scope(authenticated_principal, &payload.canonical_target)?;
+        self.application.query(payload).map_err(map_app_error)
+    }
+
     pub fn handle_request(
         &self,
         authenticated_principal: &PrincipalRef,
         request: &OperationRequest,
     ) -> Result<OperationResult, ServerError> {
-        if request.payload.principal_ref != *authenticated_principal
-            || request.idempotency_key.principal_ref != *authenticated_principal
-        {
+        if request.idempotency_key.principal_ref != *authenticated_principal {
             return Err(ServerError::PermissionDenied(
-                "request principal binding mismatch".to_string(),
+                "idempotency principal binding mismatch".to_owned(),
             ));
         }
+        self.authorize_payload_identity(authenticated_principal, &request.payload)?;
         self.authorize_mutation(authenticated_principal, &request.payload.canonical_target)?;
         self.application.mutate(request).map_err(map_app_error)
     }
 
-    /// Read-only binding lookup used by CLI recovery. Cross-principal lookup is
-    /// rejected before Application state is consulted, preventing receipt
-    /// existence disclosure to another authenticated UID.
     pub fn lookup_binding(
         &self,
         authenticated_principal: &PrincipalRef,
@@ -168,20 +175,43 @@ impl ControlServer {
             .map_err(map_app_error)
     }
 
+    fn authorize_payload_identity(
+        &self,
+        authenticated_principal: &PrincipalRef,
+        payload: &CommandPayload,
+    ) -> Result<(), ServerError> {
+        if payload.principal_ref != *authenticated_principal {
+            return Err(ServerError::PermissionDenied(
+                "request principal binding mismatch".to_owned(),
+            ));
+        }
+        self.require_active_principal(authenticated_principal)
+    }
+
     fn authorize_mutation(
         &self,
         authenticated_principal: &PrincipalRef,
         target: &CanonicalTarget,
     ) -> Result<(), ServerError> {
+        self.require_local_operator_or_scope(authenticated_principal, target)
+    }
+
+    fn require_local_operator_or_scope(
+        &self,
+        authenticated_principal: &PrincipalRef,
+        target: &CanonicalTarget,
+    ) -> Result<(), ServerError> {
         let security = self.security.lock().map_err(|_| {
-            ServerError::InternalInvariant("security state lock unavailable".to_string())
+            ServerError::InternalInvariant("security state lock unavailable".to_owned())
         })?;
         let principal_state = active_principal(&security, authenticated_principal)?;
-
         let is_local_operator = security
             .authority
             .check_global_authority(&principal_state.ref_, LOCAL_OPERATOR_ROLE)
             .map_err(|_| ServerError::PermissionDenied("global authority check failed".to_owned()))?;
+        if is_local_operator {
+            return Ok(());
+        }
         let scoped_authorized = match scope_for_target(target) {
             Some(scope) => security
                 .authority
@@ -191,11 +221,10 @@ impl ControlServer {
                 })?,
             None => false,
         };
-
-        if is_local_operator || scoped_authorized {
+        if scoped_authorized {
             Ok(())
         } else {
-            Err(ServerError::PermissionDenied("not authorized".to_string()))
+            Err(ServerError::PermissionDenied("not authorized".to_owned()))
         }
     }
 
@@ -214,10 +243,10 @@ fn active_principal(
     let principal_state = security
         .principals
         .resolve_principal(principal)
-        .map_err(|_| ServerError::PermissionDenied("unauthenticated principal".to_string()))?;
+        .map_err(|_| ServerError::PermissionDenied("unauthenticated principal".to_owned()))?;
     if principal_state.status != PrincipalStatus::Active {
         return Err(ServerError::PermissionDenied(
-            "principal is not active".to_string(),
+            "principal is not active".to_owned(),
         ));
     }
     Ok(principal_state)
@@ -229,18 +258,15 @@ fn map_app_error(error: AppError) -> ServerError {
         AppError::NotFound(message) => ServerError::NotFound(message),
         AppError::Conflict(message) => ServerError::Conflict(message),
         AppError::GapDetected(_) => {
-            ServerError::InternalInvariant("subscription gap detected at boundary".to_string())
+            ServerError::InternalInvariant("subscription gap detected at boundary".to_owned())
         }
         AppError::Timeout(_) => {
-            ServerError::InternalInvariant("subscription timeout at boundary".to_string())
+            ServerError::InternalInvariant("subscription timeout at boundary".to_owned())
         }
         AppError::Internal(message) => ServerError::InternalInvariant(message),
     }
 }
 
-/// Project only targets whose P0 authority scope is unambiguous from the
-/// canonical target itself. Instance-global local operator authority is checked
-/// separately; unknown ownership never fabricates a fallback scope.
 fn scope_for_target(target: &CanonicalTarget) -> Option<ScopeSelector> {
     match target {
         CanonicalTarget::Bot { id, .. } => {
