@@ -9,8 +9,8 @@ use dxbot_core::DxbotError;
 use dxbot_core::types::ContentSource;
 use serde_json::{Map, Value, json};
 
-use crate::{CliInput, CommandMetadata, metadata_for_key};
 use crate::util;
+use crate::{CliInput, CommandMetadata, metadata_for_key};
 
 pub const MAX_CLI_TOKENS: usize = 4096;
 pub const MAX_CLI_TOKEN_BYTES: usize = 1024 * 1024;
@@ -86,7 +86,7 @@ fn bind_positionals(input: &mut CliInput, metadata: CommandMetadata) -> Result<(
 }
 
 fn can_bind_positional(input: &CliInput, spec: &FieldSpec) -> bool {
-    if spec.source == "local" || spec.source != "argv" || is_cas_field(&spec.name) {
+    if !is_user_source(&spec.source) || is_cas_field(&spec.name) {
         return false;
     }
     if is_selector_type(&spec.type_name) {
@@ -122,7 +122,7 @@ fn validate_required_fields(
     metadata: CommandMetadata,
 ) -> Result<(), DxbotError> {
     for spec in parse_field_specs(metadata.typed_fields) {
-        if !spec.required || spec.source != "argv" {
+        if !spec.required || !is_user_source(&spec.source) {
             continue;
         }
         let present = if is_selector_type(&spec.type_name) {
@@ -222,6 +222,10 @@ fn is_content_type(type_name: &str) -> bool {
     type_name.starts_with("ContentSource")
 }
 
+fn is_user_source(source: &str) -> bool {
+    matches!(source, "argv" | "oneof")
+}
+
 fn selector_kind(spec: &FieldSpec) -> String {
     match spec.type_name.as_str() {
         value if value.contains("BotSelector") => "bot".to_owned(),
@@ -263,10 +267,16 @@ fn parse_field_spec(raw: &str) -> Option<FieldSpec> {
         .trim()
         .trim_end_matches(['!', '?', '*', '+'])
         .to_owned();
+    let source = source
+        .trim()
+        .split(['{', '='])
+        .next()
+        .unwrap_or_default()
+        .to_owned();
     Some(FieldSpec {
         name: name.trim().to_owned(),
         type_name,
-        source: source.trim().to_owned(),
+        source,
         required,
     })
 }
@@ -279,7 +289,7 @@ fn split_top_level(source: &str) -> Vec<&str> {
         match ch {
             '<' | '[' | '(' | '{' => depth = depth.saturating_add(1),
             '>' | ']' | ')' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
+            ';' if depth == 0 => {
                 parts.push(&source[start..index]);
                 start = index + ch.len_utf8();
             }
@@ -312,7 +322,10 @@ mod tests {
         let input = parse_bound_input(&args(&["task-show", "task-a"]))
             .expect("task-show must bind positional selector");
         assert_eq!(input.selector_value().as_deref(), Some("task-a"));
-        assert_eq!(input.selector.as_ref().and_then(|value| value.get("kind")), Some(&json!("task")));
+        assert_eq!(
+            input.selector.as_ref().and_then(|value| value.get("kind")),
+            Some(&json!("task"))
+        );
     }
 
     #[test]
@@ -330,6 +343,18 @@ mod tests {
                 value: "hello".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn local_fields_do_not_consume_positionals() {
+        let input = parse_bound_input(&args(&[
+            "bot-list",
+            "50",
+            "cursor-a",
+        ]))
+        .expect("bot-list page arguments must skip local all flag");
+        assert_eq!(input.fields["page_size"], "50");
+        assert_eq!(input.fields["cursor"], "cursor-a");
     }
 
     #[test]
