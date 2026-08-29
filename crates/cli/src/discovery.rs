@@ -1,56 +1,24 @@
 //! CLI discovery: local help/version, exact Instance selection, and provider
 //! descriptor diagnostics.
 //!
-//! Discovery is a read/selection boundary, not a Runtime Host. It never
-//! fabricates a Runtime endpoint, authenticated peer, provider readiness, or
-//! first-Instance state. First-run bootstrap remains owned by the Runtime Host
-//! coordinator defined by DXB-RUN-035.
+//! Discovery is read-only from the CLI perspective. Runtime bootstrap owns the
+//! durable descriptor schema and publication; the CLI only selects and
+//! validates a published endpoint and never fabricates Runtime state.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::module_name_repetitions)]
 
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use application_contract::{LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_VERSION};
 use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
 use dxbot_core::types::{InstanceId, VersionInfo};
-use serde::{Deserialize, Serialize};
 
-pub const DISCOVERY_STATE_FILE: &str = "discovery.json";
+pub use runtime_bootstrap::{DISCOVERY_STATE_FILE, DiscoveryEndpoint, DiscoveryState};
+use runtime_bootstrap::bootstrap::Error as BootstrapError;
+use runtime_bootstrap::discovery_state_owner_uid;
+
 pub const REQUIRED_PROVIDER_CAPABILITIES: &[&str] = &["llm-chat", "embeddings", "auth"];
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiscoveryEndpoint {
-    pub instance_id: InstanceId,
-    pub profile: Option<String>,
-    pub endpoint: String,
-    pub host_generation: i64,
-    pub provider_id: String,
-    pub provider_ready: bool,
-}
-
-impl DiscoveryEndpoint {
-    #[cfg(unix)]
-    pub fn unix_socket_path(&self) -> Result<PathBuf, DiscoveryError> {
-        let path = self.endpoint.strip_prefix("unix://").ok_or_else(|| {
-            DiscoveryError::InvalidEndpoint {
-                message: format!("unsupported local endpoint scheme: {}", self.endpoint),
-            }
-        })?;
-        if path.is_empty() {
-            return Err(DiscoveryError::InvalidEndpoint {
-                message: "Unix endpoint path is empty".to_owned(),
-            });
-        }
-        Ok(PathBuf::from(path))
-    }
-}
 
 /// Selected descriptor plus the UID that owns the durable discovery record.
 /// The transport must verify that the live endpoint has the same owner.
@@ -60,64 +28,34 @@ pub struct SelectedEndpoint {
     pub state_owner_uid: u32,
 }
 
+impl SelectedEndpoint {
+    #[cfg(unix)]
+    pub fn unix_socket_path(&self) -> Result<PathBuf, DiscoveryError> {
+        let path = self
+            .descriptor
+            .endpoint
+            .strip_prefix("unix://")
+            .ok_or_else(|| DiscoveryError::InvalidEndpoint {
+                message: format!(
+                    "unsupported local endpoint scheme: {}",
+                    self.descriptor.endpoint
+                ),
+            })?;
+        if path.is_empty() {
+            return Err(DiscoveryError::InvalidEndpoint {
+                message: "Unix endpoint path is empty".to_owned(),
+            });
+        }
+        Ok(PathBuf::from(path))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderDiagnostic {
     pub provider_id: String,
     pub status: String,
     pub required_capabilities: Vec<String>,
     pub available: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiscoveryState {
-    pub instance_endpoints: HashMap<InstanceId, DiscoveryEndpoint>,
-}
-
-impl DiscoveryState {
-    pub fn load_state(base_path: &Path) -> Result<Self, DiscoveryError> {
-        let path = base_path.join(DISCOVERY_STATE_FILE);
-        let data = match fs::read(&path) {
-            Ok(data) => data,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Ok(Self {
-                    instance_endpoints: HashMap::new(),
-                });
-            }
-            Err(error) => return Err(DiscoveryError::state_io(&path, error)),
-        };
-        validate_state_file(&path)?;
-        serde_json::from_slice(&data).map_err(|error| DiscoveryError::StateIo {
-            path,
-            message: error.to_string(),
-        })
-    }
-
-    /// Persists only already-verified descriptors supplied by the Runtime Host
-    /// integration boundary. This method does not discover or verify peers.
-    pub fn save_state(&self, base_path: &Path) -> Result<(), DiscoveryError> {
-        fs::create_dir_all(base_path)
-            .map_err(|error| DiscoveryError::state_io(base_path, error))?;
-        harden_directory(base_path)?;
-        let path = base_path.join(DISCOVERY_STATE_FILE);
-        let tmp = base_path.join(format!("{DISCOVERY_STATE_FILE}.tmp"));
-        let bytes = serde_json::to_vec(self).map_err(|error| DiscoveryError::StateIo {
-            path: path.clone(),
-            message: error.to_string(),
-        })?;
-        {
-            let mut file = File::create(&tmp)
-                .map_err(|error| DiscoveryError::state_io(&tmp, error))?;
-            harden_file(&tmp)?;
-            file.write_all(&bytes)
-                .map_err(|error| DiscoveryError::state_io(&tmp, error))?;
-            file.sync_all()
-                .map_err(|error| DiscoveryError::state_io(&tmp, error))?;
-        }
-        fs::rename(&tmp, &path).map_err(|error| DiscoveryError::state_io(&tmp, error))?;
-        sync_directory(base_path)?;
-        validate_state_file(&path)?;
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,13 +69,6 @@ pub enum DiscoveryError {
 }
 
 impl DiscoveryError {
-    fn state_io(path: &Path, error: std::io::Error) -> Self {
-        Self::StateIo {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        }
-    }
-
     pub fn to_dxbot_error(&self) -> DxbotError {
         match self {
             Self::NoInstance { message } => dxbot_error(
@@ -276,8 +207,7 @@ Instance selection:
 
 Runtime bootstrap:
   First-Instance creation belongs to the Runtime Host coordinator. Discovery
-  never fabricates an endpoint or provider-ready descriptor. Until the
-  authenticated control path is connected, runtime operations fail closed.
+  never fabricates an endpoint or provider-ready descriptor.
 "
         .to_string()
     }
@@ -305,9 +235,8 @@ Runtime bootstrap:
         profile: Option<&str>,
         instance: Option<&str>,
     ) -> Result<SelectedEndpoint, DiscoveryError> {
-        let state = DiscoveryState::load_state(&self.base_path)?;
-        let state_file = self.base_path.join(DISCOVERY_STATE_FILE);
-        let owner_uid = discovery_owner_uid(&state_file)?;
+        let state = DiscoveryState::load_state(&self.base_path)
+            .map_err(|error| map_state_error(&self.base_path, error))?;
         let mut candidates: Vec<DiscoveryEndpoint> = if let Some(name) = instance {
             state
                 .instance_endpoints
@@ -331,9 +260,15 @@ Runtime bootstrap:
         if candidates.len() == 1 {
             let descriptor = candidates.remove(0);
             validate_descriptor(&descriptor)?;
+            let state_owner_uid = discovery_state_owner_uid(&self.base_path)
+                .map_err(|error| map_state_error(&self.base_path, error))?
+                .ok_or_else(|| DiscoveryError::StateIo {
+                    path: self.base_path.join(DISCOVERY_STATE_FILE),
+                    message: "selected descriptor has no durable discovery owner".to_owned(),
+                })?;
             return Ok(SelectedEndpoint {
                 descriptor,
-                state_owner_uid: owner_uid,
+                state_owner_uid,
             });
         }
         if candidates.is_empty() {
@@ -358,7 +293,8 @@ Runtime bootstrap:
     /// must perform atomic bootstrap and endpoint authentication, then publish
     /// the verified descriptor through the integration boundary.
     pub fn first_run_bootstrap(&self) -> Result<InstanceId, DiscoveryError> {
-        let state = DiscoveryState::load_state(&self.base_path)?;
+        let state = DiscoveryState::load_state(&self.base_path)
+            .map_err(|error| map_state_error(&self.base_path, error))?;
         if !state.instance_endpoints.is_empty() {
             return Err(DiscoveryError::BootstrapConflict {
                 existing: state.instance_endpoints.keys().cloned().collect(),
@@ -374,7 +310,8 @@ Runtime bootstrap:
         &self,
         instance_id: &InstanceId,
     ) -> Result<ProviderDiagnostic, DiscoveryError> {
-        let state = DiscoveryState::load_state(&self.base_path)?;
+        let state = DiscoveryState::load_state(&self.base_path)
+            .map_err(|error| map_state_error(&self.base_path, error))?;
         let descriptor = state
             .instance_endpoints
             .get(instance_id)
@@ -419,66 +356,17 @@ fn validate_descriptor(descriptor: &DiscoveryEndpoint) -> Result<(), DiscoveryEr
         });
     }
     #[cfg(unix)]
-    descriptor.unix_socket_path()?;
-    Ok(())
-}
-
-fn validate_state_file(path: &Path) -> Result<(), DiscoveryError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| DiscoveryError::state_io(path, error))?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        return Err(DiscoveryError::StateIo {
-            path: path.to_path_buf(),
-            message: "discovery state must be a direct regular file".to_owned(),
-        });
-    }
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(DiscoveryError::StateIo {
-            path: path.to_path_buf(),
-            message: "discovery state permissions must be owner-only".to_owned(),
+    if !descriptor.endpoint.starts_with("unix://") {
+        return Err(DiscoveryError::InvalidEndpoint {
+            message: format!("unsupported local endpoint scheme: {}", descriptor.endpoint),
         });
     }
     Ok(())
 }
 
-#[cfg(unix)]
-fn discovery_owner_uid(path: &Path) -> Result<u32, DiscoveryError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| DiscoveryError::state_io(path, error))?;
-    Ok(metadata.uid())
-}
-
-#[cfg(not(unix))]
-fn discovery_owner_uid(_path: &Path) -> Result<u32, DiscoveryError> {
-    Err(DiscoveryError::InvalidEndpoint {
-        message: "P0 local control discovery requires a Unix platform".to_owned(),
-    })
-}
-
-#[cfg(unix)]
-fn harden_directory(path: &Path) -> Result<(), DiscoveryError> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|error| DiscoveryError::state_io(path, error))
-}
-
-#[cfg(not(unix))]
-fn harden_directory(_path: &Path) -> Result<(), DiscoveryError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn harden_file(path: &Path) -> Result<(), DiscoveryError> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| DiscoveryError::state_io(path, error))
-}
-
-#[cfg(not(unix))]
-fn harden_file(_path: &Path) -> Result<(), DiscoveryError> {
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<(), DiscoveryError> {
-    let directory = File::open(path).map_err(|error| DiscoveryError::state_io(path, error))?;
-    directory
-        .sync_all()
-        .map_err(|error| DiscoveryError::state_io(path, error))
+fn map_state_error(base_path: &Path, error: BootstrapError) -> DiscoveryError {
+    DiscoveryError::StateIo {
+        path: base_path.join(DISCOVERY_STATE_FILE),
+        message: format!("{error:?}"),
+    }
 }
