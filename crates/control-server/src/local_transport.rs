@@ -1,8 +1,9 @@
 //! Owner-only Unix-domain control transport.
 //!
-//! P0 LocalPrincipal is derived server-side from Runtime Instance + peer UID.
-//! Every connection performs a version/generation handshake and then serves one
-//! bounded preflight/query/submit/recovery request.
+//! P0 LocalPrincipal is derived server-side from the Runtime Instance and the
+//! authenticated peer UID. The socket itself is owner-only and clients verify
+//! its owner/type/generation, but pathname permissions are not treated as peer
+//! identity. Same-UID process isolation is intentionally not claimed.
 
 #![cfg(unix)]
 
@@ -12,6 +13,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use application_contract::{
@@ -35,6 +37,7 @@ pub struct LocalControlServer {
     instance_id: InstanceId,
     host_generation: i64,
     owner_principal_ref: PrincipalRef,
+    shutdown_requested: Arc<AtomicBool>,
     control: Arc<ControlServer>,
 }
 
@@ -55,6 +58,7 @@ impl LocalControlServer {
         if let Some(parent) = endpoint_path.parent() {
             fs::create_dir_all(parent)?;
         }
+
         let listener = UnixListener::bind(&endpoint_path)?;
         fs::set_permissions(&endpoint_path, fs::Permissions::from_mode(SOCKET_MODE))?;
         let metadata = fs::symlink_metadata(&endpoint_path)?;
@@ -70,10 +74,12 @@ impl LocalControlServer {
                 "local control endpoint is not owner-only",
             ));
         }
+
         let owner_principal_ref = local_principal(&instance_id, metadata.uid());
         control
             .register_local_operator(&owner_principal_ref)
             .map_err(|error| io::Error::other(error.to_string()))?;
+
         Ok(Self {
             listener,
             endpoint_path,
@@ -82,6 +88,7 @@ impl LocalControlServer {
             instance_id,
             host_generation,
             owner_principal_ref,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             control,
         })
     }
@@ -95,10 +102,11 @@ impl LocalControlServer {
     }
 
     pub fn serve(&self) -> Result<(), io::Error> {
-        loop {
+        while !self.shutdown_requested.load(Ordering::Acquire) {
             let (stream, _) = self.listener.accept()?;
             let _ = self.handle_stream(stream);
         }
+        Ok(())
     }
 
     pub fn serve_one(&self) -> Result<(), io::Error> {
@@ -123,6 +131,7 @@ impl LocalControlServer {
                 return Ok(());
             }
         };
+
         if hello.instance_id != self.instance_id
             || hello.host_generation != self.host_generation
             || hello.protocol_version != LOCAL_CONTROL_PROTOCOL_VERSION
@@ -140,6 +149,7 @@ impl LocalControlServer {
             )?;
             return Ok(());
         }
+
         write_local_control_frame(
             &mut stream,
             &LocalControlResponse::Handshake {
@@ -154,9 +164,9 @@ impl LocalControlServer {
         )
         .map_err(codec_io)?;
 
-        let request = read_local_control_frame::<_, LocalControlRequest>(&mut stream)
+        let second = read_local_control_frame::<_, LocalControlRequest>(&mut stream)
             .map_err(codec_io)?;
-        match request {
+        match second {
             LocalControlRequest::Hello { .. } => write_error(
                 &mut stream,
                 protocol_error("duplicate local control handshake"),
@@ -178,17 +188,16 @@ impl LocalControlServer {
                 .map_err(codec_io),
                 Err(error) => write_error(&mut stream, error.to_dxbot_error()),
             },
-            LocalControlRequest::Query { payload } => match self
-                .control
-                .query(&authenticated_principal, &payload)
-            {
-                Ok(value) => write_local_control_frame(
-                    &mut stream,
-                    &LocalControlResponse::Data { value },
-                )
-                .map_err(codec_io),
-                Err(error) => write_error(&mut stream, error.to_dxbot_error()),
-            },
+            LocalControlRequest::Query { payload } => {
+                match self.control.query(&authenticated_principal, &payload) {
+                    Ok(value) => write_local_control_frame(
+                        &mut stream,
+                        &LocalControlResponse::Data { value },
+                    )
+                    .map_err(codec_io),
+                    Err(error) => write_error(&mut stream, error.to_dxbot_error()),
+                }
+            }
             LocalControlRequest::Submit { request } => {
                 if request.payload.instance_id != self.instance_id {
                     return write_error(
@@ -200,11 +209,18 @@ impl LocalControlServer {
                     .control
                     .handle_request(&authenticated_principal, &request)
                 {
-                    Ok(result) => write_local_control_frame(
-                        &mut stream,
-                        &LocalControlResponse::Operation { result },
-                    )
-                    .map_err(codec_io),
+                    Ok(result) => {
+                        if request.payload.command_key == "runtime-stop-graceful" {
+                            // Commit is authoritative. Even if the response is lost,
+                            // the host must honor the committed shutdown request.
+                            self.shutdown_requested.store(true, Ordering::Release);
+                        }
+                        write_local_control_frame(
+                            &mut stream,
+                            &LocalControlResponse::Operation { result },
+                        )
+                        .map_err(codec_io)
+                    }
                     Err(error) => write_error(&mut stream, error.to_dxbot_error()),
                 }
             }
@@ -223,6 +239,35 @@ impl LocalControlServer {
                 .map_err(codec_io),
                 Err(error) => write_error(&mut stream, error.to_dxbot_error()),
             },
+            LocalControlRequest::StopHost { host_generation } => {
+                if authenticated_principal != self.owner_principal_ref {
+                    return write_error(
+                        &mut stream,
+                        permission_error("host stop requires the endpoint owner principal"),
+                    );
+                }
+                if host_generation != self.host_generation {
+                    return write_error(
+                        &mut stream,
+                        incompatible_error(format!(
+                            "host generation fenced: expected {}, got {host_generation}",
+                            self.host_generation
+                        )),
+                    );
+                }
+                self.shutdown_requested.store(true, Ordering::Release);
+                write_local_control_frame(
+                    &mut stream,
+                    &LocalControlResponse::Data {
+                        value: serde_json::json!({
+                            "status": "stopped",
+                            "instance_id": self.instance_id,
+                            "host_generation": self.host_generation,
+                        }),
+                    },
+                )
+                .map_err(codec_io)
+            }
         }
     }
 }
@@ -291,17 +336,17 @@ fn write_error(stream: &mut UnixStream, error: DxbotError) -> Result<(), io::Err
 }
 
 fn protocol_error(message: impl Into<String>) -> DxbotError {
-    dxbot_error(
-        ErrorCode::InvalidInput,
-        ErrorCategory::Input,
-        message.into(),
-    )
+    dxbot_error(ErrorCode::InvalidInput, ErrorCategory::Input, message.into())
 }
 
 fn incompatible_error(message: impl Into<String>) -> DxbotError {
+    dxbot_error(ErrorCode::Incompatible, ErrorCategory::Conflict, message.into())
+}
+
+fn permission_error(message: impl Into<String>) -> DxbotError {
     dxbot_error(
-        ErrorCode::Incompatible,
-        ErrorCategory::Conflict,
+        ErrorCode::PermissionDenied,
+        ErrorCategory::Permission,
         message.into(),
     )
 }
