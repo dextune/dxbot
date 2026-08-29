@@ -41,13 +41,16 @@ pub enum LocalControlRequest {
         raw_selector: Option<serde_json::Value>,
     },
     Query { payload: CommandPayload },
+    WatchNext {
+        payload: CommandPayload,
+        cursor: Option<String>,
+        timeout_ms: u64,
+    },
     Submit { request: OperationRequest },
     LookupBinding {
         command_id: CommandId,
         idempotency_key: IdempotencyKey,
     },
-    /// Host action, not an Application Command. The generation supplied by the
-    /// client is checked against the live host generation before shutdown.
     StopHost { host_generation: i64 },
 }
 
@@ -184,6 +187,32 @@ mod tests {
                 key_digest: "key-a".to_owned(),
                 expires_at: 7,
             },
+        };
+        let mut bytes = Vec::new();
+        write_local_control_frame(&mut bytes, &request).expect("frame writes");
+        let decoded: LocalControlRequest =
+            read_local_control_frame(&mut bytes.as_slice()).expect("frame reads");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn watch_request_roundtrips() {
+        let request = LocalControlRequest::WatchNext {
+            payload: CommandPayload {
+                command_key: "task-watch".to_owned(),
+                principal_ref: PrincipalRef("principal".to_owned()),
+                instance_id: InstanceId("instance".to_owned()),
+                canonical_target: CanonicalTarget::Task {
+                    id: dxbot_core::types::TaskId("task".to_owned()),
+                    revision: 1,
+                    execution_generation: Some(1),
+                },
+                cas: None,
+                content: None,
+                semantic_options: serde_json::json!({}),
+            },
+            cursor: Some("1".to_owned()),
+            timeout_ms: 1000,
         };
         let mut bytes = Vec::new();
         write_local_control_frame(&mut bytes, &request).expect("frame writes");
