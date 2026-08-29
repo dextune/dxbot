@@ -6,6 +6,7 @@ pub mod persistence;
 pub mod outcome;
 pub mod query;
 pub mod interface;
+pub mod watch;
 pub mod subscription;
 pub mod membership;
 pub mod delegation;
