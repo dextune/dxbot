@@ -112,9 +112,12 @@ impl SecurityState {
     pub fn apply_delta(&mut self, delta: &SecurityDelta) -> Result<(), Error> {
         if let Some(membership) = &delta.membership {
             match membership {
-                MembershipBindingDelta::Upsert { binding } => {
+                MembershipBindingDelta::Upsert { binding } if binding.active => {
                     self.authority.apply_membership_binding(binding.clone())?;
                 }
+                MembershipBindingDelta::Upsert { binding } => self
+                    .authority
+                    .revoke_membership_binding(&binding.binding_id, binding.generation)?,
                 MembershipBindingDelta::Revoke {
                     binding_id,
                     expected_generation,
@@ -305,19 +308,23 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn membership_delta_is_idempotent_and_does_not_create_principal() {
-        let mut state = SecurityState::new();
-        let binding = MembershipAuthorityBinding {
+    fn membership_binding(generation: i64, active: bool) -> MembershipAuthorityBinding {
+        MembershipAuthorityBinding {
             binding_id: "member-a".to_owned(),
             scope: ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
                 "project-a".to_owned(),
             ))),
             member_bot: BotSelector::CanonicalId(BotId("bot-a".to_owned())),
             role: "member".to_owned(),
-            generation: 1,
-            active: true,
-        };
+            generation,
+            active,
+        }
+    }
+
+    #[test]
+    fn membership_delta_is_idempotent_and_does_not_create_principal() {
+        let mut state = SecurityState::new();
+        let binding = membership_binding(1, true);
         let delta = SecurityDelta {
             membership: Some(MembershipBindingDelta::Upsert {
                 binding: binding.clone(),
@@ -337,6 +344,32 @@ mod tests {
                 .resolve_principal(&PrincipalRef("bot:bot-a".to_owned()))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn inactive_upsert_is_generation_advancing_idempotent_revoke() {
+        let mut state = SecurityState::new();
+        state
+            .apply_delta(&SecurityDelta {
+                membership: Some(MembershipBindingDelta::Upsert {
+                    binding: membership_binding(1, true),
+                }),
+                approval: None,
+                audit_intent: None,
+            })
+            .expect("create binding");
+        let revoke = SecurityDelta {
+            membership: Some(MembershipBindingDelta::Upsert {
+                binding: membership_binding(1, false),
+            }),
+            approval: None,
+            audit_intent: None,
+        };
+        state.apply_delta(&revoke).expect("revoke");
+        state.apply_delta(&revoke).expect("replay revoke");
+        let tombstone = state.authority.membership_binding("member-a").expect("binding");
+        assert!(!tombstone.active);
+        assert_eq!(tombstone.generation, 2);
     }
 
     #[test]
