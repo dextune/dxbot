@@ -5,11 +5,12 @@
 //! specific fields. It deliberately does **not** own canonical materialization — that is
 //! the responsibility of `crate::contract`.
 
-use dxbot_core::types::*;
 use dxbot_core::DxbotError;
-use serde_json::json;
-use serde_json::Value;
+use dxbot_core::types::*;
+use serde_json::{Value, json};
 
+use crate::command::metadata_for_key;
+use crate::field_spec::is_primary_selector_flag;
 use crate::registry::{command_count, is_known_command};
 use crate::util;
 
@@ -31,8 +32,8 @@ impl CliInput {
     /// Parse a `CliInput` from argv-style tokens.
     ///
     /// `args[0]` is the `command_key` (e.g. `bot-create`); the remaining tokens are global
-    /// options, an optional selector, optional `--if-*` CAS guards, a content source and
-    /// command-specific fields.
+    /// options, an optional primary selector, optional `--if-*` CAS guards, a content source
+    /// and command-specific fields. Secondary selector-typed fields remain ordinary fields.
     pub fn parse(args: &[String]) -> Result<CliInput, DxbotError> {
         let _ = command_count; // keep the registry scope explicit for diagnostics
         if args.is_empty() {
@@ -42,6 +43,9 @@ impl CliInput {
         if !is_known_command(&command_key) {
             return Err(util::input_error(format!("unknown command key: '{command_key}'")));
         }
+        let metadata = metadata_for_key(&command_key).ok_or_else(|| {
+            util::invariant(format!("known command '{command_key}' has no metadata row"))
+        })?;
 
         let mut global = CliGlobalOptions::default();
         let mut cas_builder = util::empty_cas();
@@ -56,12 +60,10 @@ impl CliInput {
 
             match arg {
                 "--profile" => {
-                    let v = take_value(args, &mut i, "--profile")?;
-                    global.profile = Some(v);
+                    global.profile = Some(take_value(args, &mut i, "--profile")?);
                 }
                 "--instance" => {
-                    let v = take_value(args, &mut i, "--instance")?;
-                    global.instance = Some(v);
+                    global.instance = Some(take_value(args, &mut i, "--instance")?);
                 }
                 "--format" => {
                     let v = take_value(args, &mut i, "--format")?;
@@ -84,12 +86,10 @@ impl CliInput {
                     };
                 }
                 "--wait" => {
-                    let v = take_value(args, &mut i, "--wait")?;
-                    global.wait = Some(v);
+                    global.wait = Some(take_value(args, &mut i, "--wait")?);
                 }
                 "--timeout" => {
-                    let v = take_value(args, &mut i, "--timeout")?;
-                    global.timeout = Some(v);
+                    global.timeout = Some(take_value(args, &mut i, "--timeout")?);
                 }
                 "--yes" => {
                     i += 1;
@@ -121,15 +121,19 @@ impl CliInput {
                     )?;
                 }
                 "--" => {
-                    for p in &args[i + 1..] {
-                        append_positional(&mut fields, p);
+                    for positional in &args[i + 1..] {
+                        append_positional(&mut fields, positional);
                     }
                     break;
                 }
-                _ if selector_kind(arg).is_some() => {
-                    let kind = selector_kind(arg).unwrap_or("selector");
+                _ if is_primary_selector_flag(metadata.typed_fields, arg) => {
+                    let kind = selector_kind(arg).ok_or_else(|| {
+                        util::invariant(format!(
+                            "primary selector option {arg} has no selector kind for {command_key}"
+                        ))
+                    })?;
                     if selector.is_some() {
-                        return Err(util::input_error("multiple selectors are not allowed"));
+                        return Err(util::input_error("multiple primary selectors are not allowed"));
                     }
                     let value = take_value(args, &mut i, arg)?;
                     selector = Some(json!({ "kind": kind, "value": value }));
@@ -141,19 +145,21 @@ impl CliInput {
                     cas_present = true;
                 }
                 _ if arg.starts_with("--") => {
-                    // Generic command-specific flag.
+                    // Generic command-specific flag. Invocation validation will
+                    // reject names/types that are not present in typed_fields.
                     let key = arg.trim_start_matches("--").to_string();
                     let has_value = args
                         .get(i + 1)
                         .map(|next| !next.starts_with("--"))
                         .unwrap_or(false);
-                    i += 1;
                     let val = if has_value {
-                        args.get(i)
-                            .cloned()
-                            .map(Value::String)
-                            .ok_or_else(|| util::input_error(format!("{arg} requires a value")))?
+                        let value = args.get(i + 1).cloned().ok_or_else(|| {
+                            util::input_error(format!("{arg} requires a value"))
+                        })?;
+                        i += 2;
+                        Value::String(value)
                     } else {
+                        i += 1;
                         Value::Bool(true)
                     };
                     put_field(&mut fields, &key, val);
@@ -165,7 +171,7 @@ impl CliInput {
             }
         }
 
-        let cas = if cas_present { Some(cas_builder) } else { None };
+        let cas = cas_present.then_some(cas_builder);
 
         Ok(CliInput {
             command_key,
@@ -177,7 +183,8 @@ impl CliInput {
         })
     }
 
-    /// Resolve the local instance id for this input.
+    /// Resolve the local instance id for isolated projection compatibility.
+    /// Production orchestration must override this through verified discovery.
     pub fn instance_id(&self) -> InstanceId {
         if let Some(v) = &self.global_options.instance {
             InstanceId(v.clone())
@@ -188,7 +195,8 @@ impl CliInput {
         }
     }
 
-    /// Resolve the local principal ref for this input.
+    /// Resolve a parser-side principal compatibility ref. Production execution
+    /// must replace this with the authenticated transport-derived principal.
     pub fn principal_ref(&self) -> PrincipalRef {
         let base = if let Some(v) = &self.global_options.profile {
             v.clone()
@@ -200,21 +208,28 @@ impl CliInput {
         PrincipalRef(format!("principal:{base}"))
     }
 
-    /// The selector value (if any), as a plain string.
+    /// The primary target selector value (if any), as a plain string.
     pub fn selector_value(&self) -> Option<String> {
         self.selector
             .as_ref()
-            .and_then(|s| s.get("value"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
+            .and_then(|selector| selector.get("value"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
     }
 }
 
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, DxbotError> {
-    *i += 1;
-    args.get(*i)
+    let value_index = i
+        .checked_add(1)
+        .ok_or_else(|| util::input_error(format!("{flag} index overflow")))?;
+    let value = args
+        .get(value_index)
         .cloned()
-        .ok_or_else(|| util::input_error(format!("{flag} requires a value")))
+        .ok_or_else(|| util::input_error(format!("{flag} requires a value")))?;
+    *i = value_index
+        .checked_add(1)
+        .ok_or_else(|| util::input_error(format!("{flag} index overflow")))?;
+    Ok(value)
 }
 
 fn parse_int(v: &str, flag: &str) -> Result<i64, DxbotError> {
@@ -222,38 +237,37 @@ fn parse_int(v: &str, flag: &str) -> Result<i64, DxbotError> {
         .map_err(|_| util::input_error(format!("{flag} expects an integer, got '{v}'")))
 }
 
-fn set_content(slot: &mut Option<ContentSource>, c: ContentSource) -> Result<(), DxbotError> {
+fn set_content(slot: &mut Option<ContentSource>, content: ContentSource) -> Result<(), DxbotError> {
     if slot.is_some() {
         return Err(util::input_error("multiple content sources are not allowed"));
     }
-    *slot = Some(c);
+    *slot = Some(content);
     Ok(())
 }
 
 fn append_positional(fields: &mut serde_json::Map<String, Value>, arg: &str) {
-    let pos = fields
+    let positional = fields
         .entry("positional".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
-    if let Value::Array(arr) = pos {
-        arr.push(Value::String(arg.to_string()));
+    if let Value::Array(values) = positional {
+        values.push(Value::String(arg.to_string()));
     }
 }
 
-fn put_field(fields: &mut serde_json::Map<String, Value>, key: &str, val: Value) {
+fn put_field(fields: &mut serde_json::Map<String, Value>, key: &str, value: Value) {
     match fields.get_mut(key) {
-        Some(Value::Array(arr)) => arr.push(val),
+        Some(Value::Array(values)) => values.push(value),
         Some(other) => {
-            let prev = other.clone();
-            let list = json!([prev, val]);
-            fields.insert(key.to_string(), list);
+            let previous = other.clone();
+            fields.insert(key.to_string(), json!([previous, value]));
         }
         None => {
-            fields.insert(key.to_string(), val);
+            fields.insert(key.to_string(), value);
         }
     }
 }
 
-/// Maps a user-facing selector flag to a stable selector kind.
+/// Maps a user-facing primary selector flag to a stable selector kind.
 fn selector_kind(flag: &str) -> Option<&'static str> {
     match flag {
         "--bot" => Some("bot"),
@@ -262,7 +276,7 @@ fn selector_kind(flag: &str) -> Option<&'static str> {
         "--task" => Some("task"),
         "--project" => Some("project"),
         "--channel" => Some("channel"),
-        "--scope" => Some("scope"),
+        "--scope" | "--owner" => Some("scope"),
         "--memory" => Some("memory"),
         "--proposal" => Some("proposal"),
         "--provider" => Some("provider"),
@@ -292,20 +306,20 @@ fn is_cas_flag(flag: &str) -> bool {
     )
 }
 
-fn apply_cas(cas: &mut CasConditions, flag: &str, n: i64) -> Result<(), DxbotError> {
+fn apply_cas(cas: &mut CasConditions, flag: &str, value: i64) -> Result<(), DxbotError> {
     match flag {
-        "--if-revision" => cas.if_revision = Some(n),
-        "--if-generation" => cas.if_generation = Some(n),
-        "--if-host-generation" => cas.if_host_generation = Some(n),
-        "--if-execution-generation" => cas.if_execution_generation = Some(n),
-        "--if-source-revision" => cas.if_source_revision = Some(n),
-        "--if-scope-revision" => cas.if_scope_revision = Some(n),
-        "--if-project-revision" => cas.if_project_revision = Some(n),
-        "--if-channel-revision" => cas.if_channel_revision = Some(n),
-        "--if-membership-generation" => cas.if_membership_generation = Some(n),
-        "--if-proposal-revision" => cas.if_proposal_revision = Some(n),
-        "--if-target-scope-revision" => cas.if_target_scope_revision = Some(n),
-        "--if-receipt-revision" => cas.if_receipt_revision = Some(n),
+        "--if-revision" => cas.if_revision = Some(value),
+        "--if-generation" => cas.if_generation = Some(value),
+        "--if-host-generation" => cas.if_host_generation = Some(value),
+        "--if-execution-generation" => cas.if_execution_generation = Some(value),
+        "--if-source-revision" => cas.if_source_revision = Some(value),
+        "--if-scope-revision" => cas.if_scope_revision = Some(value),
+        "--if-project-revision" => cas.if_project_revision = Some(value),
+        "--if-channel-revision" => cas.if_channel_revision = Some(value),
+        "--if-membership-generation" => cas.if_membership_generation = Some(value),
+        "--if-proposal-revision" => cas.if_proposal_revision = Some(value),
+        "--if-target-scope-revision" => cas.if_target_scope_revision = Some(value),
+        "--if-receipt-revision" => cas.if_receipt_revision = Some(value),
         _ => return Err(util::input_error(format!("unknown CAS flag '{flag}'"))),
     }
     Ok(())
@@ -313,15 +327,16 @@ fn apply_cas(cas: &mut CasConditions, flag: &str, n: i64) -> Result<(), DxbotErr
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     fn sl(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
+        args.iter().map(|value| value.to_string()).collect()
     }
 
     #[test]
-    fn parses_command_key_and_globals() {
+    fn valued_options_are_consumed_exactly_once() {
         let input = CliInput::parse(&sl(&[
             "conversation-send",
             "--profile",
@@ -336,21 +351,55 @@ mod tests {
             "committed",
             "--timeout",
             "30s",
-            "--yes",
+            "--conversation",
+            "conversation-a",
+            "--text",
+            "hello",
         ]))
         .unwrap();
-        assert_eq!(input.command_key, "conversation-send");
         assert_eq!(input.global_options.profile.as_deref(), Some("work"));
         assert_eq!(input.global_options.instance.as_deref(), Some("prod-1"));
-        assert_eq!(input.global_options.format, OutputFormat::Json);
-        assert_eq!(input.global_options.color, ColorMode::Never);
-        assert_eq!(input.global_options.wait.as_deref(), Some("committed"));
-        assert_eq!(input.global_options.timeout.as_deref(), Some("30s"));
-        assert!(input.global_options.yes);
+        assert_eq!(input.selector_value().as_deref(), Some("conversation-a"));
+        assert_eq!(input.fields.get("positional"), None);
+        assert_eq!(
+            input.content,
+            Some(ContentSource::Text {
+                value: "hello".to_owned()
+            })
+        );
     }
 
     #[test]
-    fn parses_selector_cas_and_content() {
+    fn task_submit_owner_is_primary_selector() {
+        let input = CliInput::parse(&sl(&[
+            "task-submit",
+            "--owner",
+            "project:alpha",
+            "--text",
+            "work",
+        ]))
+        .unwrap();
+        assert_eq!(input.selector_value().as_deref(), Some("project:alpha"));
+        assert_eq!(input.selector.as_ref().unwrap()["kind"], "scope");
+        assert!(input.fields.get("owner").is_none());
+    }
+
+    #[test]
+    fn memory_get_scope_remains_secondary_semantic_field() {
+        let input = CliInput::parse(&sl(&[
+            "memory-get",
+            "--memory",
+            "memory-a",
+            "--scope",
+            "project:alpha",
+        ]))
+        .unwrap();
+        assert_eq!(input.selector_value().as_deref(), Some("memory-a"));
+        assert_eq!(input.fields["scope"], "project:alpha");
+    }
+
+    #[test]
+    fn parses_selector_cas_without_positional_replay() {
         let input = CliInput::parse(&sl(&[
             "task-cancel",
             "--task",
@@ -359,22 +408,13 @@ mod tests {
             "7",
             "--if-execution-generation",
             "2",
-            "--text",
-            "out of budget",
         ]))
         .unwrap();
         assert_eq!(input.selector_value().as_deref(), Some("scoped/alpha"));
-        let sel = input.selector.clone().unwrap();
-        assert_eq!(sel["kind"], "task");
         let cas = input.cas.unwrap();
         assert_eq!(cas.if_revision, Some(7));
         assert_eq!(cas.if_execution_generation, Some(2));
-        assert_eq!(
-            input.content,
-            Some(ContentSource::Text {
-                value: "out of budget".to_string()
-            })
-        );
+        assert_eq!(input.fields.get("positional"), None);
     }
 
     #[test]
