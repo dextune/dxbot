@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use application::ApplicationMutator;
 use control_server::{ControlServer, SecurityState, ServerError};
 use dxbot_core::types::{
-    BotId, CanonicalTarget, CommandId, CommandPayload, IdempotencyKey, InstanceId, OperationId,
-    OperationRequest, PrincipalRef, RequestDigest,
+    BotId, CanonicalTarget, CasConditions, CommandId, CommandPayload, IdempotencyKey, InstanceId,
+    OperationId, OperationRequest, PrincipalRef, RequestDigest,
 };
 use provider_host::{ProviderHost, ReferenceProvider};
 use serde_json::json;
@@ -17,7 +17,13 @@ fn principal() -> PrincipalRef {
     PrincipalRef("local:instance-a:uid:1000".to_owned())
 }
 
-fn request(command: &str, sequence: &str, target: CanonicalTarget, fields: serde_json::Value) -> OperationRequest {
+fn request(
+    command: &str,
+    sequence: &str,
+    target: CanonicalTarget,
+    cas: Option<CasConditions>,
+    fields: serde_json::Value,
+) -> OperationRequest {
     OperationRequest {
         command_id: CommandId(format!("command-{sequence}")),
         idempotency_key: IdempotencyKey {
@@ -32,10 +38,27 @@ fn request(command: &str, sequence: &str, target: CanonicalTarget, fields: serde
             principal_ref: principal(),
             instance_id: InstanceId("instance-a".to_owned()),
             canonical_target: target,
-            cas: None,
+            cas,
             content: None,
             semantic_options: fields,
         },
+    }
+}
+
+fn revision_cas(revision: i64) -> CasConditions {
+    CasConditions {
+        if_revision: Some(revision),
+        if_generation: None,
+        if_host_generation: None,
+        if_execution_generation: None,
+        if_source_revision: None,
+        if_scope_revision: None,
+        if_project_revision: None,
+        if_channel_revision: None,
+        if_membership_generation: None,
+        if_proposal_revision: None,
+        if_target_scope_revision: None,
+        if_receipt_revision: None,
     }
 }
 
@@ -55,7 +78,13 @@ fn bot_activation_fails_closed_without_ready_llm_provider() {
     server
         .handle_request(
             &principal(),
-            &request("bot-create", "create", instance, json!({"name": "alpha"})),
+            &request(
+                "bot-create",
+                "create",
+                instance,
+                None,
+                json!({"name": "alpha"}),
+            ),
         )
         .expect("identity creation does not require provider");
 
@@ -69,6 +98,7 @@ fn bot_activation_fails_closed_without_ready_llm_provider() {
                     id: BotId("alpha".to_owned()),
                     revision: 1,
                 },
+                Some(revision_cas(1)),
                 json!({}),
             ),
         )
@@ -94,7 +124,13 @@ fn ready_llm_provider_allows_activation_owner_path() {
     server
         .handle_request(
             &principal(),
-            &request("bot-create", "create-ready", instance, json!({"name": "alpha"})),
+            &request(
+                "bot-create",
+                "create-ready",
+                instance,
+                None,
+                json!({"name": "alpha"}),
+            ),
         )
         .expect("create bot");
 
@@ -108,6 +144,7 @@ fn ready_llm_provider_allows_activation_owner_path() {
                     id: BotId("alpha".to_owned()),
                     revision: 1,
                 },
+                Some(revision_cas(1)),
                 json!({}),
             ),
         )
