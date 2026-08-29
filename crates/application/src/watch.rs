@@ -25,7 +25,9 @@ impl ApplicationMutator {
         timeout: Duration,
     ) -> Result<Value, AppError> {
         if timeout.is_zero() {
-            return Err(AppError::Conflict("watch timeout must be non-zero".to_owned()));
+            return Err(AppError::Conflict(
+                "watch timeout must be non-zero".to_owned(),
+            ));
         }
         let requested = parse_cursor(cursor)?;
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
@@ -35,10 +37,9 @@ impl ApplicationMutator {
             let state = self.snapshot()?;
             let observation = match (&payload.canonical_target, payload.command_key.as_str()) {
                 (CanonicalTarget::Task { id, .. }, "task-watch") => {
-                    let row = state
-                        .tasks
-                        .get(id)
-                        .ok_or_else(|| AppError::NotFound(format!("task {} does not exist", id.0)))?;
+                    let row = state.tasks.get(id).ok_or_else(|| {
+                        AppError::NotFound(format!("task {} does not exist", id.0))
+                    })?;
                     Observation {
                         revision: row.revision,
                         terminal: task_terminal(row.status),
@@ -148,7 +149,9 @@ fn parse_cursor(cursor: Option<&str>) -> Result<Option<i64>, AppError> {
                 .map_err(|_| AppError::Conflict(format!("invalid watch cursor: {value}")))
                 .and_then(|revision| {
                     if revision < 0 {
-                        Err(AppError::Conflict("watch cursor must be non-negative".to_owned()))
+                        Err(AppError::Conflict(
+                            "watch cursor must be non-negative".to_owned(),
+                        ))
                     } else {
                         Ok(revision)
                     }
@@ -214,6 +217,9 @@ mod tests {
                 status: TaskStatus::Running,
                 intent: None,
                 result: None,
+                constraints: Default::default(),
+                control_history: Vec::new(),
+                process_ref: None,
             },
         );
         let app = ApplicationMutator::with_state(state);

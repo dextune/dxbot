@@ -263,8 +263,8 @@ mod tests {
         };
 
         let secret = SafeAttribute::new(SafeAttributeKey::Observed, "token=secret-value");
-        assert!(sink
-            .emit(
+        assert!(
+            sink.emit(
                 DiagnosticComponent::ProviderHost,
                 "provider-a",
                 DiagnosticFamily::ProviderProtocol,
@@ -272,9 +272,10 @@ mod tests {
                 DiagnosticSeverity::Error,
                 &[secret],
             )
-            .is_ok());
-        assert!(sink
-            .emit(
+            .is_ok()
+        );
+        assert!(
+            sink.emit(
                 DiagnosticComponent::RuntimeHost,
                 "runtime",
                 DiagnosticFamily::RuntimeLifecycle,
@@ -282,9 +283,10 @@ mod tests {
                 DiagnosticSeverity::Warning,
                 &[],
             )
-            .is_ok());
-        assert!(sink
-            .emit(
+            .is_ok()
+        );
+        assert!(
+            sink.emit(
                 DiagnosticComponent::Storage,
                 "store",
                 DiagnosticFamily::StorageRecovery,
@@ -292,7 +294,8 @@ mod tests {
                 DiagnosticSeverity::Info,
                 &[],
             )
-            .is_ok());
+            .is_ok()
+        );
 
         let events = sink.events();
         assert!(events.is_ok());

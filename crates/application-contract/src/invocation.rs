@@ -42,17 +42,17 @@ fn validate_argv_bounds(args: &[String]) -> Result<(), DxbotError> {
     if args.len() > MAX_CLI_TOKENS {
         return Err(util::input_error(format!(
             "too many CLI tokens: {} > {}",
-            args.len(), MAX_CLI_TOKENS
+            args.len(),
+            MAX_CLI_TOKENS
         )));
     }
-    if let Some((index, token)) = args
+    if let Some((index, _)) = args
         .iter()
         .enumerate()
         .find(|(_, token)| token.len() > MAX_CLI_TOKEN_BYTES)
     {
         return Err(util::input_error(format!(
-            "CLI token {index} exceeds {} bytes",
-            MAX_CLI_TOKEN_BYTES
+            "CLI token {index} exceeds {MAX_CLI_TOKEN_BYTES} bytes"
         )));
     }
     Ok(())
@@ -69,9 +69,7 @@ fn bind_positionals(input: &mut CliInput, metadata: CommandMetadata) -> Result<(
 
     let mut next = 0usize;
     for value in positionals {
-        while next < specs.len()
-            && !can_bind_positional(input, &specs[next], primary_selector)
-        {
+        while next < specs.len() && !can_bind_positional(input, &specs[next], primary_selector) {
             next += 1;
         }
         let Some(spec) = specs.get(next) else {
@@ -88,11 +86,7 @@ fn bind_positionals(input: &mut CliInput, metadata: CommandMetadata) -> Result<(
     Ok(())
 }
 
-fn can_bind_positional(
-    input: &CliInput,
-    spec: &FieldSpec,
-    primary_selector: Option<&str>,
-) -> bool {
+fn can_bind_positional(input: &CliInput, spec: &FieldSpec, primary_selector: Option<&str>) -> bool {
     if !is_user_source(&spec.source) || is_cas_field(&spec.name) {
         return false;
     }
@@ -120,7 +114,9 @@ fn bind_one(
     }
     if is_content_type(&spec.type_name) {
         if input.content.is_some() {
-            return Err(util::input_error("multiple content sources are not allowed"));
+            return Err(util::input_error(
+                "multiple content sources are not allowed",
+            ));
         }
         input.content = Some(ContentSource::Text { value });
         return Ok(());
@@ -279,21 +275,15 @@ fn validate_scalar(spec: &FieldSpec, value: &Value) -> Result<(), DxbotError> {
 }
 
 fn numeric_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, DxbotError> {
-    value.as_str().ok_or_else(|| {
-        util::input_error(format!("field '{field}' expects a numeric string value"))
-    })
+    value
+        .as_str()
+        .ok_or_else(|| util::input_error(format!("field '{field}' expects a numeric string value")))
 }
 
 fn is_numeric_contract_type(type_name: &str) -> bool {
     matches!(
         type_name,
-        "Revision"
-            | "Generation"
-            | "HostGeneration"
-            | "Sequence"
-            | "Limit"
-            | "Count"
-            | "Percent"
+        "Revision" | "Generation" | "HostGeneration" | "Sequence" | "Limit" | "Count" | "Percent"
     )
 }
 
@@ -301,7 +291,11 @@ fn validate_wait(input: &CliInput, metadata: CommandMetadata) -> Result<(), Dxbo
     let Some(wait) = input.global_options.wait.as_deref() else {
         return Ok(());
     };
-    if metadata.wait_allowed.split(',').any(|allowed| allowed == wait) {
+    if metadata
+        .wait_allowed
+        .split(',')
+        .any(|allowed| allowed == wait)
+    {
         Ok(())
     } else {
         Err(util::input_error(format!(
@@ -437,12 +431,8 @@ mod tests {
 
     #[test]
     fn conversation_send_binds_selector_and_text_content() {
-        let input = parse_bound_input(&args(&[
-            "conversation-send",
-            "conversation-a",
-            "hello",
-        ]))
-        .expect("conversation-send must bind selector and content");
+        let input = parse_bound_input(&args(&["conversation-send", "conversation-a", "hello"]))
+            .expect("conversation-send must bind selector and content");
         assert_eq!(input.selector_value().as_deref(), Some("conversation-a"));
         assert_eq!(
             input.content,
@@ -478,13 +468,8 @@ mod tests {
 
     #[test]
     fn secondary_semantic_selector_binds_as_a_field() {
-        let input = parse_bound_input(&args(&[
-            "task-submit",
-            "project-a",
-            "do work",
-            "bot-a",
-        ]))
-        .expect("task-submit must retain delegated bot as semantic field");
+        let input = parse_bound_input(&args(&["task-submit", "project-a", "do work", "bot-a"]))
+            .expect("task-submit must retain delegated bot as semantic field");
         assert_eq!(input.selector_value().as_deref(), Some("project-a"));
         assert_eq!(input.fields["delegate_to_bot"], "bot-a");
     }
@@ -506,10 +491,8 @@ mod tests {
 
     #[test]
     fn singular_duplicate_is_rejected() {
-        let error = parse_bound_input(&args(&[
-            "bot-create", "--name", "alpha", "--name", "beta",
-        ]))
-        .expect_err("duplicate singular field must fail closed");
+        let error = parse_bound_input(&args(&["bot-create", "--name", "alpha", "--name", "beta"]))
+            .expect_err("duplicate singular field must fail closed");
         assert!(error.message.contains("more than once"));
     }
 
@@ -537,23 +520,15 @@ mod tests {
 
     #[test]
     fn hyphenated_named_fields_are_normalized_to_registry_names() {
-        let input = parse_bound_input(&args(&[
-            "runtime-start",
-            "--ready-at",
-            "control",
-        ]))
-        .expect("runtime-start flag must normalize");
+        let input = parse_bound_input(&args(&["runtime-start", "--ready-at", "control"]))
+            .expect("runtime-start flag must normalize");
         assert_eq!(input.fields["ready_at"], "control");
     }
 
     #[test]
     fn true_presence_flag_rejects_explicit_false_value() {
-        let error = parse_bound_input(&args(&[
-            "runtime-stop-host",
-            "--host-stop",
-            "false",
-        ]))
-        .expect_err("True field cannot accept false");
+        let error = parse_bound_input(&args(&["runtime-stop-host", "--host-stop", "false"]))
+            .expect_err("True field cannot accept false");
         assert!(error.message.contains("presence flag"));
     }
 

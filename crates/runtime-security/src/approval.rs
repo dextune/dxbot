@@ -176,12 +176,7 @@ impl ApprovalManager {
     ) -> Result<ApprovalRecord, Error> {
         let current = self.get_approval(approval_id)?;
         if current.revision == expected_revision {
-            return self.decide_approval_if_revision(
-                approval_id,
-                expected_revision,
-                decision,
-                by,
-            );
+            return self.decide_approval_if_revision(approval_id, expected_revision, decision, by);
         }
         if current.revision == expected_revision.saturating_add(1)
             && current

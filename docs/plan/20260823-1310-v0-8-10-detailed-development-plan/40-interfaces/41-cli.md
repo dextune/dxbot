@@ -6,7 +6,7 @@ status: "Accepted"
 normative: true
 priority: "P0"
 last_updated: "2026-08-23"
-depends_on: ["DXB-IFC-040", "DXB-IFC-042", "DXB-IFC-043", "DXB-RUN-035"]
+depends_on: ["DXB-IFC-040", "DXB-IFC-042", "DXB-RUN-035"]
 ---
 # CLI Reference Interface와 P0 Operation Registry
 

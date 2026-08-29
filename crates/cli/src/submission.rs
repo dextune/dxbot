@@ -64,7 +64,10 @@ pub fn submit_or_recover(
     let candidates = recovery_candidates(records, &digest.0, &principal.0);
     if candidates.len() > 1 {
         return Err(SubmissionFlowError::AmbiguousRecovery(
-            candidates.iter().map(|record| record.command_id.clone()).collect(),
+            candidates
+                .iter()
+                .map(|record| record.command_id.clone())
+                .collect(),
         ));
     }
 
@@ -90,15 +93,14 @@ fn recover_existing(
 ) -> Result<OperationResult, SubmissionFlowError> {
     let remote = match record.state {
         JournalState::Prepared => None,
-        JournalState::Dispatching | JournalState::Observed => local_client
-            .lookup_binding(&record.command_id, &record.idempotency_key)?,
+        JournalState::Dispatching | JournalState::Observed => {
+            local_client.lookup_binding(&record.command_id, &record.idempotency_key)?
+        }
         JournalState::Terminal | JournalState::Abandoned => None,
     };
 
     if record.state == JournalState::Prepared && remote.is_some() {
-        return Err(SubmissionFlowError::PreparedAlreadyBound(
-            record.command_id,
-        ));
+        return Err(SubmissionFlowError::PreparedAlreadyBound(record.command_id));
     }
     if record.state == JournalState::Observed && remote.is_none() {
         return Err(SubmissionFlowError::ObservedBindingMissing(
@@ -137,7 +139,10 @@ fn recovery_candidates(
     for record in latest.into_values() {
         if record.request_digest.0 != digest
             || record.idempotency_key.principal_ref.0 != principal
-            || matches!(record.state, JournalState::Terminal | JournalState::Abandoned)
+            || matches!(
+                record.state,
+                JournalState::Terminal | JournalState::Abandoned
+            )
         {
             continue;
         }
@@ -151,9 +156,7 @@ fn recovery_candidates(
 
 #[cfg(test)]
 mod tests {
-    use dxbot_core::types::{
-        IdempotencyKey, InstanceId, OperationId, PrincipalRef, RequestDigest,
-    };
+    use dxbot_core::types::{IdempotencyKey, InstanceId, OperationId, PrincipalRef, RequestDigest};
 
     use super::*;
 

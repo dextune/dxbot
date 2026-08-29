@@ -2,7 +2,7 @@
 title: "DeepSeek v4 Flash 0731 Adapter — 첫 Real Provider 구현"
 document_id: "DXB-PRV-001"
 version: "0.8.11"
-status: "Draft"
+status: "Accepted"
 normative: true
 priority: "P0"
 last_updated: "2026-08-23"

@@ -6,8 +6,6 @@
 //! composition, control-server composition, and discovery publication. The CLI
 //! only spawns/contacts this owner.
 
-#![cfg(unix)]
-
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -15,9 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use application::ApplicationMutator;
-use control_server::{
-    ControlServer, LocalControlServer, SecurityCoordinationStore, SecurityState,
-};
+use control_server::{ControlServer, LocalControlServer, SecurityCoordinationStore, SecurityState};
 use dxbot_core::types::InstanceId;
 use fs2::FileExt;
 use provider_host::ProviderHost;
@@ -94,6 +90,13 @@ impl LocalRuntimeHost {
             SecurityStateStore::open(runtime_root.join(SECURITY_STATE_FILE)).map_err(|error| {
                 io::Error::other(format!("cannot restore Security state: {error}"))
             })?;
+        let mut security_state = security_state;
+        // Consume the first-init manifest and register the derived local
+        // operator into the canonical Security registry. Bootstrap owns the
+        // initialization decision; the Security PrincipalManager remains the
+        // canonical owner of principal state. Registration is idempotent across
+        // restarts.
+        register_owner_principal(&bootstrap, &security_store, &mut security_state)?;
         let security: Arc<Mutex<SecurityState>> = Arc::new(Mutex::new(security_state));
         let coordination_store = Arc::new(SecurityCoordinationStore::new(
             runtime_root.join(SECURITY_COORDINATION_FILE),
@@ -171,13 +174,14 @@ impl Drop for LocalRuntimeHost {
         let Ok(mut state) = DiscoveryState::load_state(&self.discovery_root) else {
             return;
         };
-        let should_remove = state
-            .instance_endpoints
-            .get(&self.instance_id)
-            .is_some_and(|endpoint| {
-                endpoint.host_generation == self.host_generation
-                    && endpoint.endpoint == self.endpoint_uri
-            });
+        let should_remove =
+            state
+                .instance_endpoints
+                .get(&self.instance_id)
+                .is_some_and(|endpoint| {
+                    endpoint.host_generation == self.host_generation
+                        && endpoint.endpoint == self.endpoint_uri
+                });
         if should_remove {
             state.instance_endpoints.remove(&self.instance_id);
             let _ = state.save_state(&self.discovery_root);
@@ -208,6 +212,43 @@ fn open_host_lock(path: &Path) -> Result<File, io::Error> {
     };
     fs::set_permissions(path, fs::Permissions::from_mode(OWNER_FILE_MODE))?;
     Ok(file)
+}
+
+/// Register the derived local operator described by the first-init manifest
+/// into the canonical Security `PrincipalManager`. Idempotent: an already
+/// registered owner is left untouched and no needless persist occurs.
+fn register_owner_principal(
+    bootstrap: &RuntimeBootstrap,
+    security_store: &SecurityStateStore,
+    security_state: &mut SecurityState,
+) -> Result<(), io::Error> {
+    let manifest = bootstrap.load_manifest().map_err(bootstrap_io)?;
+    let owner_ref = manifest.owner.principal_ref.clone();
+    let principal_exists = security_state
+        .principals
+        .resolve_principal(&owner_ref)
+        .is_ok();
+    let operator_bound = security_state
+        .authority
+        .check_global_authority(&owner_ref, "operator")
+        .map_err(|error| io::Error::other(format!("cannot inspect owner authority: {error}")))?;
+    if principal_exists && operator_bound {
+        return Ok(());
+    }
+    if !principal_exists {
+        security_state
+            .principals
+            .register_principal(owner_ref.clone())
+            .map_err(|error| {
+                io::Error::other(format!("cannot register owner principal: {error}"))
+            })?;
+    }
+    security_state
+        .authority
+        .bind_global_authority(&owner_ref, "operator")
+        .map_err(|error| io::Error::other(format!("cannot bind owner authority: {error}")))?;
+    security_store.persist(security_state)?;
+    Ok(())
 }
 
 fn publish_discovery(root: &Path, endpoint: DiscoveryEndpoint) -> Result<(), io::Error> {

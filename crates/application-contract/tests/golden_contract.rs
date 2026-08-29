@@ -11,7 +11,10 @@ use std::path::Path;
 #[test]
 fn golden_contract_snapshot_is_stable() {
     let snapshot = GoldenContract::generate_snapshot();
-    assert!(!snapshot.is_empty(), "generated snapshot must never be empty");
+    assert!(
+        !snapshot.is_empty(),
+        "generated snapshot must never be empty"
+    );
 
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("golden");
     let golden_path = dir.join("contract-snapshot-v1.json");
@@ -31,7 +34,8 @@ fn golden_contract_snapshot_is_stable() {
 
     // Exact diff against the stored golden file.
     assert_eq!(
-        expected, snapshot,
+        expected,
+        snapshot,
         "golden contract snapshot drifted from generator output; \
          regenerate {} from GoldenContract::generate_snapshot()",
         golden_path.display()

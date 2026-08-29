@@ -16,6 +16,12 @@ use sha2::{Digest, Sha256};
 
 const MAX_EXECUTION_ID_BYTES: usize = 96;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// `ETXTBSY` (text file busy) errno on Linux/Android: a freshly published
+/// runtime artifact can briefly report this on `execve`.
+const ETXTBSY: i32 = 26;
+/// Bounded retries for a transient `ETXTBSY` on sandbox spawn.
+const MAX_SPAWN_TEXT_BUSY_RETRIES: u32 = 50;
+const SPAWN_TEXT_BUSY_BACKOFF: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxError {
@@ -229,7 +235,8 @@ impl LocalSubprocessSandbox {
             Err(error) => return Err(io_error(error)),
         }
 
-        let spawn = Command::new(spec.runtime_artifact.path())
+        let mut command = Command::new(spec.runtime_artifact.path());
+        command
             .args(args)
             .current_dir(&workspace)
             .env_clear()
@@ -242,8 +249,26 @@ impl LocalSubprocessSandbox {
             )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+
+        // A runtime artifact that was just published can transiently fail
+        // `execve` with `ETXTBSY` (text file busy) until the publisher's write
+        // handle close fully propagates. Retry a bounded number of times with a
+        // short backoff; any other spawn error is surfaced immediately.
+        let mut attempts = 0_u32;
+        let spawn = loop {
+            match command.spawn() {
+                Ok(child) => break Ok(child),
+                Err(error)
+                    if error.raw_os_error() == Some(ETXTBSY)
+                        && attempts < MAX_SPAWN_TEXT_BUSY_RETRIES =>
+                {
+                    attempts = attempts.saturating_add(1);
+                    thread::sleep(SPAWN_TEXT_BUSY_BACKOFF);
+                }
+                Err(error) => break Err(error),
+            }
+        };
 
         let child = match spawn {
             Ok(child) => child,
@@ -366,7 +391,8 @@ impl LocalSubprocessSandbox {
         requester_owner: &str,
         requester_generation: i64,
     ) -> Result<(), SandboxError> {
-        if requester_owner != self.owner_instance_id || requester_owner != handle.owner_instance_id {
+        if requester_owner != self.owner_instance_id || requester_owner != handle.owner_instance_id
+        {
             return Err(SandboxError::Unowned {
                 expected: handle.owner_instance_id.clone(),
                 provided: requester_owner.to_owned(),
@@ -593,11 +619,8 @@ mod tests {
         let sandbox = LocalSubprocessSandbox::new("instance-1", 7, &workspace_root);
 
         let cancelled = AtomicBool::new(true);
-        let result = sandbox.run_with_control(
-            &spec(artifact.clone(), "exec-cancel"),
-            &[],
-            &cancelled,
-        );
+        let result =
+            sandbox.run_with_control(&spec(artifact.clone(), "exec-cancel"), &[], &cancelled);
         assert!(result.is_ok());
         assert_eq!(
             result.map(|value| value.terminal),

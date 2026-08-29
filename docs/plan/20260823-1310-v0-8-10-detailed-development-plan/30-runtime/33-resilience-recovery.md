@@ -6,7 +6,7 @@ status: "Accepted"
 normative: true
 priority: "P0"
 last_updated: "2026-08-23"
-depends_on: ["DXB-RUN-030", "DXB-ARC-015", "DXB-IFC-043"]
+depends_on: ["DXB-RUN-030", "DXB-ARC-015"]
 ---
 # 오류·복구·회복성과 사용자 재진입
 

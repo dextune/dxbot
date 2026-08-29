@@ -4,8 +4,6 @@
 //! HostGeneration and the server-derived local Principal are then bound by the
 //! versioned handshake before preflight, query, watch, host action, submit or recovery lookup.
 
-#![cfg(unix)]
-
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -87,12 +85,14 @@ impl LocalControlClient {
             },
         )
         .map_err(codec_error)?;
-        match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
+        match read_local_control_frame::<_, LocalControlResponse>(&mut stream)
+            .map_err(codec_error)?
+        {
             LocalControlResponse::Preflight {
                 canonical_target,
                 cas,
             } => Ok((canonical_target, cas)),
-            LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(Box::new(error))),
             _ => Err(ClientError::Transport(
                 "unexpected response after preflight".to_owned(),
             )),
@@ -109,9 +109,11 @@ impl LocalControlClient {
             },
         )
         .map_err(codec_error)?;
-        match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
+        match read_local_control_frame::<_, LocalControlResponse>(&mut stream)
+            .map_err(codec_error)?
+        {
             LocalControlResponse::Data { value } => Ok(value),
-            LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(Box::new(error))),
             _ => Err(ClientError::Transport(
                 "unexpected response after query".to_owned(),
             )),
@@ -138,9 +140,11 @@ impl LocalControlClient {
             },
         )
         .map_err(codec_error)?;
-        match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
+        match read_local_control_frame::<_, LocalControlResponse>(&mut stream)
+            .map_err(codec_error)?
+        {
             LocalControlResponse::Data { value } => Ok(value),
-            LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(Box::new(error))),
             _ => Err(ClientError::Transport(
                 "unexpected response after watch".to_owned(),
             )),
@@ -160,9 +164,11 @@ impl LocalControlClient {
             &LocalControlRequest::StopHost { host_generation },
         )
         .map_err(codec_error)?;
-        match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
+        match read_local_control_frame::<_, LocalControlResponse>(&mut stream)
+            .map_err(codec_error)?
+        {
             LocalControlResponse::Data { value } => Ok(value),
-            LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(Box::new(error))),
             _ => Err(ClientError::Transport(
                 "unexpected response after host stop".to_owned(),
             )),
@@ -195,9 +201,11 @@ impl LocalControlClient {
             },
         )
         .map_err(codec_error)?;
-        match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
+        match read_local_control_frame::<_, LocalControlResponse>(&mut stream)
+            .map_err(codec_error)?
+        {
             LocalControlResponse::Operation { result } => Ok(result),
-            LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(Box::new(error))),
             _ => Err(ClientError::Transport(
                 "unexpected response after operation submit".to_owned(),
             )),
@@ -223,9 +231,11 @@ impl LocalControlClient {
             },
         )
         .map_err(codec_error)?;
-        match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
+        match read_local_control_frame::<_, LocalControlResponse>(&mut stream)
+            .map_err(codec_error)?
+        {
             LocalControlResponse::Binding { result } => Ok(result),
-            LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(Box::new(error))),
             _ => Err(ClientError::Transport(
                 "unexpected response after binding lookup".to_owned(),
             )),
@@ -249,11 +259,13 @@ impl LocalControlClient {
             },
         )
         .map_err(codec_error)?;
-        let response =
-            read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)?;
+        let response = read_local_control_frame::<_, LocalControlResponse>(&mut stream)
+            .map_err(codec_error)?;
         let handshake = match response {
             LocalControlResponse::Handshake { handshake } => handshake,
-            LocalControlResponse::Error { error } => return Err(ClientError::Remote(error)),
+            LocalControlResponse::Error { error } => {
+                return Err(ClientError::Remote(Box::new(error)));
+            }
             _ => {
                 return Err(ClientError::Transport(
                     "non-handshake response received before handshake".to_owned(),
@@ -312,8 +324,7 @@ impl LocalControlClient {
         let mode = metadata.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             return Err(ClientError::Transport(format!(
-                "control endpoint permissions are not owner-only: {:o}",
-                mode
+                "control endpoint permissions are not owner-only: {mode:o}"
             )));
         }
         Ok(())

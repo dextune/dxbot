@@ -32,10 +32,7 @@ pub enum StreamEvent {
         percent: Option<u8>,
     },
     /// A diagnostic message with a machine-understandable level.
-    Diagnostic {
-        level: String,
-        message: String,
-    },
+    Diagnostic { level: String, message: String },
     /// The terminal OperationResult record completing the stream.
     Terminal(Box<OperationResult>),
 }
@@ -91,7 +88,8 @@ impl MachineRenderer {
 
     /// Renders a single complete JSON result document (one valid JSON value).
     pub fn render_json(&self, result: &OperationResult) -> String {
-        serde_json::to_string(result).unwrap_or_else(|e| self.render_serialize_failure(e.to_string()))
+        serde_json::to_string(result)
+            .unwrap_or_else(|e| self.render_serialize_failure(e.to_string()))
     }
 
     /// Renders a JSONL stream: one JSON line per event, terminal record last.
@@ -152,7 +150,8 @@ impl MachineRenderer {
     /// `command_key`, and typed `args`. The stable schema is never a raw shell
     /// command string.
     pub fn render_next_action(&self, action: &TypedNextAction) -> String {
-        serde_json::to_string(action).unwrap_or_else(|e| self.render_serialize_failure(e.to_string()))
+        serde_json::to_string(action)
+            .unwrap_or_else(|e| self.render_serialize_failure(e.to_string()))
     }
 
     /// Renders the full typed next-action set as a JSON array of documents.
@@ -194,11 +193,9 @@ fn project_cli_error(error: &DxbotError) -> DxbotError {
         )],
         ErrorCode::ApprovalRequired => approval_action(&projected).into_iter().collect(),
         ErrorCode::RecoveryRequired => recovery_actions(&projected),
-        ErrorCode::Incompatible => vec![action(
-            "inspect-version",
-            "version",
-            serde_json::json!({}),
-        )],
+        ErrorCode::Incompatible => {
+            vec![action("inspect-version", "version", serde_json::json!({}))]
+        }
         ErrorCode::PartialOrResync => projected
             .resume_cursor
             .as_ref()
@@ -244,11 +241,7 @@ fn recovery_actions(error: &DxbotError) -> Vec<TypedNextAction> {
     actions
 }
 
-fn action(
-    action_code: &str,
-    command_key: &str,
-    args: serde_json::Value,
-) -> TypedNextAction {
+fn action(action_code: &str, command_key: &str, args: serde_json::Value) -> TypedNextAction {
     TypedNextAction {
         action_code: action_code.to_owned(),
         command_key: command_key.to_owned(),
@@ -306,7 +299,8 @@ mod tests {
     #[test]
     fn provider_failure_gets_typed_doctor_action() {
         let renderer = MachineRenderer::new();
-        let rendered = renderer.render_error(&error(ErrorCode::ProviderUnavailable), OutputFormat::Json);
+        let rendered =
+            renderer.render_error(&error(ErrorCode::ProviderUnavailable), OutputFormat::Json);
         let value: serde_json::Value = serde_json::from_str(&rendered).expect("json");
         assert_eq!(value["next_actions"][0]["command_key"], "runtime-doctor");
         assert_eq!(value["next_actions"][0]["args"]["section"], "provider");

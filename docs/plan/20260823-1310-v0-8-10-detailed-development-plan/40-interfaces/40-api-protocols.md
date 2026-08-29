@@ -6,7 +6,7 @@ status: "Accepted"
 normative: true
 priority: "P0"
 last_updated: "2026-08-23"
-depends_on: ["DXB-DOM-026", "DXB-DOM-027", "DXB-DOM-028", "DXB-DOM-029", "DXB-RUN-032", "DXB-RUN-033", "DXB-RUN-036", "DXB-RUN-038", "DXB-ARC-014", "DXB-ARC-015", "DXB-IFC-043"]
+depends_on: ["DXB-DOM-026", "DXB-DOM-027", "DXB-DOM-028", "DXB-DOM-029", "DXB-RUN-032", "DXB-RUN-033", "DXB-RUN-036", "DXB-RUN-038", "DXB-ARC-014", "DXB-ARC-015"]
 ---
 # Headless Application Contract와 사용자 안전 submission
 

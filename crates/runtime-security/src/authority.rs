@@ -204,17 +204,33 @@ mod tests {
     fn registration_does_not_imply_global_authority() {
         let manager = AuthorityManager::new();
         let principal = PrincipalRef("local:i:uid:1000".to_owned());
-        assert!(!manager.check_global_authority(&principal, "operator").unwrap());
+        assert!(
+            !manager
+                .check_global_authority(&principal, "operator")
+                .unwrap()
+        );
     }
 
     #[test]
     fn global_authority_is_explicit_and_revocable() {
         let mut manager = AuthorityManager::new();
         let principal = PrincipalRef("local:i:uid:1000".to_owned());
-        manager.bind_global_authority(&principal, "operator").unwrap();
-        assert!(manager.check_global_authority(&principal, "operator").unwrap());
-        manager.revoke_global_authority(&principal, "operator").unwrap();
-        assert!(!manager.check_global_authority(&principal, "operator").unwrap());
+        manager
+            .bind_global_authority(&principal, "operator")
+            .unwrap();
+        assert!(
+            manager
+                .check_global_authority(&principal, "operator")
+                .unwrap()
+        );
+        manager
+            .revoke_global_authority(&principal, "operator")
+            .unwrap();
+        assert!(
+            !manager
+                .check_global_authority(&principal, "operator")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -244,11 +260,18 @@ mod tests {
         manager
             .apply_membership_binding(membership_binding(4, true))
             .unwrap();
-        manager.revoke_membership_binding("membership-1", 4).unwrap();
+        manager
+            .revoke_membership_binding("membership-1", 4)
+            .unwrap();
         let tombstone = manager.membership_binding("membership-1").unwrap();
         assert!(!tombstone.active);
         assert_eq!(tombstone.generation, 5);
-        manager.revoke_membership_binding("membership-1", 4).unwrap();
-        assert_eq!(manager.membership_binding("membership-1").unwrap(), tombstone);
+        manager
+            .revoke_membership_binding("membership-1", 4)
+            .unwrap();
+        assert_eq!(
+            manager.membership_binding("membership-1").unwrap(),
+            tombstone
+        );
     }
 }

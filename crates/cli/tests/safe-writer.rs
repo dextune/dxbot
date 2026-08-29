@@ -24,10 +24,7 @@ fn temp_base() -> TempDir {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "dxbot-safewriter-{}-{nanos}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("dxbot-safewriter-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     TempDir(dir)
 }
@@ -40,9 +37,7 @@ fn writer() -> SafeWriter {
 fn safe_writer_atomic_no_replace_creates_file() {
     let base = temp_base();
     let path = base.as_path().join("out.bin");
-    writer()
-        .write_to_path(&path, b"hello world", true)
-        .unwrap();
+    writer().write_to_path(&path, b"hello world", true).unwrap();
 
     assert_eq!(fs::read(&path).unwrap(), b"hello world");
 
@@ -82,7 +77,9 @@ fn safe_writer_bounded_write_truncates_at_max_bytes() {
     // Bounds equal to the content length write everything (fresh path; the
     // first write already published to `path` and is no-replace).
     let full_path = base.as_path().join("bounded_full.bin");
-    let full = writer().write_bounded(&full_path, &content[..5], 5).unwrap();
+    let full = writer()
+        .write_bounded(&full_path, &content[..5], 5)
+        .unwrap();
     assert_eq!(full, 5);
     assert_eq!(fs::read(&full_path).unwrap(), &content[..5]);
 }
@@ -112,7 +109,9 @@ fn safe_writer_no_follow_refuses_symlink() {
 fn safe_writer_fsyncs_before_rename() {
     let base = temp_base();
     let path = base.as_path().join("durable.bin");
-    writer().write_to_path(&path, b"durable payload", true).unwrap();
+    writer()
+        .write_to_path(&path, b"durable payload", true)
+        .unwrap();
 
     // A written artifact is durably present with the exact bytes.
     assert!(path.exists());

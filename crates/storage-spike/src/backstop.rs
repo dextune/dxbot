@@ -79,7 +79,10 @@ impl fmt::Display for BackstopError {
             Self::InvalidBudget => formatter.write_str("invalid backstop budget"),
             Self::SinkFailed => formatter.write_str("backstop sink failed"),
             Self::SchemaMismatch { snapshot, current } => {
-                write!(formatter, "backstop schema mismatch: snapshot={snapshot}, current={current}")
+                write!(
+                    formatter,
+                    "backstop schema mismatch: snapshot={snapshot}, current={current}"
+                )
             }
         }
     }
@@ -233,11 +236,10 @@ impl BackstopCoordinator {
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
         verify_writer_fence(&transaction, &instance_id, host_generation)?;
 
-        let source_watermark: i64 = transaction.query_row(
-            "SELECT COALESCE(MAX(sequence), 0) FROM events",
-            [],
-            |row| row.get(0),
-        )?;
+        let source_watermark: i64 =
+            transaction.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |row| {
+                row.get(0)
+            })?;
         if self.last_source_watermark == Some(source_watermark) {
             transaction.commit()?;
             self.last_capture_at = Some(now);
@@ -249,7 +251,8 @@ impl BackstopCoordinator {
             return Ok(BackstopCaptureOutcome::SkippedNoChange);
         }
 
-        let schema_version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let schema_version: i64 =
+            transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let (item_count, estimated_bytes): (i64, i64) = transaction.query_row(
             "SELECT COUNT(*), COALESCE(SUM(\
                  length(aggregate_id) + length(state_value) + length(last_operation_id) + 8\
@@ -354,7 +357,10 @@ impl BackstopCoordinator {
 
 impl BackstopSnapshot {
     /// Produces a bounded restore plan only. No state is applied here.
-    pub fn dry_run_restore(&self, current_schema: i64) -> Result<BackstopRestorePlan, BackstopError> {
+    pub fn dry_run_restore(
+        &self,
+        current_schema: i64,
+    ) -> Result<BackstopRestorePlan, BackstopError> {
         if self.schema_version != current_schema {
             return Err(BackstopError::SchemaMismatch {
                 snapshot: self.schema_version,
@@ -406,6 +412,7 @@ fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 

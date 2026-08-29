@@ -30,10 +30,7 @@ fn temp_base() -> TempDir {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "dxbot-recovery-{}-{nanos}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("dxbot-recovery-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     TempDir(dir)
 }
@@ -105,12 +102,7 @@ fn set_mtime(path: &Path, time: SystemTime) {
     file.set_modified(time).unwrap();
 }
 
-fn prepare_on_disk(
-    base: &Path,
-    instance_id: &InstanceId,
-    command_id: &str,
-    request_digest: &str,
-) {
+fn prepare_on_disk(base: &Path, instance_id: &InstanceId, command_id: &str, request_digest: &str) {
     let mut journal = LocalJournal::open(instance_id.clone(), base).unwrap();
     journal
         .append_prepared(&prepared_record(
@@ -132,9 +124,7 @@ fn dispatch_on_disk(
     let key = record.idempotency_key.clone();
     let mut journal = LocalJournal::open(instance_id.clone(), base).unwrap();
     journal.append_prepared(&record).unwrap();
-    journal
-        .dispatch(&CommandId(command_id.to_owned()))
-        .unwrap();
+    journal.dispatch(&CommandId(command_id.to_owned())).unwrap();
     key
 }
 
@@ -179,10 +169,7 @@ fn recovery_stale_different_prepared_becomes_prune_eligible() {
         .join(&inst.0)
         .join("operations")
         .join("cmd-stale.jsonl");
-    set_mtime(
-        &path,
-        SystemTime::now() - Duration::from_secs(7200),
-    );
+    set_mtime(&path, SystemTime::now() - Duration::from_secs(7200));
 
     let recovery = RecoveryManager::new(Arc::new(Mutex::new(
         LocalJournal::open(inst, base.as_path()).unwrap(),
@@ -200,12 +187,7 @@ fn recovery_stale_different_prepared_becomes_prune_eligible() {
 fn recovery_dispatching_validates_returned_binding_identity() {
     let base = temp_base();
     let inst = instance("i3");
-    dispatch_on_disk(
-        base.as_path(),
-        &inst,
-        "cmd-existing",
-        "req-existing",
-    );
+    dispatch_on_disk(base.as_path(), &inst, "cmd-existing", "req-existing");
     let journal = Arc::new(Mutex::new(
         LocalJournal::open(inst.clone(), base.as_path()).unwrap(),
     ));
@@ -313,12 +295,7 @@ fn recovery_pruning_respects_retention_before_capacity() {
     let operations = base.as_path().join(&inst.0).join("operations");
 
     for index in 0..4 {
-        prepare_on_disk(
-            base.as_path(),
-            &inst,
-            &format!("prep-{index}"),
-            "req",
-        );
+        prepare_on_disk(base.as_path(), &inst, &format!("prep-{index}"), "req");
     }
     let now = SystemTime::now();
     for index in 0..3 {
@@ -346,12 +323,7 @@ fn recovery_pruning_respects_retention_before_capacity() {
     assert_eq!(recovery.scan_journal().unwrap().len(), 1);
 
     for index in 5..7 {
-        prepare_on_disk(
-            base.as_path(),
-            &inst,
-            &format!("prep-{index}"),
-            "req",
-        );
+        prepare_on_disk(base.as_path(), &inst, &format!("prep-{index}"), "req");
     }
     let fresh_pressure = PrunePolicy {
         min_retention_seconds: 3600,

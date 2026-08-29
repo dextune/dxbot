@@ -27,6 +27,13 @@ use crate::transport::{HttpTransport, TransportBuildError};
 const MAX_REFERENCE_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_REFERENCE_OUTPUT_ITEMS: usize = 256;
 const SUBPROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// `ETXTBSY` (text file busy) errno on Linux/Android. A freshly published
+/// executable can briefly report this until the writer's close propagates.
+const ETXTBSY: i32 = 26;
+/// Bounded retries for a transient `ETXTBSY` on spawn before treating it as a
+/// hard transport failure.
+const MAX_SPAWN_TEXT_BUSY_RETRIES: u32 = 50;
+const SPAWN_TEXT_BUSY_BACKOFF: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy)]
 pub struct CredentialMaterial<'a> {
@@ -177,7 +184,10 @@ impl ReferenceAdapter for HttpReferenceAdapter {
     ) -> Result<ConformanceOutcome, ConformanceError> {
         validate_request(request)?;
         if request.cancellation.is_cancelled() {
-            self.emit(DiagnosticReason::ProviderCancelled, DiagnosticSeverity::Info);
+            self.emit(
+                DiagnosticReason::ProviderCancelled,
+                DiagnosticSeverity::Info,
+            );
             return Err(ConformanceError::Cancelled);
         }
 
@@ -254,7 +264,12 @@ impl SubprocessReferenceAdapter {
     }
 
     fn emit(&self, reason: DiagnosticReason, severity: DiagnosticSeverity) {
-        emit_provider_diagnostic(self.diagnostics.as_ref(), "subprocess-reference", reason, severity);
+        emit_provider_diagnostic(
+            self.diagnostics.as_ref(),
+            "subprocess-reference",
+            reason,
+            severity,
+        );
     }
 }
 
@@ -265,7 +280,10 @@ impl ReferenceAdapter for SubprocessReferenceAdapter {
     ) -> Result<ConformanceOutcome, ConformanceError> {
         validate_request(request)?;
         if request.cancellation.is_cancelled() {
-            self.emit(DiagnosticReason::ProviderCancelled, DiagnosticSeverity::Info);
+            self.emit(
+                DiagnosticReason::ProviderCancelled,
+                DiagnosticSeverity::Info,
+            );
             return Err(ConformanceError::Cancelled);
         }
         if let Some(credential) = request.credential {
@@ -283,9 +301,31 @@ impl ReferenceAdapter for SubprocessReferenceAdapter {
         if let Some(credential) = request.credential {
             command.env("DXBOT_REFERENCE_CREDENTIAL", credential.secret());
         }
-        let mut child = command
-            .spawn()
-            .map_err(|_| ConformanceError::TransportUnavailable)?;
+        // A provider executable that was published very recently can transiently
+        // fail `execve` with `ETXTBSY` (text file busy, errno 26 on Linux/Android)
+        // while the writer's close propagates. Retry a bounded number of times
+        // with a short backoff; any other spawn error is a genuine transport
+        // failure and is surfaced immediately.
+        let mut child = {
+            let mut attempts = 0_u32;
+            loop {
+                match command.spawn() {
+                    Ok(child) => break child,
+                    Err(error)
+                        if error.raw_os_error() == Some(ETXTBSY)
+                            && attempts < MAX_SPAWN_TEXT_BUSY_RETRIES =>
+                    {
+                        if request.cancellation.is_cancelled() {
+                            return Err(ConformanceError::Cancelled);
+                        }
+                        attempts = attempts.saturating_add(1);
+                        thread::sleep(SPAWN_TEXT_BUSY_BACKOFF);
+                        continue;
+                    }
+                    Err(_) => return Err(ConformanceError::TransportUnavailable),
+                }
+            }
+        };
 
         if let Some(mut stdin) = child.stdin.take() {
             if stdin.write_all(request.prompt.as_bytes()).is_err() {
@@ -304,7 +344,10 @@ impl ReferenceAdapter for SubprocessReferenceAdapter {
             if request.cancellation.is_cancelled() {
                 let _ = child.kill();
                 let _ = child.wait();
-                self.emit(DiagnosticReason::ProviderCancelled, DiagnosticSeverity::Info);
+                self.emit(
+                    DiagnosticReason::ProviderCancelled,
+                    DiagnosticSeverity::Info,
+                );
                 return Err(ConformanceError::Cancelled);
             }
             if Instant::now() >= deadline {
@@ -351,7 +394,12 @@ impl ReferenceAdapter for SubprocessReferenceAdapter {
 
 impl HttpReferenceAdapter {
     fn emit(&self, reason: DiagnosticReason, severity: DiagnosticSeverity) {
-        emit_provider_diagnostic(self.diagnostics.as_ref(), "http-reference", reason, severity);
+        emit_provider_diagnostic(
+            self.diagnostics.as_ref(),
+            "http-reference",
+            reason,
+            severity,
+        );
     }
 }
 
@@ -404,7 +452,8 @@ fn normalize_provider_events(
 }
 
 fn normalize_usage(usage: UsageInfo) -> NormalizedUsage {
-    if usage.prompt_tokens == 0 && usage.completion_tokens == 0 && usage.reasoning_tokens.is_none() {
+    if usage.prompt_tokens == 0 && usage.completion_tokens == 0 && usage.reasoning_tokens.is_none()
+    {
         return NormalizedUsage {
             input_units: None,
             output_units: None,
@@ -525,9 +574,7 @@ fn parse_usage_source(value: &str) -> Result<UsageSource, ConformanceError> {
     }
 }
 
-fn malformed(
-    diagnostics: Option<&DiagnosticSink>,
-) -> Result<ConformanceOutcome, ConformanceError> {
+fn malformed(diagnostics: Option<&DiagnosticSink>) -> Result<ConformanceOutcome, ConformanceError> {
     emit_provider_diagnostic(
         diagnostics,
         "subprocess-reference",
@@ -586,7 +633,10 @@ fn emit_provider_diagnostic(
     let Some(sink) = diagnostics else {
         return;
     };
-    let attributes = [SafeAttribute::new(SafeAttributeKey::ProviderId, provider_id)];
+    let attributes = [SafeAttribute::new(
+        SafeAttributeKey::ProviderId,
+        provider_id,
+    )];
     let _ = sink.emit(
         DiagnosticComponent::ProviderHost,
         provider_id,
@@ -621,7 +671,11 @@ mod tests {
             required_action_grant: None,
             action_grants: &grants,
         };
-        let parsed = parse_subprocess_frames("text\thello\nusage\t3\t5\testimated\ndone\n", &request, None);
+        let parsed = parse_subprocess_frames(
+            "text\thello\nusage\t3\t5\testimated\ndone\n",
+            &request,
+            None,
+        );
         assert!(parsed.is_ok());
         let Ok(parsed) = parsed else {
             return;

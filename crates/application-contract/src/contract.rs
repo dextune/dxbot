@@ -266,6 +266,7 @@ fn field_string(input: &CliInput, name: &str) -> Result<String, DxbotError> {
         .fields
         .get(name)
         .and_then(ValueExt::as_string)
+        .map(str::to_owned)
         .ok_or_else(|| util::input_error(format!("{} requires field '{name}'", input.command_key)))
 }
 
@@ -297,15 +298,15 @@ fn preflight_queries(command: &str, input: &CliInput, cas: &CasConditions) -> Ve
     if required_revision_missing(command, cas) {
         queries.push(format!("resolve-revision:{command}:{selector}"));
     }
-    if matches!(command, "task-cancel" | "task-suspend")
-        && cas.if_execution_generation.is_none()
-    {
+    if matches!(command, "task-cancel" | "task-suspend") && cas.if_execution_generation.is_none() {
         queries.push(format!("resolve-execution-generation:{command}:{selector}"));
     }
     if matches!(command, "project-member-remove" | "channel-member-remove")
         && cas.if_membership_generation.is_none()
     {
-        queries.push(format!("resolve-membership-generation:{command}:{selector}"));
+        queries.push(format!(
+            "resolve-membership-generation:{command}:{selector}"
+        ));
     }
     queries.sort();
     queries.dedup();
@@ -318,10 +319,20 @@ fn is_canonical_like(value: &str) -> bool {
 
 fn required_revision_missing(command: &str, cas: &CasConditions) -> bool {
     match command {
-        "bot-activate" | "bot-deactivate" | "bot-archive" | "bot-restore"
-        | "conversation-send" | "thread-create" | "thread-send" | "task-cancel"
-        | "task-suspend" | "task-resume" | "task-redirect" | "approval-approve"
-        | "approval-deny" | "side-effect-reconcile" => cas.if_revision.is_none(),
+        "bot-activate"
+        | "bot-deactivate"
+        | "bot-archive"
+        | "bot-restore"
+        | "conversation-send"
+        | "thread-create"
+        | "thread-send"
+        | "task-cancel"
+        | "task-suspend"
+        | "task-resume"
+        | "task-redirect"
+        | "approval-approve"
+        | "approval-deny"
+        | "side-effect-reconcile" => cas.if_revision.is_none(),
         "thread-branch" => cas.if_source_revision.is_none(),
         "task-submit" | "memory-propose" => cas.if_scope_revision.is_none(),
         "memory-promote" => {
@@ -360,7 +371,10 @@ mod tests {
         ]))
         .expect("input parses");
         let target = TargetMaterialization::from_cli_input(&input).expect("target projects");
-        assert!(matches!(target.canonical_target, CanonicalTarget::Instance(_)));
+        assert!(matches!(
+            target.canonical_target,
+            CanonicalTarget::Instance(_)
+        ));
     }
 
     #[test]
@@ -374,7 +388,10 @@ mod tests {
         ]))
         .expect("input parses");
         let target = TargetMaterialization::from_cli_input(&input).expect("target projects");
-        assert!(matches!(target.canonical_target, CanonicalTarget::Project { .. }));
+        assert!(matches!(
+            target.canonical_target,
+            CanonicalTarget::Project { .. }
+        ));
     }
 
     #[test]
@@ -383,10 +400,11 @@ mod tests {
             .expect("input parses");
         let target = TargetMaterialization::from_cli_input(&input).expect("target projects");
         let plan = target.plan_preflight(&input);
-        assert!(plan
-            .queries
-            .iter()
-            .any(|query| query.starts_with("resolve-target:")));
+        assert!(
+            plan.queries
+                .iter()
+                .any(|query| query.starts_with("resolve-target:"))
+        );
     }
 
     #[test]

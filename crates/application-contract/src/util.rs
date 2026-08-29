@@ -4,9 +4,9 @@
 //! `DxbotError` type from `dxbot-core` and only fill the stable semantic fields that the
 //! application-contract layer is responsible for.
 
+use dxbot_core::DxbotError;
 use dxbot_core::error::{ErrorCategory, ErrorCode};
 use dxbot_core::types::CasConditions;
-use dxbot_core::DxbotError;
 
 fn err(code: ErrorCode, category: ErrorCategory, message: String) -> DxbotError {
     DxbotError {
@@ -26,12 +26,20 @@ fn err(code: ErrorCode, category: ErrorCategory, message: String) -> DxbotError 
 
 /// An input/usage error whose meaning is "the user-supplied CLI input is invalid".
 pub(crate) fn input_error(message: impl Into<String>) -> DxbotError {
-    err(ErrorCode::InvalidInput, ErrorCategory::Input, message.into())
+    err(
+        ErrorCode::InvalidInput,
+        ErrorCategory::Input,
+        message.into(),
+    )
 }
 
 /// An internal invariant violation (should never happen on well-formed inputs).
 pub(crate) fn invariant(message: impl Into<String>) -> DxbotError {
-    err(ErrorCode::InternalInvariant, ErrorCategory::Internal, message.into())
+    err(
+        ErrorCode::InternalInvariant,
+        ErrorCategory::Internal,
+        message.into(),
+    )
 }
 
 /// The fully-empty CAS condition: no optimistic-concurrency guard requested.

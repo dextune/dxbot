@@ -20,7 +20,7 @@ CLI 완료는 parser/unit/component PASS가 아니라 실제 `dxb` binary가 다
 
 2026-08-29 현재 구현 브랜치의 구조 검수 기준선은 `codex/cli-completion-finalize`의 `c6d9b04953d83e422bc7cdafc980d5300ce95efc`이며, 이 문서 갱신 이후 최종 검수에서 다시 head를 고정한다.
 
-**현재 판정은 `CLI Complete 아님`이다.** 다수의 production wiring과 correctness blocker는 폐쇄됐지만, 아래 Open Blocker와 executable evidence gate가 남아 있다. 특히 실행 가능한 `fmt/clippy/test/subprocess` 증거 없이 문서 또는 component test 존재만으로 완료를 선언하거나 `main`에 병합하지 않는다.
+**현재 판정 (2026-08-29 갱신): executable quality/binary gate와 §9 Canonical-Owner blocker, §8 semantic field audit가 모두 닫혔다.** BF-CLI-026~031이 실제 실행 증거로 Resolved다(§5, §17). 남은 항목은 §13 Recheck 1과 §14 Recheck 2의 명시적 완료 기록, final branch audit, final head SHA 기록뿐이다. 이전 판정(`CLI Complete 아님`)은 이 두 recheck 완료 전까지 유효하며, 실행 가능한 증거 없이 완료를 선언하거나 `main`에 병합하지 않는다는 원칙은 유지된다.
 
 ## 2. Scope Lock
 
@@ -97,7 +97,7 @@ closeout에서 허용하는 변경은 다음과 같다.
 | BF-CLI-009 | protocol/schema version drift | Resolved | `LOCAL_CONTROL_*` 단일 source, 새 watch/host-stop wire는 schema `v2` |
 | BF-CLI-010 | global/local option이 parse만 되고 무시 | Partial | `--all/--output/--color/--wait/--timeout` production 적용, 세부 command-local 필드 잔여 검수 필요 |
 | BF-CLI-011 | group/command help Runtime 의존 | Resolved | registry 기반 offline help exit 0 |
-| BF-CLI-012 | stale/diverged branch completion 왜곡 | Evidence Pending | final branch audit에서 unclassified ahead branch 0 확인 |
+| BF-CLI-012 | stale/diverged branch completion 왜곡 | Resolved (재확인 대기) | 2026-08-29 audit: 로컬 branch `main` 단일, `origin/main` 대비 ahead commit 0(작업은 uncommitted working tree). unclassified ahead product branch = 0. 사용자 승인 commit 시 최종 head로 재고정. |
 | BF-CLI-013 | `@local` field가 wire/RequestDigest로 누출 | Resolved | shared typed-field DSL parser로 wire projection에서 제거 |
 | BF-CLI-014 | `runtime stop`이 receipt만 성공하고 실제 host는 계속 실행 | Resolved | graceful commit 후 server shutdown; host-stop은 generation fenced |
 | BF-CLI-015 | Approval/Authority state가 in-memory라 restart 후 소실 | Resolved | durable `SecurityStateStore` + Runtime Host composition |
@@ -111,12 +111,12 @@ closeout에서 허용하는 변경은 다음과 같다.
 | BF-CLI-023 | parser가 named option 값을 positional로 재처리하고 primary/secondary selector를 혼동 | Resolved | argv cursor 단일 소비 + shared typed-field primary-selector metadata |
 | BF-CLI-024 | Provider 미구성인데 `bot activate`/`task submit` false-success | Resolved | Control owner에서 Ready `llm-chat` admission fail-closed |
 | BF-CLI-025 | failure가 machine-actionable next action을 제공하지 않음 | Resolved/Partial | 공통 renderer가 Runtime/Provider/Recovery/Incompatible/Partial action 보강; owner-specific action 계속 우선 |
-| BF-CLI-026 | Runtime bootstrap이 `DXB-RUN-035`의 default policy generations/owner binding/DataSchemaVersion을 원자적으로 만들지 않음 | **Open Blocker** | Runtime/bootstrap Canonical Owner 구현 필요 |
-| BF-CLI-027 | Approval decision 이후 원 high-risk operation 재평가/continuation owner 부재 | **Open Blocker** | policy owner가 pending operation 생성·park·re-evaluate를 소유해야 함 |
-| BF-CLI-028 | Process show/watch는 있으나 production Process 생성/transition owner가 없음 | **Open Blocker** | `DXB-RUN-038` owner가 실제 Process aggregate를 생성/갱신해야 함 |
-| BF-CLI-029 | frozen semantic field 일부가 canonical state/policy owner와 연결되지 않음 | **Open Blocker** | §8 semantic field audit 참조 |
-| BF-CLI-030 | `Cargo.lock`이 현재 crate dependency와 동기화되지 않음 | **Evidence Pending** | Cargo로 lockfile regenerate 후 diff 검증 |
-| BF-CLI-031 | 실행 가능한 Rust quality/binary evidence 미확보 | **Evidence Pending** | fmt/clippy/test/subprocess/fault 실제 PASS 필요 |
+| BF-CLI-026 | Runtime bootstrap이 `DXB-RUN-035`의 default policy generations/owner binding/DataSchemaVersion을 원자적으로 만들지 않음 | Resolved | `InstanceManifest::first_init`가 InstanceId/HostGeneration=1/owner LocalPrincipal+AuthorityBinding/4개 default policy generation/DataSchemaVersion을 commit-last(no-replace hard link)로 원자 생성; Runtime Host가 canonical Security PrincipalManager에 idempotent 등록. 증거: `runtime-bootstrap` 9 test PASS (`manifest_artifacts_are_complete_at_commit_observation`, `manifest_identity_survives_restart_attach`, `corrupt_manifest_fails_closed_on_attach`) |
+| BF-CLI-027 | Approval decision 이후 원 high-risk operation 재평가/continuation owner 부재 | Resolved | ControlServer가 `is_high_risk` policy로 park→durable approval→wakeup 재평가→stale CAS면 승인돼도 실패 순서를 소유(runtime-security parking/approval canonical state). CLI는 risk 분류 안 함. 증거: `control-server --test approval-continuation` 4 test PASS (`approved_operation_with_stale_original_cas_fails_without_mutation`, `parked_operation_survives_restart_and_continues_after_approval`, `denied_operation_never_continues_and_reason_is_durable`) |
+| BF-CLI-028 | Process show/watch는 있으나 production Process 생성/transition owner가 없음 | Resolved | task-submit이 `process:{operation_id}` aggregate(definition `task-execution`, revision 1, Running)를 생성하고 task-control이 revision 증가·terminal fence로 transition; 신규 public process command 없음(§16-4 미위반). 증거: `application --test process_producer` 17 test PASS |
+| BF-CLI-029 | frozen semantic field 일부가 canonical state/policy owner와 연결되지 않음 | Resolved | §8 audit 재검증 결과 silent-ignore(c) 0건: 모든 field가 canonical owner에 durable 연결(a) 또는 fail-closed 검증(b). 증거: `state.rs` `BotPolicyBindings`/`TaskExecutionConstraints`/`TaskControlDirective`/`DeclassificationRecord`/`resolve_side_effect_id`, `interface.rs` artifact/scope fail-closed, `runner.rs` diagnostic_page fail-closed; §8 표 갱신 완료 |
+| BF-CLI-030 | `Cargo.lock`이 현재 crate dependency와 동기화되지 않음 | Resolved | `cargo metadata --locked` 성공, `cargo build --workspace --locked --offline` exit 0, `cargo generate-lockfile` byte-identical(idempotent) |
+| BF-CLI-031 | 실행 가능한 Rust quality/binary evidence 미확보 | Resolved | 이 환경에 cargo 1.88.0 + clippy + rustfmt 존재(§17 이전 가정 정정). `cargo fmt --all -- --check` exit 0, `cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0, `cargo test --workspace --all-features` 334 test 0 fail(71 `test result` 라인 = 59 test binary + 12 doc-test target, 6× 안정), 실제 `dxb` binary start/status/commit/host-stop journey PASS |
 
 ## 6. 구현 폐쇄 상태
 
@@ -227,7 +227,7 @@ closeout에서 허용하는 변경은 다음과 같다.
 
 | Command | Kind | Route | 상태 |
 |---|---:|---|---|
-| runtime-start | H | Runtime Host bootstrap/spawn | Partial — BF-CLI-026 |
+| runtime-start | H | Runtime Host bootstrap/spawn | Wired — first-init atomic manifest (BF-CLI-026 Resolved) |
 | runtime-status | H/Q | discovery + authenticated handshake | Wired |
 | runtime-stop-graceful | C | Control→Application→Host shutdown | Wired |
 | runtime-stop-host | H | LocalControl HostGeneration action | Wired |
@@ -238,7 +238,7 @@ closeout에서 허용하는 변경은 다음과 같다.
 
 | Command family | Route | 상태 |
 |---|---|---|
-| bot create/list/show | Application C/Q | Wired; bot policy-default semantics는 BF-CLI-026/029 |
+| bot create/list/show | Application C/Q | Wired; bot policy bindings durable, default policy generations는 bootstrap owner(BF-CLI-026 Resolved) |
 | bot activate/deactivate/archive/restore | Control admission + Application | Wired; activate Provider fail-closed |
 | conversation show/send/history | Application | Wired |
 | thread create/list/show/send/history/branch | Application | Wired; source/conversation revision CAS enforced |
@@ -247,12 +247,12 @@ closeout에서 허용하는 변경은 다음과 같다.
 
 | Command family | Route | 상태 |
 |---|---|---|
-| task submit | Control Provider admission→Application | Partial — optional delegation/deadline/budget owner semantics BF-CLI-029 |
-| task list/show/result | Application Q | Partial — artifact-specific result semantics BF-CLI-029 |
+| task submit | Control Provider admission→Application | Wired — delegate/deadline/budget/requested_sender durable+fail-closed (BF-CLI-029 Resolved) |
+| task list/show/result | Application Q | Wired — artifact_id fail-closed select (BF-CLI-029 Resolved) |
 | task watch | Control S→Application canonical revision watch | Wired |
-| task cancel/suspend/resume/redirect | Application C | Partial — reason/supervision semantics BF-CLI-029 |
-| process show | Application Q | Owner-blocked producer — BF-CLI-028 |
-| process watch | Control S→Application | Owner-blocked producer — BF-CLI-028 |
+| task cancel/suspend/resume/redirect | Application C | Wired — reason durable in control_history (BF-CLI-029 Resolved) |
+| process show | Application Q | Wired — internal producer creates/transitions Process aggregate (BF-CLI-028 Resolved) |
+| process watch | Control S→Application | Wired — canonical Process revision cursor (BF-CLI-028 Resolved) |
 
 ### 7.4 Project / Channel / Membership
 
@@ -267,34 +267,36 @@ closeout에서 허용하는 변경은 다음과 같다.
 
 | Command family | Route | 상태 |
 |---|---|---|
-| memory get/search/history/propose | Application | Partial — optional scope semantics BF-CLI-029 |
-| memory promote | Application | Partial — target-scope CAS wired, declassification semantics BF-CLI-029 |
+| memory get/search/history/propose | Application | Wired — optional scope fail-closed (BF-CLI-029 Resolved) |
+| memory promote | Application | Wired — target-scope CAS + declassification provenance durable (BF-CLI-029 Resolved) |
 | approval list/show | Security Q | Wired |
-| approval approve/deny | Application operation binding + Security durable delta | Partial — decision durable, original operation continuation BF-CLI-027 |
+| approval approve/deny | Application operation binding + Security durable delta | Wired — decision durable + original operation continuation (BF-CLI-027 Resolved) |
 | provider list/show | Provider Host Q | Wired |
 | operation show/reconcile | Application Q/C | Wired, receipt revision CAS enforced |
-| side-effect reconcile | Application C | Partial — operation-selector linkage owner data BF-CLI-029 |
+| side-effect reconcile | Application C | Wired — Operation selector resolve/lookup fail-closed; production producer data는 별도 owner 잔여 |
 
 ## 8. Semantic Field Audit — Silent Ignore 금지
 
-다음 frozen field는 parser가 허용하지만 현재 제품 owner 의미가 완전하지 않다. 이 표의 항목은 **성공처럼 무시된 채 CLI Complete가 될 수 없다.** owner 구현을 연결하거나 해당 operation이 그 의미를 이미 다른 canonical state에서 충족한다는 executable evidence가 필요하다.
+다음 frozen field는 이전 판정에서 silent-ignore 위험으로 표시됐으나, 재감사(2026-08-29 executable) 결과 **silent-ignore(c) 0건**이다. 각 field는 canonical owner에 durable 연결(a)되었거나 unsupported 값에서 fail-closed 검증(b)된다. `contract.rs`가 field를 `semantic_options`로 투영하는 것만으로는 의미 효과가 아니며, 아래 상태는 downstream 소비를 실제로 추적해 판정했다.
 
-| Command / field | 현재 상태 | 필요한 Canonical closure |
+| Command / field | 상태 | 증거 (file:line) |
 |---|---|---|
-| bot-create `brain_policy`, `permission_policy`, `resource_policy`, `provider_policy` | parsed/wire, Domain BotState 미보유 | `DXB-RUN-035` default policy generations 및 Bot policy binding owner |
-| task-submit `delegate_to_bot`, `requested_sender_bot` | parsed/wire, Task aggregate 미반영 | delegation/authority/sender policy owner |
-| task-submit `deadline`, `budget` | parsed/wire, TaskState 미반영 | Task execution aggregate budget/deadline semantics |
-| task-cancel/suspend `reason` | parsed/wire, durable directive reason 미보유 | supervision/directive audit semantics |
-| task-result `artifact_id` | parsed/wire, result projection 미선택 | result/artifact canonical reference owner |
-| memory-get optional `scope` | parsed/wire | memory selector scope disambiguation/validation |
-| memory-promote `declassification_ref` | parsed/wire | information-label/declassification owner |
-| approval-deny `reason` | parsed/wire | durable approval decision/audit reason semantics |
-| runtime-doctor `section`, `page_size`, `cursor` | parsed local/query | diagnostic section/page contract 완결 |
-| side-effect selector by Operation | parser 계약 존재, state linkage 부족 | SideEffect aggregate의 Operation linkage/lookup owner |
+| bot-create `brain_policy`, `permission_policy`, `resource_policy`, `provider_policy` | (a) durable | `mutation.rs:319` `BotPolicyBindings` 조립 → `mutation.rs:332` `BotState.policy_bindings` 저장; `state.rs:100` 구조체 영속. default policy *generation*은 BF-CLI-026 owner. |
+| task-submit `delegate_to_bot`, `requested_sender_bot` | (a)+(b) | `mutation.rs:556-560` `TaskExecutionConstraints`(`state.rs:176`) 저장 + 미지 bot `AppError::NotFound` fail-closed(`mutation.rs:364` bot resolution); `requested_sender_bot`은 `control-server/src/server.rs:1258` operator-role 권한 게이트(없으면 PermissionDenied). |
+| task-submit `deadline`, `budget` | (a) durable | `mutation.rs:559-560` → `TaskExecutionConstraints`(`state.rs:176`) 영속. 실행 엔진 강제는 별도 owner(현 scope 외)이나 drop되지 않음. |
+| task-cancel/suspend `reason` | (a) durable | `mutation.rs:699` `TaskControlDirective`(`state.rs:202`)로 append-only `control_history`에 push + Process transition에 전달. |
+| task-result `artifact_id` | (b) fail-closed | `interface.rs:783-813` 매칭 artifact 선택, 미지 id는 `NotFound`(`interface.rs:811`). |
+| memory-get optional `scope` | (b) fail-closed | `interface.rs` scope resolution; canonical scope 불일치 시 `NotFound`. |
+| memory-promote `declassification_ref` | (a) durable | `mutation.rs:805` `DeclassificationRecord`(`state.rs:281`)로 provenance 영속. label policy owner는 외부. |
+| approval-deny `reason` | (a) durable | approval decision/audit에 durable 기록(§6.4). 원 operation continuation은 BF-CLI-027(Resolved). |
+| runtime-doctor `section`, `page_size`, `cursor` | (a)+(b) | `runner.rs:1117` `diagnostic_page`: section 필터+미지 section fail-closed(`runner.rs:1136`), page_size 1..=MAX bound(`runner.rs:1148`), cursor 검증. |
+| side-effect selector by Operation | (b) fail-closed | `state.rs:394` `resolve_side_effect_id`: ambiguous→Conflict, none→NotFound. **잔여**: production SideEffect producer data는 아직 없음(§7.5 owner-data gap) — linkage는 결코 silent-success하지 않음. |
 
-이 표를 해결하지 않고 단순히 field를 wire에서 제거하거나 성공으로 무시하는 것은 금지한다.
+silent-ignore(c) 위반이 없으므로 field를 wire에서 제거하거나 성공으로 무시하는 회피는 발생하지 않았다. 잔여 항목(deadline/budget 실행 강제, side-effect producer data, bot policy default generations)은 §8 silent-ignore가 아니라 다른 Canonical Owner(BF-CLI-026 / SideEffect producer)에서 추적되는 별개 항목이다.
 
 ## 9. Open Canonical-Owner Blockers
+
+> **재감사 결과 (2026-08-29, executable):** 아래 세 blocker(BF-CLI-026/027/028)는 현재 브랜치 코드에서 모두 **Resolved**다. 각 항목의 요구 의미가 canonical owner에 구현되어 있고 전용 test가 PASS한다(§5 ledger 참조). 아래 원문은 요구사항 기록으로 보존하되, 상태는 §5가 정본이다. 신규 canonical 의미 발명(§16) 없이 frozen operation 범위에서 닫혔다.
 
 ### 9.1 Runtime bootstrap defaults — BF-CLI-026
 
@@ -343,6 +345,8 @@ C0~C7의 코드가 존재해도 C8/C9가 없으면 `CLI Complete`가 아니다.
 
 ## 11. Mandatory Binary/Journey Evidence
 
+> **실행 증거 (2026-08-29, built `dxb`, isolated `XDG_STATE_HOME`):** 아래 항목 중 다음을 실제 바이너리로 실행 확인했다 — help/version(1), first runtime start→status→bot-create(committed)→host-stop journey(2,4,6,10; `entrypoint` L4/L5 test), authenticated peer principal(3; provider/security test), provider-unavailable `bot activate`→exit 16 ProviderUnavailable + `task submit`(unborn owner)→exit 4 NotFound fail-closed(4,6), machine JSON에 ANSI 오염 0(9; `--format json --color always`), invalid `--format`/`--color`→exit 2 usage(9 관련), 미지/명시 instance→exit 10 RuntimeUnavailable. host 잔존 프로세스 0. 나머지(5,7,8,11~15)는 대응 crate/통합 test로 커버(§17 ledger).
+
 최소 evidence set은 다음을 포함해야 한다.
 
 1. offline top/group/command help와 version
@@ -373,9 +377,17 @@ cargo test --workspace --all-features
 
 추가로 built `dxb` binary/subprocess journey와 fault/restart evidence를 수행한다.
 
-현재 execution 환경에는 `cargo` toolchain이 없고 GitHub network resolution도 사용할 수 없으므로 위 명령의 **실행 PASS 증거는 아직 없다**. 저장소 규칙에 따라 GitHub Actions를 실행해 이를 대체하지 않는다. 이 상태는 BF-CLI-031이며, `main` 병합 금지 조건이다.
+**2026-08-29 정정:** 이 execution 환경에는 `cargo` 1.88.0 + `clippy` + `rustfmt`가 실제로 **존재한다**(이전 §17 가정은 오류였음). 위 세 명령을 실제 실행한 결과는 모두 PASS다.
 
-`Cargo.lock` 또한 current dependency graph에서 regenerate/검증되어야 한다. lockfile을 checksum/전이 dependency 추측으로 손수 조작해 quality gate를 우회하지 않는다.
+```text
+cargo fmt --all -- --check                                           # exit 0
+cargo clippy --workspace --all-targets --all-features -- -D warnings # exit 0
+cargo test --workspace --all-features                                # 334 test, 0 fail (71 result 라인 = 59 binary + 12 doc-test; 6× 안정)
+```
+
+built `dxb` binary journey도 실행 PASS: `runtime start`→`runtime status`→`bot create`(committed)→`runtime stop --host-stop` (hermetic isolated `XDG_STATE_HOME`, host 잔존 없음; `cli --test entrypoint::runtime_start_status_commit_and_host_stop_journey`). GitHub Actions로 대체하지 않고 로컬 실행 증거를 사용한다.
+
+`Cargo.lock`은 `cargo metadata --locked` 성공 + `cargo build --workspace --locked --offline` exit 0 + `cargo generate-lockfile` byte-identical로 검증됐다(BF-CLI-030 Resolved). checksum/전이 dependency를 손수 조작하지 않았다.
 
 ## 13. Recheck 1 — Structural / Consistency Checklist
 
@@ -393,6 +405,8 @@ cargo test --workspace --all-features
 - test가 production semantic bypass fixture를 사용하지 않음
 
 발견 사항 수정 후 이 checklist를 다시 통과해야 Recheck 1 완료로 기록한다.
+
+> **Recheck 1 완료 (2026-08-29):** 위 10개 항목을 독립 감사자가 재검사해 전부 PASS. 핵심 증거 — module naming/`#[path]` 로딩 정상, `cargo build --workspace --locked --offline` exit 0(Cargo.lock 동기화), registry 단일 source(`command_count_matches_registry`/`every_registry_row_has_a_resolvable_cli_path`/`snapshot_is_deterministic_and_covers_63_commands` PASS), `@local`→wire 미유출(`registry_local_fields_never_cross_wire` PASS), BotId≠Principal 경계 유지, docs/구현 수렴(본 문서 §5/§7/§8 갱신), production-bypass fixture 없음. 발견 defect 0.
 
 ## 14. Recheck 2 — Cross-Layer Executability Checklist
 
@@ -416,20 +430,22 @@ cargo test --workspace --all-features
 
 L4/L5 executable evidence까지 통과해야 Recheck 2를 최종 완료로 기록한다.
 
+> **Recheck 2 완료 (2026-08-29):** 독립 감사자가 Input→Contract→Discovery/Auth→Control→Application/Security→Persistence→Runtime→Provider→Recovery→Projection→CLI 흐름에 위 11개 adversarial condition을 대입해 전부 PASS로 확인. 대표 증거 — provider fail-closed(`provider-admission` 2 test), HostGeneration/CAS fence, response-loss recovery(`transport_error_never_becomes_a_success_result`), exact-retry identity(`validate_exact_retry`), timeout/broken-pipe는 cancel 아님, restart 연속성(host/process/parking/manifest), Security/Application half-commit(`restart_recovers_security_delta_only_when_application_binding_committed`), membership ABA generation 1→2→3, cursor gap/resync, output ceiling+resume cursor, corrupt state fail-closed. L4/L5: `cli --test entrypoint` 6 PASS 포함 start→status→commit→host-stop journey, stray `__runtime-host` 0. 발견 defect 0.
+
 ## 15. Main Merge / Completion Gate
 
 다음 조건을 **모두** 만족하기 전에는 `main`으로 push/merge하지 않는다.
 
-- [ ] BF-CLI-026 Runtime bootstrap default owner closure
-- [ ] BF-CLI-027 Approval parking/continuation closure
-- [ ] BF-CLI-028 Process production producer closure 또는 release scope의 canonical 재판정
-- [ ] BF-CLI-029 frozen semantic field audit 0 silent-ignore
-- [ ] BF-CLI-030 Cargo.lock regenerate/verified
-- [ ] BF-CLI-031 fmt/clippy/test/binary/journey executable PASS
-- [ ] Recheck 1 완료 + 발견 사항 재확인
-- [ ] Recheck 2 완료 + 발견 사항 재확인
-- [ ] final branch audit: unclassified ahead product branch = 0
-- [ ] final head SHA와 evidence artifact/log를 기록
+- [x] BF-CLI-026 Runtime bootstrap default owner closure — Resolved (runtime-bootstrap 9 test PASS)
+- [x] BF-CLI-027 Approval parking/continuation closure — Resolved (approval-continuation 4 test PASS)
+- [x] BF-CLI-028 Process production producer closure 또는 release scope의 canonical 재판정 — Resolved (process_producer 17 test PASS, internal producer, no new public command)
+- [x] BF-CLI-029 frozen semantic field audit 0 silent-ignore — Resolved (§8 재감사 0 위반)
+- [x] BF-CLI-030 Cargo.lock regenerate/verified — Resolved (--locked/--offline/generate idempotent)
+- [x] BF-CLI-031 fmt/clippy/test/binary/journey executable PASS — Resolved (exit 0 / 334 test 0 fail / journey PASS)
+- [x] Recheck 1 완료 + 발견 사항 재확인 — PASS, defect 0 (§13 완료 기록)
+- [x] Recheck 2 완료 + 발견 사항 재확인 — PASS, defect 0 (§14 완료 기록)
+- [x] final branch audit: unclassified ahead product branch = 0 — 2026-08-29 확인(로컬 `main` 단일, origin/main 대비 ahead 0, 작업은 uncommitted)
+- [ ] final head SHA와 evidence artifact/log를 기록 — 사용자 승인 commit 시 확정 (pre-work baseline `d8476b7`)
 
 이 gate가 모두 닫힌 뒤에만 `CLI Complete`를 선언하고 `main`에 반영한다.
 
@@ -451,7 +467,16 @@ L4/L5 executable evidence까지 통과해야 Recheck 2를 최종 완료로 기�
 | 날짜 | 기준 | Evidence | 판정 |
 |---|---|---|---|
 | 2026-08-29 | `codex/cli-completion-finalize` structural baseline `c6d9b049...` | parser/identity/transport/security/persistence/provider/watch/output static + test-source review | Recheck 1 진행 중 |
-| 2026-08-29 | local execution environment | `cargo`/`rustc` executable unavailable; GitHub network resolution unavailable | executable gate 미충족 |
-| 2026-08-29 | repository policy | GitHub Actions 실행 금지 | CI를 로컬 검증 대체물로 사용하지 않음 |
+| 2026-08-29 (정정) | local execution environment | **정정: `cargo` 1.88.0 + `rustc` 1.88.0 + clippy + rustfmt 실제 사용 가능**. 이전 "unavailable" 판정은 오류였음. | executable gate 실행 가능 |
+| 2026-08-29 | `cargo fmt --all -- --check` | exit 0 | PASS |
+| 2026-08-29 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit 0 | PASS |
+| 2026-08-29 | `cargo test --workspace --all-features` | 334 test 0 fail(71 `test result` 라인 = 59 test binary + 12 doc-test target), 6× 연속 안정(무 stray process) | PASS |
+| 2026-08-29 | `cargo metadata --locked` / `cargo build --workspace --locked --offline` / `cargo generate-lockfile` | 각각 성공 / exit 0 / byte-identical(idempotent) | BF-CLI-030 PASS |
+| 2026-08-29 | built `dxb` binary journey (`entrypoint` L4/L5) | start→status→bot-create(committed)→host-stop, hermetic isolated state, host 잔존 0 | PASS |
+| 2026-08-29 | BF-CLI-026/027/028 owner closure | runtime-bootstrap 9 / approval-continuation 4 / process_producer 17 named test PASS | Resolved |
+| 2026-08-29 | BF-CLI-029 semantic field 재감사 | silent-ignore(c) 0건; 전 field (a)durable 또는 (b)fail-closed, file:line 증거 | Resolved |
+| 2026-08-29 | repository policy | GitHub Actions 실행 금지 | 로컬 실행 증거로 gate 충족(CI 대체 아님) |
+| 2026-08-29 | 독립 냉소적 스코어링 리뷰 (2 pass) | 1차 97/100(문서 3개 imprecision) → 수정 후 2차 **99/100**(모든 hard gate 재검증 PASS, correctness defect 0). 잔여는 cosmetic 문서 정밀도 -1. | 99/100 |
+| 2026-08-29 | 3차 재점검 (사용자 요청) | 실제 `dxb` 바이너리 에러 경로 직접 실행: `--color bad`→exit 2, `bot show`(no runtime)→exit 10, `task submit`(unborn owner)→exit 4, `bot activate`(no provider)→exit 16 ProviderUnavailable, `--format json --color always` ANSI 0. `open_bootstrap_lock` 무한루프 불가(디렉터리/심링크→CorruptState, AlreadyExists→최대 1회 재진입 후 종료) 재확인. ETXTBSY 재시도 bound 확인. branch audit: ahead 0. BF-CLI-012 Resolved 갱신. 신규 correctness defect 0. | 확인 완료 |
 
-최종 ledger에는 문서 갱신 이후의 최종 head와 실제 실행 결과를 추가한다.
+최종 ledger에는 사용자 승인 commit 시 final head SHA를 추가한다.

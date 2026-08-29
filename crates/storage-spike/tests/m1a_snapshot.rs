@@ -6,9 +6,7 @@ use std::io;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use storage_spike::{
-    ReferenceStore, SnapshotBudget, SnapshotPage, SpikeError, SubmitOutcome,
-};
+use storage_spike::{ReferenceStore, SnapshotBudget, SnapshotPage, SpikeError, SubmitOutcome};
 
 use m1a_fixture::{database_path, effect_for, request};
 
@@ -21,13 +19,7 @@ fn submit_projection_row(
     let command = format!("command-{aggregate_id}-{version}");
     let digest = format!("request-{aggregate_id}-{version}");
     let operation_id = format!("operation-{aggregate_id}-{version}");
-    let operation = request(
-        "principal-a",
-        &key,
-        &command,
-        &digest,
-        &operation_id,
-    );
+    let operation = request("principal-a", &key, &command, &digest, &operation_id);
     let state = format!("state-{aggregate_id}-{version}");
     let effect = effect_for(aggregate_id, &state);
     match store.submit(&operation, &effect)? {

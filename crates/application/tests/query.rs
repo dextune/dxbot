@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Acceptance tests for AT-APP-006: bounded page, cursor, all-loop and resync
 //! semantics over the in-memory [`DomainState`] fixture.
 //!
@@ -6,9 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use application::state::{BotState, DomainState, LifecycleState};
-use application::{
-    AllLoopResult, AppError, ApplicationQuery, BotSummary, Page, all_loop, resync,
-};
+use application::{AllLoopResult, AppError, ApplicationQuery, BotSummary, Page, all_loop, resync};
 use dxbot_core::types::BotId;
 
 /// Build a bot state with a lexicographically stable id for cursor ordering.
@@ -18,6 +17,7 @@ fn bot_state(id: &str, revision: i64) -> BotState {
         name: format!("name-{id}"),
         revision,
         lifecycle: LifecycleState::Active,
+        policy_bindings: Default::default(),
     }
 }
 
@@ -75,18 +75,10 @@ fn query_pagination_cursor_continues_from_previous() {
 fn query_all_loop_never_exceeds_local_ceiling() {
     let query = query_over(state_with_bots(8));
 
-    let result = all_loop(
-        |page_size, cursor| query.list_bots(page_size, cursor),
-        2,
-        3,
-    )
-    .unwrap();
+    let result = all_loop(|page_size, cursor| query.list_bots(page_size, cursor), 2, 3).unwrap();
 
     match result {
-        AllLoopResult::Partial {
-            items,
-            next_cursor,
-        } => {
+        AllLoopResult::Partial { items, next_cursor } => {
             assert_eq!(items.len(), 3, "local ceiling is a hard upper bound");
             assert!(next_cursor.is_some(), "partial exposes a resume cursor");
         }
@@ -100,12 +92,7 @@ fn query_all_loop_never_exceeds_local_ceiling() {
 fn query_exact_ceiling_is_complete_when_source_is_exhausted() {
     let query = query_over(state_with_bots(4));
 
-    let result = all_loop(
-        |page_size, cursor| query.list_bots(page_size, cursor),
-        3,
-        4,
-    )
-    .unwrap();
+    let result = all_loop(|page_size, cursor| query.list_bots(page_size, cursor), 3, 4).unwrap();
 
     match result {
         AllLoopResult::Complete { items } => assert_eq!(items.len(), 4),

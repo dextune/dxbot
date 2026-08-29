@@ -50,56 +50,59 @@ pub struct PrincipalRef(pub String);
 // ── Selectors ──
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum BotSelector {
     CanonicalId(BotId),
     ScopedExact(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum ConversationSelector {
     ConversationId(ConversationId),
     BotMain(BotSelector),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum ThreadSelector {
     CanonicalId(ThreadId),
     ScopedExact(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum TaskSelector {
     CanonicalId(TaskId),
     ScopedExact(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum ProjectSelector {
     CanonicalId(ProjectId),
     VisibleExact(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum ChannelSelector {
     CanonicalId(ChannelId),
     ProjectExact { project: String, name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum OperationSelector {
     OperationId(OperationId),
-    CommandIdKey { command_id: CommandId, key_digest: String },
+    CommandIdKey {
+        command_id: CommandId,
+        key_digest: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum ScopeSelector {
     Bot(BotSelector),
     Project(ProjectSelector),
@@ -107,28 +110,28 @@ pub enum ScopeSelector {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum ApprovalSelector {
     CanonicalId(ApprovalId),
     Operation(OperationSelector),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum ProviderSelector {
     CanonicalId(ProviderId),
     Exact(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum ProcessSelector {
     CanonicalId(ProcessId),
     ScopedExact(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum MemorySelector {
     CanonicalId(MemoryId),
     ScopedExact(String),
@@ -141,7 +144,7 @@ pub struct MemoryScopeSelector {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum SideEffectSelector {
     CanonicalId(String),
     Operation(OperationSelector),
@@ -150,7 +153,7 @@ pub enum SideEffectSelector {
 // ── Content source ──
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum ContentSource {
     Text { value: String },
     InputFile { path: String },
@@ -172,22 +175,63 @@ pub struct CommandPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum CanonicalTarget {
     Instance(InstanceId),
-    Bot { id: BotId, revision: i64 },
-    Conversation { id: ConversationId, revision: i64 },
-    Thread { id: ThreadId, parent_id: Option<ConversationId>, revision: i64 },
-    Task { id: TaskId, revision: i64, execution_generation: Option<i64> },
-    Project { id: ProjectId, revision: i64 },
-    Channel { id: ChannelId, project_id: ProjectId, revision: i64 },
-    Operation { operation_id: OperationId, command_id: CommandId },
-    Approval { id: ApprovalId, revision: i64 },
-    Memory { id: MemoryId, revision: i64 },
-    Provider { id: ProviderId, generation: i64 },
-    Process { id: ProcessId },
-    SideEffect { id: String, revision: i64 },
-    Membership { scope: ScopeSelector, member_bot: BotSelector },
+    Bot {
+        id: BotId,
+        revision: i64,
+    },
+    Conversation {
+        id: ConversationId,
+        revision: i64,
+    },
+    Thread {
+        id: ThreadId,
+        parent_id: Option<ConversationId>,
+        revision: i64,
+    },
+    Task {
+        id: TaskId,
+        revision: i64,
+        execution_generation: Option<i64>,
+    },
+    Project {
+        id: ProjectId,
+        revision: i64,
+    },
+    Channel {
+        id: ChannelId,
+        project_id: ProjectId,
+        revision: i64,
+    },
+    Operation {
+        operation_id: OperationId,
+        command_id: CommandId,
+    },
+    Approval {
+        id: ApprovalId,
+        revision: i64,
+    },
+    Memory {
+        id: MemoryId,
+        revision: i64,
+    },
+    Provider {
+        id: ProviderId,
+        generation: i64,
+    },
+    Process {
+        id: ProcessId,
+    },
+    SideEffect {
+        id: String,
+        revision: i64,
+    },
+    Membership {
+        scope: ScopeSelector,
+        member_bot: BotSelector,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

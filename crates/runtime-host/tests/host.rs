@@ -102,13 +102,15 @@ fn host_status_transitions_are_correct() -> Result<(), Error> {
 fn composed_host_is_not_running_before_mandatory_readiness() {
     let mut host = RuntimeHost::new(endpoint("i-5", 1, true));
     let mut composition = RuntimeComposition::new();
-    assert!(composition
-        .register(Box::new(TestExtension {
-            id: "provider".to_owned(),
-            dependencies: Vec::new(),
-            start_result: Err("not ready".to_owned()),
-        }))
-        .is_ok());
+    assert!(
+        composition
+            .register(Box::new(TestExtension {
+                id: "provider".to_owned(),
+                dependencies: Vec::new(),
+                start_result: Err("not ready".to_owned()),
+            }))
+            .is_ok()
+    );
 
     assert!(matches!(
         host.start_composed(&mut composition),

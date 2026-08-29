@@ -1,11 +1,12 @@
+#![allow(clippy::unwrap_used)]
 //! Acceptance tests for AT-APP-007: cursor-based application subscription.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use application::AppError;
 use application::state::DomainState;
 use application::subscription::{StreamEvent, SubscriptionManager, TaskResult};
-use application::AppError;
 use dxbot_core::types::{ProcessId, TaskId};
 
 const POLL: Duration = Duration::from_millis(150);
@@ -73,9 +74,7 @@ fn subscription_cursor_resumes_from_last_position() {
             .unwrap();
     }
 
-    let sub = manager
-        .subscribe_task(&task_id, Some("2".into()))
-        .unwrap();
+    let sub = manager.subscribe_task(&task_id, Some("2".into())).unwrap();
     assert_eq!(sub.cursor, Some("2".into()));
     assert_eq!(
         manager.next_event(&sub, POLL).unwrap(),
@@ -171,9 +170,7 @@ fn subscription_gap_detection_distinguishes_missing_from_predecessor() {
 
     // Cursor 5 is exactly the predecessor of oldest retained cursor 6, so no
     // event is missing and delivery may continue with event 6.
-    let predecessor = manager
-        .subscribe_task(&task_id, Some("5".into()))
-        .unwrap();
+    let predecessor = manager.subscribe_task(&task_id, Some("5".into())).unwrap();
     assert_eq!(
         manager.next_event(&predecessor, POLL).unwrap(),
         StreamEvent::Progress {
@@ -258,7 +255,10 @@ fn subscription_active_reader_detects_pruning_gap_then_resyncs() {
         }
     }
 
-    assert_eq!(received.len(), application::subscription::MAX_EVENTS_PER_STREAM);
+    assert_eq!(
+        received.len(),
+        application::subscription::MAX_EVENTS_PER_STREAM
+    );
     assert_eq!(received.first().map(String::as_str), Some("step-200"));
     assert_eq!(received.last().map(String::as_str), Some("step-1199"));
 }

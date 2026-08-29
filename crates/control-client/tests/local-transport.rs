@@ -5,14 +5,13 @@
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use application_contract::{
-    LocalControlHandshake, LocalControlRequest, LocalControlResponse,
-    LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_VERSION, read_local_control_frame,
-    write_local_control_frame,
+    LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_VERSION, LocalControlHandshake,
+    LocalControlRequest, LocalControlResponse, read_local_control_frame, write_local_control_frame,
 };
 use control_client::{ClientError, LocalControlClient};
 use dxbot_core::receipt::{ReceiptDisposition, ReceiptRecord};

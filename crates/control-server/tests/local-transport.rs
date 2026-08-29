@@ -36,10 +36,14 @@ fn local_control_derives_principal_and_dispatches_after_handshake() {
     let security = Arc::new(Mutex::new(SecurityState::new()));
     let control = Arc::new(ControlServer::new(security, application));
     let instance = InstanceId("instance-local".to_owned());
-    let server = LocalControlServer::bind(path.clone(), instance.clone(), 7, control)
-        .expect("server binds");
+    let server =
+        LocalControlServer::bind(path.clone(), instance.clone(), 7, control).expect("server binds");
     let expected_principal = server.principal_ref().clone();
-    assert!(expected_principal.0.starts_with("local:instance-local:uid:"));
+    assert!(
+        expected_principal
+            .0
+            .starts_with("local:instance-local:uid:")
+    );
     assert_eq!(
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
@@ -55,7 +59,8 @@ fn local_control_derives_principal_and_dispatches_after_handshake() {
         },
     )
     .unwrap();
-    let handshake = match read_local_control_frame::<_, LocalControlResponse>(&mut stream).unwrap() {
+    let handshake = match read_local_control_frame::<_, LocalControlResponse>(&mut stream).unwrap()
+    {
         LocalControlResponse::Handshake { handshake } => handshake,
         other => panic!("unexpected handshake response: {other:?}"),
     };

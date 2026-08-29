@@ -16,13 +16,10 @@ use std::time::SystemTime;
 use dxbot_core::types::*;
 use fs2::FileExt;
 
-#[path = "journal-sha256.rs"]
-mod journal_sha256;
-use journal_sha256::sha256_hex;
+use crate::sha256::sha256_hex;
 
 const MAX_SCAN_RECORDS: usize = 1_000_000;
-const ZERO_HASH_HEX: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const ZERO_HASH_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrunePolicy {
@@ -250,7 +247,8 @@ impl LocalJournal {
             if self.is_locked(&command_id) {
                 continue;
             }
-            let modified = match fs::metadata(entry.path()).and_then(|metadata| metadata.modified()) {
+            let modified = match fs::metadata(entry.path()).and_then(|metadata| metadata.modified())
+            {
                 Ok(modified) => modified,
                 Err(_) => continue,
             };
@@ -628,9 +626,9 @@ fn validate_chain(records: &[JournalRecord]) -> Result<(), JournalError> {
                 record.command_id.0, record.sequence
             )));
         }
-        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
-            JournalError::ChainIntegrity("journal sequence exhausted".to_owned())
-        })?;
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or_else(|| JournalError::ChainIntegrity("journal sequence exhausted".to_owned()))?;
 
         if let Some((instance, command, operation, key, digest)) = identity {
             if record.instance_id != *instance
@@ -646,8 +644,7 @@ fn validate_chain(records: &[JournalRecord]) -> Result<(), JournalError> {
         } else {
             if record.operation_id.0.trim().is_empty() {
                 return Err(JournalError::ChainIntegrity(
-                    "journal operation id is missing; legacy record requires migration"
-                        .to_owned(),
+                    "journal operation id is missing; legacy record requires migration".to_owned(),
                 ));
             }
             identity = Some((

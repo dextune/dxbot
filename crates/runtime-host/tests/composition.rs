@@ -21,7 +21,10 @@ impl TestExtension {
     fn ready(id: &str, dependencies: &[&str], log: &Arc<Mutex<Vec<String>>>) -> Self {
         Self {
             id: id.to_owned(),
-            dependencies: dependencies.iter().map(|value| (*value).to_owned()).collect(),
+            dependencies: dependencies
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
             start_result: Ok(ExtensionReadiness::Ready),
             stop_fails: false,
             log: Arc::clone(log),
@@ -43,12 +46,18 @@ impl RuntimeExtension for TestExtension {
     }
 
     fn start(&mut self) -> Result<ExtensionReadiness, String> {
-        self.log.lock().expect("test log").push(format!("start:{}", self.id));
+        self.log
+            .lock()
+            .expect("test log")
+            .push(format!("start:{}", self.id));
         self.start_result.clone()
     }
 
     fn stop(&mut self) -> Result<(), String> {
-        self.log.lock().expect("test log").push(format!("stop:{}", self.id));
+        self.log
+            .lock()
+            .expect("test log")
+            .push(format!("stop:{}", self.id));
         if self.stop_fails {
             Err("teardown failed".to_owned())
         } else {
@@ -62,7 +71,11 @@ fn resolution_is_deterministic_and_dependency_ordered() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let mut first = RuntimeComposition::new();
     first
-        .register(Box::new(TestExtension::ready("worker", &["provider"], &log)))
+        .register(Box::new(TestExtension::ready(
+            "worker",
+            &["provider"],
+            &log,
+        )))
         .expect("register worker");
     first
         .register(Box::new(TestExtension::ready("provider", &["audit"], &log)))
@@ -76,7 +89,11 @@ fn resolution_is_deterministic_and_dependency_ordered() {
         .register(Box::new(TestExtension::ready("audit", &[], &log)))
         .expect("register audit");
     second
-        .register(Box::new(TestExtension::ready("worker", &["provider"], &log)))
+        .register(Box::new(TestExtension::ready(
+            "worker",
+            &["provider"],
+            &log,
+        )))
         .expect("register worker");
     second
         .register(Box::new(TestExtension::ready("provider", &["audit"], &log)))
@@ -86,7 +103,10 @@ fn resolution_is_deterministic_and_dependency_ordered() {
         first.resolve().expect("resolve first"),
         vec!["audit", "provider", "worker"]
     );
-    assert_eq!(first.resolved_ids(), second.resolve().expect("resolve second"));
+    assert_eq!(
+        first.resolved_ids(),
+        second.resolve().expect("resolve second")
+    );
 }
 
 #[test]

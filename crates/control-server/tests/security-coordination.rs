@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use application::ApplicationMutator;
-use control_server::{ControlServer, SecurityCoordinationStore, SecurityState};
+use control_server::{ControlServer, SecurityCoordinationStore, SecurityState, ServerError};
 use dxbot_core::types::{
-    BotId, BotSelector, CanonicalTarget, CasConditions, CommandId, CommandPayload,
-    IdempotencyKey, InstanceId, OperationId, OperationRequest, PrincipalRef, ProjectId,
-    ProjectSelector, RequestDigest, ScopeSelector,
+    BotId, BotSelector, CanonicalTarget, CasConditions, CommandId, CommandPayload, IdempotencyKey,
+    InstanceId, OperationId, OperationRequest, PrincipalRef, ProjectId, ProjectSelector,
+    RequestDigest, ScopeSelector,
 };
 use provider_host::ProviderHost;
 use runtime_security::{
@@ -81,6 +81,41 @@ fn operator_server(
     server
 }
 
+fn approve_high_risk(server: &ControlServer, original: OperationRequest, decision_sequence: &str) {
+    let pending = match server.handle_request(&principal(), &original) {
+        Err(ServerError::ApprovalRequired(pending)) => pending,
+        other => panic!("expected approval-required, got {other:?}"),
+    };
+    let mut cas = empty_cas();
+    cas.if_revision = Some(1);
+    server
+        .handle_request(
+            &principal(),
+            &request(
+                "approval-approve",
+                decision_sequence,
+                CanonicalTarget::Approval {
+                    id: pending.approval_id,
+                    revision: 1,
+                },
+                Some(cas),
+                json!({}),
+            ),
+        )
+        .expect("approval decision and continuation");
+    assert!(
+        server
+            .lookup_binding(
+                &principal(),
+                &original.command_id,
+                &original.idempotency_key,
+            )
+            .expect("original binding lookup")
+            .is_some(),
+        "approved high-risk operation must commit"
+    );
+}
+
 fn membership_binding_id(scope: &ScopeSelector, member: &BotSelector) -> String {
     let encoded = serde_json::to_string(&(scope, member)).expect("subject");
     format!("membership-subject:{encoded}")
@@ -138,10 +173,12 @@ fn project_create_commits_membership_and_security_binding_for_bot_subject() {
     assert_eq!(binding.role, "owner");
     assert_eq!(binding.generation, 1);
     assert!(binding.active);
-    assert!(security
-        .principals
-        .resolve_principal(&PrincipalRef("bot:bot-a".to_owned()))
-        .is_err());
+    assert!(
+        security
+            .principals
+            .resolve_principal(&PrincipalRef("bot:bot-a".to_owned()))
+            .is_err()
+    );
 }
 
 #[test]
@@ -188,34 +225,32 @@ fn membership_remove_and_readd_keep_application_and_security_generations_aligned
     };
     let mut set_cas = empty_cas();
     set_cas.if_project_revision = Some(1);
-    server
-        .handle_request(
-            &principal(),
-            &request(
-                "project-member-set",
-                "member-set-1",
-                target.clone(),
-                Some(set_cas),
-                json!({"role_ref": "member"}),
-            ),
-        )
-        .expect("member set");
+    approve_high_risk(
+        &server,
+        request(
+            "project-member-set",
+            "member-set-1",
+            target.clone(),
+            Some(set_cas),
+            json!({"role_ref": "member"}),
+        ),
+        "approve-member-set-1",
+    );
 
     let mut remove_cas = empty_cas();
     remove_cas.if_project_revision = Some(2);
     remove_cas.if_membership_generation = Some(1);
-    server
-        .handle_request(
-            &principal(),
-            &request(
-                "project-member-remove",
-                "member-remove",
-                target.clone(),
-                Some(remove_cas),
-                json!({}),
-            ),
-        )
-        .expect("member remove");
+    approve_high_risk(
+        &server,
+        request(
+            "project-member-remove",
+            "member-remove",
+            target.clone(),
+            Some(remove_cas),
+            json!({}),
+        ),
+        "approve-member-remove",
+    );
 
     let tombstone = application
         .snapshot()
@@ -240,18 +275,17 @@ fn membership_remove_and_readd_keep_application_and_security_generations_aligned
     let mut readd_cas = empty_cas();
     readd_cas.if_project_revision = Some(3);
     readd_cas.if_membership_generation = Some(2);
-    server
-        .handle_request(
-            &principal(),
-            &request(
-                "project-member-set",
-                "member-set-2",
-                target,
-                Some(readd_cas),
-                json!({"role_ref": "admin"}),
-            ),
-        )
-        .expect("member re-add");
+    approve_high_risk(
+        &server,
+        request(
+            "project-member-set",
+            "member-set-2",
+            target,
+            Some(readd_cas),
+            json!({"role_ref": "admin"}),
+        ),
+        "approve-member-set-2",
+    );
 
     let restored = application
         .snapshot()
@@ -356,7 +390,9 @@ fn restart_recovers_security_delta_only_when_application_binding_committed() {
         .authority
         .bind_global_authority(&principal(), "operator")
         .expect("operator");
-    security_store.persist(&security_state).expect("security seed");
+    security_store
+        .persist(&security_state)
+        .expect("security seed");
 
     let committed_request = request(
         "bot-create",

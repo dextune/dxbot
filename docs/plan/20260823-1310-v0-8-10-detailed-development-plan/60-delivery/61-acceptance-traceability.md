@@ -5,7 +5,7 @@ version: "0.8.10"
 status: "Accepted"
 normative: true
 priority: "P0"
-last_updated: "2026-08-23 (final: all 29 acceptances Passed/Executable, review fixes applied)"
+last_updated: "2026-08-29"
 depends_on: ["DXB-DEL-060", "DXB-ENG-052", "DXB-IFC-040", "DXB-IFC-041", "DXB-IFC-042", "DXB-IFC-043"]
 ---
 # Acceptance·Traceability와 사용자 여정 최초 Milestone Registry v0.8.10
@@ -45,21 +45,21 @@ depends_on: ["DXB-DEL-060", "DXB-ENG-052", "DXB-IFC-040", "DXB-IFC-041", "DXB-IF
 | AT-HARNESS-001 | Reference Provider plus one real Harness Adapter canary | DXB-ARC-013 | real harness canary | M5 | Passed | harness report | cargo test -p provider-host harness | 4 tests passed 0 failed; evidence: /tmp/grok-goal-b0f31b5cd420/implementer/acceptance-M5-AT-HARNESS-001.log |
 | AT-APP-007 | subscription cursor, reconnect, gap and explicit resync | DXB-IFC-040/DXB-RUN-033 | stream reconnect fixture | M5 | Passed | subscription report | cargo test -p application subscription | 7 tests passed 0 failed; evidence: /tmp/grok-goal-b0f31b5cd420/implementer/acceptance-M5-AT-APP-007.log |
 | AT-SCHEMA-001 | full 63-operation parser/help/preflight/schema/error/exit/journey final freeze | DXB-IFC-040/041/042/043 | release snapshot exact diff | M6 | Passed | release contract snapshot | cargo test --workspace | all prior milestones passed; workspace: ~100+ tests, 0 failures; evidence: /tmp/grok-goal-b0f31b5cd420/implementer/workspace-tests.log |
-| AT-PROVIDER-INFRA-001 | HTTP transport + async runtime health check | DXB-ARC-019 | localhost:10000 proxy reachable | M5a | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
-| AT-PROVIDER-INFRA-002 | OpenAI-compatible non-streaming completion | DXB-ARC-019 | known prompt → output assertion | M5a | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
-| AT-PROVIDER-INFRA-003 | SSE streaming parse (content + reasoning) | DXB-ARC-019 | deepseek chunk fixture | M5a | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
-| AT-PROVIDER-INFRA-004 | Deadline exceeded → DeadlineExceeded error | DXB-ARC-019 | short deadline fixture | M5a | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
-| AT-PROVIDER-INFRA-005 | Output bounded → OutputExceeded | DXB-ARC-019 | low max_output_bytes | M5a | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
-| AT-PROVIDER-INFRA-006 | Transport unavailable → TransportUnavailable | DXB-ARC-019 | wrong port fixture | M5a | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
-| AT-PROVIDER-INFRA-007 | Real provider chain fallback to Reference | DXB-ARC-019 | unavailable real provider | M5a | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
-| AT-PROVIDER-INFRA-008 | 기존 canary test (AT-HARNESS-001) 회귀 없음 | DXB-ARC-019 | existing 4 tests | M5a | Executable | provider infra report | cargo test -p provider-host harness | local validation required |
-| AT-DEEPSEEK-001 | DeepSeekFlashAdapter RealProvider trait 구현 | DXB-PRV-001 | build_request returns valid ProviderRequest | M5a | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
-| AT-DEEPSEEK-002 | 실제 프록시 호출 → non-empty response | DXB-PRV-001 | live proxy integration | M5a | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
-| AT-DEEPSEEK-003 | reasoning token 포함된 SSE parse | DXB-PRV-001 | deepseek chunk fixture | M5a | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
-| AT-DEEPSEEK-004 | Provider chain: real adapter 우선, Reference 폴백 | DXB-PRV-001 | unavailable adapter scenario | M5a | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
-| AT-DEEPSEEK-005 | temperature=0.0 → deterministic output (soft) | DXB-PRV-001 | repeated call fixture | M5a | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
+| AT-PROVIDER-INFRA-001 | HTTP transport + async runtime health check | DXB-ARC-019 | localhost:10000 proxy reachable | M5 | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
+| AT-PROVIDER-INFRA-002 | OpenAI-compatible non-streaming completion | DXB-ARC-019 | known prompt → output assertion | M5 | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
+| AT-PROVIDER-INFRA-003 | SSE streaming parse (content + reasoning) | DXB-ARC-019 | deepseek chunk fixture | M5 | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
+| AT-PROVIDER-INFRA-004 | Deadline exceeded → DeadlineExceeded error | DXB-ARC-019 | short deadline fixture | M5 | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
+| AT-PROVIDER-INFRA-005 | Output bounded → OutputExceeded | DXB-ARC-019 | low max_output_bytes | M5 | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
+| AT-PROVIDER-INFRA-006 | Transport unavailable → TransportUnavailable | DXB-ARC-019 | wrong port fixture | M5 | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
+| AT-PROVIDER-INFRA-007 | Real provider chain fallback to Reference | DXB-ARC-019 | unavailable real provider | M5 | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
+| AT-PROVIDER-INFRA-008 | 기존 canary test (AT-HARNESS-001) 회귀 없음 | DXB-ARC-019 | existing 4 tests | M5 | Executable | provider infra report | cargo test -p provider-host harness | local validation required |
+| AT-DEEPSEEK-001 | DeepSeekFlashAdapter RealProvider trait 구현 | DXB-PRV-001 | build_request returns valid ProviderRequest | M5 | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
+| AT-DEEPSEEK-002 | 실제 프록시 호출 → non-empty response | DXB-PRV-001 | live proxy integration | M5 | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
+| AT-DEEPSEEK-003 | reasoning token 포함된 SSE parse | DXB-PRV-001 | deepseek chunk fixture | M5 | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
+| AT-DEEPSEEK-004 | Provider chain: real adapter 우선, Reference 폴백 | DXB-PRV-001 | unavailable adapter scenario | M5 | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
+| AT-DEEPSEEK-005 | temperature=0.0 → deterministic output (soft) | DXB-PRV-001 | repeated call fixture | M5 | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
 <!-- acceptance-registry:end -->
 
-`Executable`은 검증 명령과 fixture가 정의돼 있다는 뜻이며 실제 CI PASS가 아니다. `Passed`는 repository commit, 실행 command, artifact/hash가 모두 기록된 경우에만 사용한다. 모든 29개 Acceptance가 `Passed` 또는 `Executable` 상태로 전환 완료 (2026-08-23). Provider Common Infrastructure 13개 Acceptance는 M5a Executable 상태로 추가 (2026-08-23).
+`Executable`은 검증 명령과 fixture가 정의돼 있다는 뜻이며 실제 CI PASS가 아니다. `Passed`는 repository commit, 실행 command, artifact/hash가 모두 기록된 경우에만 사용한다. 모든 29개 Acceptance가 `Passed` 또는 `Executable` 상태로 전환 완료 (2026-08-23). Provider Common Infrastructure 13개 Acceptance는 M5 Executable 상태로 추가 (2026-08-23).
 
 command registry의 Acceptance milestone은 command freeze milestone보다 늦을 수 없다. `DXB-DEL-060` milestone exit registry와 본 표의 milestone은 exact match여야 한다. `DXB-IFC-043`의 journey GO는 본 Acceptance를 자동 Passed로 승격하지 않는다.

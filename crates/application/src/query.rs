@@ -5,8 +5,8 @@ use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
 use dxbot_core::types::{
-    BotId, BotSelector, ChannelSelector, ConversationId, ProjectSelector, ScopeSelector,
-    ThreadId, TaskId,
+    BotId, BotSelector, ChannelSelector, ConversationId, ProjectSelector, ScopeSelector, TaskId,
+    ThreadId,
 };
 
 use crate::mutation::AppError;
@@ -55,7 +55,9 @@ pub struct TaskSummary {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AllLoopResult<T> {
-    Complete { items: Vec<T> },
+    Complete {
+        items: Vec<T>,
+    },
     Partial {
         items: Vec<T>,
         next_cursor: Option<String>,

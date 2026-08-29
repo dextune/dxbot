@@ -130,10 +130,15 @@ fn subprocess_tool_request_cannot_bypass_action_grant() {
 #[test]
 fn subprocess_cancellation_kills_process_before_publish() {
     let root = temp_root("subprocess-cancel");
+    // The child runs far longer than any plausible scheduling delay so the only
+    // way the adapter returns without cancellation is the deadline. The deadline
+    // is set generously above worst-case canceller wakeup latency under parallel
+    // test load, so cancellation deterministically wins over both completion and
+    // the deadline.
     let script = write_script(
         &root,
         "provider-slow.sh",
-        "cat >/dev/null\nsleep 2\nprintf 'text\\tlate\\n'\nprintf 'done\\n'\n",
+        "cat >/dev/null\nsleep 30\nprintf 'text\\tlate\\n'\nprintf 'done\\n'\n",
     );
     let adapter = SubprocessReferenceAdapter::new(&script, &[]);
     let grants = BTreeSet::new();
@@ -146,7 +151,7 @@ fn subprocess_cancellation_kills_process_before_publish() {
     let request = ConformanceRequest {
         model: "fixture-model",
         prompt: "hello",
-        deadline: Duration::from_secs(1),
+        deadline: Duration::from_secs(10),
         cancellation,
         credential: None,
         required_action_grant: None,
@@ -217,7 +222,8 @@ fn provider_canary_runs_through_local_sandbox_lifecycle() {
     let artifact_root = temp_root("sandbox-provider-artifact");
     let workspace_root = temp_root("sandbox-provider-workspace");
     let bytes = b"#!/bin/sh\n[ \"$DXBOT_SANDBOX_NETWORK\" = \"deny\" ] || exit 9\nexit 0\n";
-    let artifact = RuntimeArtifact::publish(&artifact_root, bytes).expect("publish provider canary");
+    let artifact =
+        RuntimeArtifact::publish(&artifact_root, bytes).expect("publish provider canary");
     let spec = SandboxSpec {
         owner_instance_id: "instance-1".to_owned(),
         execution_id: "provider-canary".to_owned(),
@@ -250,12 +256,28 @@ fn temp_root(label: &str) -> PathBuf {
 
 #[cfg(unix)]
 fn write_script(root: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
 
     std::fs::create_dir_all(root).expect("create fixture root");
     let path = root.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write fixture script");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-        .expect("chmod fixture script");
+    // Publish the executable durably before returning: write and fsync a
+    // private temp file with the executable mode already set, close it, then
+    // atomically rename it into place. Spawning an executable that this process
+    // still holds open for writing can fail with `ETXTBSY` under parallel load;
+    // renaming a fully-closed inode avoids that race entirely.
+    let tmp = root.join(format!(".{name}.tmp"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o700)
+        .open(&tmp)
+        .expect("create fixture temp");
+    file.write_all(format!("#!/bin/sh\n{body}").as_bytes())
+        .expect("write fixture script");
+    file.sync_all().expect("sync fixture script");
+    drop(file);
+    std::fs::rename(&tmp, &path).expect("publish fixture script");
     path
 }

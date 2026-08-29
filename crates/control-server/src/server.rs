@@ -6,22 +6,25 @@
 //! Cross-owner Application+Security writes use a durable recovery marker rather
 //! than duplicating either owner's canonical state.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use application::ApplicationMutator;
 use application::mutation::AppError;
-use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
+use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode, TypedNextAction};
 use dxbot_core::types::*;
 use provider_host::{HarnessError, ProviderHost, ProviderInfo, ProviderStatus};
 use runtime_security::{
-    ApprovalDecision, ApprovalDecisionDelta, ApprovalRecord, ApprovalState,
-    MembershipAuthorityBinding, MembershipBindingDelta, PrincipalStatus, SecurityAuditIntent,
-    SecurityDelta, SecurityState, SecurityStateStore,
+    ApprovalBinding, ApprovalDecision, ApprovalDecisionDelta, ApprovalRecord, ApprovalState,
+    MembershipAuthorityBinding, MembershipBindingDelta, ParkedGateBinding, ParkedGateState,
+    ParkingDelta, PrincipalStatus, SecurityAuditIntent, SecurityDelta, SecurityState,
+    SecurityStateStore,
 };
 use serde_json::{Value, json};
 
 use crate::coordination::{SecurityCoordinationRecord, SecurityCoordinationStore};
+use crate::parking_store::{ParkedOperationRecord, ParkedOperationStore};
 
 const OPERATION_ROLE: &str = "mutator";
 const LOCAL_OPERATOR_ROLE: &str = "operator";
@@ -34,6 +37,7 @@ pub enum ServerError {
     PermissionDenied(String),
     NotFound(String),
     Conflict(String),
+    ApprovalRequired(ApprovalRequired),
     ProviderUnavailable(String),
     GapDetected(String),
     Timeout(String),
@@ -41,8 +45,52 @@ pub enum ServerError {
     InternalInvariant(String),
 }
 
+/// Typed non-success behavior returned when a high-risk operation is parked
+/// behind a bound approval. Compatible with the existing `ErrorCode` surface via
+/// [`ErrorCode::ApprovalRequired`]; carries the created approval/operation refs
+/// so the caller can locate the pending decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequired {
+    pub approval_id: ApprovalId,
+    pub operation_id: OperationId,
+    pub command_key: String,
+    pub target: String,
+    pub policy_generation: i64,
+}
+
 impl ServerError {
     pub fn to_dxbot_error(&self) -> DxbotError {
+        if let Self::ApprovalRequired(pending) = self {
+            let approval_ref = format!("approval:{}", pending.approval_id.0);
+            let operation_ref = format!("operation:{}", pending.operation_id.0);
+            return DxbotError {
+                code: ErrorCode::ApprovalRequired,
+                category: ErrorCategory::Approval,
+                message: format!(
+                    "{} is high-risk and is parked pending approval {}",
+                    pending.command_key, pending.approval_id.0
+                ),
+                retryable: true,
+                operation_ref: Some(operation_ref),
+                target_refs: vec![pending.target.clone()],
+                field_violations: Vec::new(),
+                current_revision: None,
+                current_generation: Some(pending.policy_generation),
+                resume_cursor: None,
+                next_actions: vec![
+                    TypedNextAction {
+                        action_code: "approval-approve".to_owned(),
+                        command_key: "approval-approve".to_owned(),
+                        args: json!({ "approval": approval_ref.clone() }),
+                    },
+                    TypedNextAction {
+                        action_code: "approval-deny".to_owned(),
+                        command_key: "approval-deny".to_owned(),
+                        args: json!({ "approval": approval_ref }),
+                    },
+                ],
+            };
+        }
         let (code, category, message, retryable) = match self {
             Self::PermissionDenied(message) => (
                 ErrorCode::PermissionDenied,
@@ -92,6 +140,7 @@ impl ServerError {
                 message.clone(),
                 false,
             ),
+            Self::ApprovalRequired(_) => unreachable!("handled by early return above"),
         };
         DxbotError {
             code,
@@ -124,14 +173,13 @@ pub struct ControlServer {
     providers: Mutex<ProviderHost>,
     security_store: Option<Arc<SecurityStateStore>>,
     coordination_store: Option<Arc<SecurityCoordinationStore>>,
+    parked_store: Option<Arc<ParkedOperationStore>>,
+    parked_memory: Mutex<BTreeMap<String, ParkedOperationRecord>>,
     coordination_lock: Mutex<()>,
 }
 
 impl ControlServer {
-    pub fn new(
-        security: Arc<Mutex<SecurityState>>,
-        application: Arc<ApplicationMutator>,
-    ) -> Self {
+    pub fn new(security: Arc<Mutex<SecurityState>>, application: Arc<ApplicationMutator>) -> Self {
         Self::with_provider_host(security, application, ProviderHost::new())
     }
 
@@ -146,6 +194,8 @@ impl ControlServer {
             providers: Mutex::new(providers),
             security_store: None,
             coordination_store: None,
+            parked_store: None,
+            parked_memory: Mutex::new(BTreeMap::new()),
             coordination_lock: Mutex::new(()),
         }
     }
@@ -157,16 +207,25 @@ impl ControlServer {
         security_store: Arc<SecurityStateStore>,
         coordination_store: Arc<SecurityCoordinationStore>,
     ) -> Result<Self, ServerError> {
+        let parked_store = Arc::new(ParkedOperationStore::new(
+            security_store
+                .path()
+                .with_file_name("parked-operations.json"),
+        ));
         let server = Self {
             security,
             application,
             providers: Mutex::new(providers),
             security_store: Some(security_store),
             coordination_store: Some(coordination_store),
+            parked_store: Some(parked_store),
+            parked_memory: Mutex::new(BTreeMap::new()),
             coordination_lock: Mutex::new(()),
         };
         let guard = server.coordination_guard()?;
+        server.hydrate_parked_memory_locked()?;
         server.recover_pending_locked()?;
+        server.drive_continuations_locked()?;
         drop(guard);
         Ok(server)
     }
@@ -209,7 +268,6 @@ impl ControlServer {
         self.recover_pending()?;
         self.authorize_payload_identity(authenticated_principal, payload)?;
         self.require_local_operator_or_scope(authenticated_principal, &payload.canonical_target)?;
-        reject_unowned_semantics(payload)?;
         match payload.command_key.as_str() {
             "approval-list" | "approval-show" => self.approval_query(payload),
             "provider-list" | "provider-show" => self.provider_query(payload),
@@ -244,6 +302,7 @@ impl ControlServer {
         }
         self.authorize_payload_identity(authenticated_principal, &request.payload)?;
         self.authorize_mutation(authenticated_principal, &request.payload.canonical_target)?;
+        self.authorize_sender_override(authenticated_principal, &request.payload)?;
 
         let _coordination = self.coordination_guard()?;
         self.recover_pending_locked()?;
@@ -256,10 +315,14 @@ impl ControlServer {
             return Ok(result);
         }
 
-        reject_unowned_semantics(&request.payload)?;
         application_contract::validate_materialized_cas(&request.payload)
             .map_err(|error| ServerError::Conflict(error.message))?;
         self.require_provider_admission(&request.payload)?;
+
+        if is_high_risk(&request.payload.command_key)? {
+            return self.park_high_risk_locked(authenticated_principal, request);
+        }
+
         let delta = self.security_delta(authenticated_principal, request)?;
         if delta.is_empty() {
             return self.application.mutate(request).map_err(map_app_error);
@@ -267,7 +330,24 @@ impl ControlServer {
 
         let mut candidate = self.lock_security()?.clone();
         candidate.apply_delta(&delta).map_err(map_security_error)?;
+        let result = self.commit_with_delta_locked(request, &delta, candidate)?;
+        // A committed approval decision may have cleared or denied a parked gate;
+        // drive any now-approved continuations to their terminal Application
+        // commit before returning.
+        self.drive_continuations_locked()?;
+        Ok(result)
+    }
 
+    /// Commit a request together with its non-empty security delta using the
+    /// crash-safe cross-owner protocol. Shared by first submission and parked
+    /// operation continuation so both paths apply exactly once and recover
+    /// identically.
+    fn commit_with_delta_locked(
+        &self,
+        request: &OperationRequest,
+        delta: &SecurityDelta,
+        candidate: SecurityState,
+    ) -> Result<OperationResult, ServerError> {
         match (&self.security_store, &self.coordination_store) {
             (Some(security_store), Some(coordination_store)) => {
                 coordination_store
@@ -310,9 +390,362 @@ impl ControlServer {
                 Ok(result)
             }
             _ => Err(ServerError::InternalInvariant(
-                "security persistence and coordination store must be configured together".to_owned(),
+                "security persistence and coordination store must be configured together"
+                    .to_owned(),
             )),
         }
+    }
+
+    fn hydrate_parked_memory_locked(&self) -> Result<(), ServerError> {
+        let Some(store) = &self.parked_store else {
+            return Ok(());
+        };
+        let records = store.load_all().map_err(|error| {
+            ServerError::RecoveryRequired(format!("cannot load parked operations: {error}"))
+        })?;
+        let security = self.lock_security()?.clone();
+        let mut hydrated = BTreeMap::new();
+        for (approval_key, record) in records {
+            let approval_id = ApprovalId(approval_key.clone());
+            let Some(gate) = security.parking.gate_for_approval(&approval_id) else {
+                // Request-first persistence can leave an orphan if the process
+                // crashes before canonical Security publication. It is safe to
+                // discard because no approval/gate became visible.
+                store.remove(&approval_key).map_err(|error| {
+                    ServerError::RecoveryRequired(format!(
+                        "cannot remove orphan parked operation {approval_key}: {error}"
+                    ))
+                })?;
+                continue;
+            };
+            if gate.state != ParkedGateState::Parked {
+                store.remove(&approval_key).map_err(|error| {
+                    ServerError::RecoveryRequired(format!(
+                        "cannot remove terminal parked operation {approval_key}: {error}"
+                    ))
+                })?;
+                continue;
+            }
+            validate_parked_record(&record, &gate.binding)?;
+            hydrated.insert(approval_key, record);
+        }
+        // Every canonical non-terminal gate must retain its exact replay request.
+        for gate in security.parking.list_gates() {
+            if gate.state == ParkedGateState::Parked
+                && !hydrated.contains_key(&gate.binding.approval_id.0)
+            {
+                return Err(ServerError::RecoveryRequired(format!(
+                    "parked request missing for approval {}",
+                    gate.binding.approval_id.0
+                )));
+            }
+        }
+        *self.parked_memory.lock().map_err(|_| {
+            ServerError::InternalInvariant("parked operation lock unavailable".to_owned())
+        })? = hydrated;
+        Ok(())
+    }
+
+    fn park_high_risk_locked(
+        &self,
+        authenticated_principal: &PrincipalRef,
+        request: &OperationRequest,
+    ) -> Result<OperationResult, ServerError> {
+        const POLICY_GENERATION: i64 = 1;
+        if let Some(existing) = self
+            .lock_security()?
+            .parking
+            .gate_for_operation(&request.new_operation_id)
+        {
+            validate_gate_retry(request, &existing.binding)?;
+            return match existing.state {
+                ParkedGateState::Parked => {
+                    let parked = self
+                        .parked_record_locked(&existing.binding.approval_id.0)?
+                        .ok_or_else(|| {
+                            ServerError::RecoveryRequired(format!(
+                                "parked request missing for approval {}",
+                                existing.binding.approval_id.0
+                            ))
+                        })?;
+                    if parked.request != *request {
+                        return Err(ServerError::Conflict(
+                            "parked request does not match exact retry".to_owned(),
+                        ));
+                    }
+                    Err(ServerError::ApprovalRequired(ApprovalRequired {
+                        approval_id: existing.binding.approval_id,
+                        operation_id: request.new_operation_id.clone(),
+                        command_key: request.payload.command_key.clone(),
+                        target: existing.binding.target,
+                        policy_generation: existing.binding.policy_generation,
+                    }))
+                }
+                ParkedGateState::Denied => Err(ServerError::Conflict(
+                    "parked operation was denied".to_owned(),
+                )),
+                ParkedGateState::Failed => Err(ServerError::Conflict(
+                    existing
+                        .failure_reason
+                        .unwrap_or_else(|| "parked operation continuation failed".to_owned()),
+                )),
+                ParkedGateState::Continued => Err(ServerError::RecoveryRequired(
+                    "continued operation has no durable Application binding".to_owned(),
+                )),
+            };
+        }
+
+        let target = target_label(&request.payload.canonical_target);
+        let mut candidate = self.lock_security()?.clone();
+        let approval_id = candidate
+            .approvals
+            .create_bound_approval(
+                request.new_operation_id.clone(),
+                ApprovalBinding {
+                    action: request.payload.command_key.clone(),
+                    target: target.clone(),
+                    policy_generation: POLICY_GENERATION,
+                },
+                vec![authenticated_principal.clone()],
+            )
+            .map_err(map_security_error)?;
+        let binding = ParkedGateBinding {
+            operation_id: request.new_operation_id.clone(),
+            approval_id: approval_id.clone(),
+            request_digest: request.request_digest.0.clone(),
+            command_key: request.payload.command_key.clone(),
+            target: target.clone(),
+            policy_generation: POLICY_GENERATION,
+        };
+        candidate
+            .apply_delta(&SecurityDelta {
+                membership: None,
+                approval: None,
+                parking: Some(ParkingDelta::Park {
+                    binding: binding.clone(),
+                }),
+                audit_intent: Some(SecurityAuditIntent::new(
+                    request.new_operation_id.clone(),
+                    authenticated_principal.clone(),
+                    format!("park:{}", request.payload.command_key),
+                    target.clone(),
+                )),
+            })
+            .map_err(map_security_error)?;
+
+        let record = ParkedOperationRecord {
+            approval_id: approval_id.0.clone(),
+            request: request.clone(),
+            policy_generation: POLICY_GENERATION,
+        };
+        self.insert_parked_record_locked(&record)?;
+        if let Err(error) = self.persist_security_candidate(candidate) {
+            let _ = self.remove_parked_record_locked(&approval_id.0);
+            return Err(error);
+        }
+
+        Err(ServerError::ApprovalRequired(ApprovalRequired {
+            approval_id,
+            operation_id: request.new_operation_id.clone(),
+            command_key: request.payload.command_key.clone(),
+            target,
+            policy_generation: POLICY_GENERATION,
+        }))
+    }
+
+    fn drive_continuations_locked(&self) -> Result<(), ServerError> {
+        let wakeups = self.lock_security()?.approval_wakeups();
+        for wakeup in wakeups {
+            let snapshot = self.lock_security()?.clone();
+            let Some(gate) = snapshot.parking.gate_for_approval(&wakeup.approval_id) else {
+                // Legacy/manual approvals have no parked operation and retain
+                // their wakeup for their owning continuation mechanism.
+                continue;
+            };
+            if gate.state != ParkedGateState::Parked {
+                self.remove_parked_record_locked(&wakeup.approval_id.0)?;
+                continue;
+            }
+            let approval = snapshot
+                .approvals
+                .get_approval(&wakeup.approval_id)
+                .map_err(map_security_error)?;
+            if approval.state != ApprovalState::Approved {
+                continue;
+            }
+            let record = self
+                .parked_record_locked(&wakeup.approval_id.0)?
+                .ok_or_else(|| {
+                    ServerError::RecoveryRequired(format!(
+                        "approved operation {} has no parked request",
+                        wakeup.operation_id.0
+                    ))
+                })?;
+            validate_parked_record(&record, &gate.binding)?;
+
+            if let Some(result) = self
+                .application
+                .lookup_binding(&record.request.command_id, &record.request.idempotency_key)
+                .map_err(map_app_error)?
+            {
+                validate_exact_retry(&result, &record.request)?;
+                self.mark_continued_without_application_locked(&wakeup.approval_id)?;
+                self.remove_parked_record_locked(&wakeup.approval_id.0)?;
+                continue;
+            }
+
+            if let Err(error) = self.revalidate_parked_request(&record.request) {
+                self.mark_continuation_failed_locked(&wakeup.approval_id, error.to_string())?;
+                self.remove_parked_record_locked(&wakeup.approval_id.0)?;
+                continue;
+            }
+
+            let mut delta = match self
+                .security_delta(&record.request.payload.principal_ref, &record.request)
+            {
+                Ok(delta) => delta,
+                Err(error) if is_terminal_continuation_error(&error) => {
+                    self.mark_continuation_failed_locked(&wakeup.approval_id, error.to_string())?;
+                    self.remove_parked_record_locked(&wakeup.approval_id.0)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            delta.parking = Some(ParkingDelta::Continue {
+                approval_id: wakeup.approval_id.clone(),
+            });
+            let mut candidate = self.lock_security()?.clone();
+            candidate.apply_delta(&delta).map_err(map_security_error)?;
+            match self.commit_with_delta_locked(&record.request, &delta, candidate) {
+                Ok(_) => self.remove_parked_record_locked(&wakeup.approval_id.0)?,
+                Err(error) if is_terminal_continuation_error(&error) => {
+                    self.mark_continuation_failed_locked(&wakeup.approval_id, error.to_string())?;
+                    self.remove_parked_record_locked(&wakeup.approval_id.0)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.cleanup_terminal_parked_locked()
+    }
+
+    fn revalidate_parked_request(&self, request: &OperationRequest) -> Result<(), ServerError> {
+        let principal = &request.payload.principal_ref;
+        if request.idempotency_key.principal_ref != *principal {
+            return Err(ServerError::PermissionDenied(
+                "parked idempotency principal binding mismatch".to_owned(),
+            ));
+        }
+        self.authorize_payload_identity(principal, &request.payload)?;
+        self.authorize_mutation(principal, &request.payload.canonical_target)?;
+        self.authorize_sender_override(principal, &request.payload)?;
+        application_contract::validate_materialized_cas(&request.payload)
+            .map_err(|error| ServerError::Conflict(error.message))?;
+        self.require_provider_admission(&request.payload)
+    }
+
+    fn mark_continued_without_application_locked(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<(), ServerError> {
+        let delta = SecurityDelta {
+            membership: None,
+            approval: None,
+            parking: Some(ParkingDelta::Continue {
+                approval_id: approval_id.clone(),
+            }),
+            audit_intent: None,
+        };
+        let mut candidate = self.lock_security()?.clone();
+        candidate.apply_delta(&delta).map_err(map_security_error)?;
+        self.persist_security_candidate(candidate)
+    }
+
+    fn mark_continuation_failed_locked(
+        &self,
+        approval_id: &ApprovalId,
+        reason: String,
+    ) -> Result<(), ServerError> {
+        let delta = SecurityDelta {
+            membership: None,
+            approval: None,
+            parking: Some(ParkingDelta::Fail {
+                approval_id: approval_id.clone(),
+                reason,
+            }),
+            audit_intent: None,
+        };
+        let mut candidate = self.lock_security()?.clone();
+        candidate.apply_delta(&delta).map_err(map_security_error)?;
+        self.persist_security_candidate(candidate)
+    }
+
+    fn insert_parked_record_locked(
+        &self,
+        record: &ParkedOperationRecord,
+    ) -> Result<(), ServerError> {
+        if let Some(store) = &self.parked_store {
+            store.insert(record).map_err(|error| {
+                ServerError::RecoveryRequired(format!("cannot persist parked operation: {error}"))
+            })?;
+        }
+        let mut parked = self.parked_memory.lock().map_err(|_| {
+            ServerError::InternalInvariant("parked operation lock unavailable".to_owned())
+        })?;
+        match parked.get(&record.approval_id) {
+            Some(existing) if existing == record => Ok(()),
+            Some(_) => Err(ServerError::Conflict(format!(
+                "parked operation conflict for approval {}",
+                record.approval_id
+            ))),
+            None => {
+                parked.insert(record.approval_id.clone(), record.clone());
+                Ok(())
+            }
+        }
+    }
+
+    fn parked_record_locked(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<ParkedOperationRecord>, ServerError> {
+        self.parked_memory
+            .lock()
+            .map_err(|_| {
+                ServerError::InternalInvariant("parked operation lock unavailable".to_owned())
+            })
+            .map(|parked| parked.get(approval_id).cloned())
+    }
+
+    fn remove_parked_record_locked(&self, approval_id: &str) -> Result<(), ServerError> {
+        if let Some(store) = &self.parked_store {
+            store.remove(approval_id).map_err(|error| {
+                ServerError::RecoveryRequired(format!(
+                    "cannot remove terminal parked operation {approval_id}: {error}"
+                ))
+            })?;
+        }
+        self.parked_memory
+            .lock()
+            .map_err(|_| {
+                ServerError::InternalInvariant("parked operation lock unavailable".to_owned())
+            })?
+            .remove(approval_id);
+        Ok(())
+    }
+
+    fn cleanup_terminal_parked_locked(&self) -> Result<(), ServerError> {
+        let terminal = self
+            .lock_security()?
+            .parking
+            .list_gates()
+            .into_iter()
+            .filter(|record| record.state != ParkedGateState::Parked)
+            .map(|record| record.binding.approval_id.0)
+            .collect::<Vec<_>>();
+        for approval_id in terminal {
+            self.remove_parked_record_locked(&approval_id)?;
+        }
+        Ok(())
     }
 
     pub fn lookup_binding(
@@ -373,18 +806,38 @@ impl ControlServer {
                     .as_ref()
                     .and_then(|cas| cas.if_revision)
                     .unwrap_or(*revision);
+                let is_deny = payload.command_key == "approval-deny";
+                let parking = if is_deny
+                    && self
+                        .lock_security()?
+                        .parking
+                        .gate_for_approval(id)
+                        .is_some()
+                {
+                    Some(ParkingDelta::Deny {
+                        approval_id: id.clone(),
+                        reason: payload
+                            .semantic_options
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    })
+                } else {
+                    None
+                };
                 Ok(SecurityDelta {
                     membership: None,
                     approval: Some(ApprovalDecisionDelta {
                         approval_id: id.clone(),
                         expected_revision,
-                        decision: if payload.command_key == "approval-approve" {
-                            ApprovalDecision::Approve
-                        } else {
+                        decision: if is_deny {
                             ApprovalDecision::Deny
+                        } else {
+                            ApprovalDecision::Approve
                         },
                         by: authenticated_principal.clone(),
                     }),
+                    parking,
                     audit_intent: Some(SecurityAuditIntent::new(
                         request.new_operation_id.clone(),
                         authenticated_principal.clone(),
@@ -394,7 +847,8 @@ impl ControlServer {
                 })
             }
             "project-member-set" | "channel-member-set" => {
-                let CanonicalTarget::Membership { scope, member_bot } = &payload.canonical_target else {
+                let CanonicalTarget::Membership { scope, member_bot } = &payload.canonical_target
+                else {
                     return Err(ServerError::Conflict(
                         "membership set requires Membership target".to_owned(),
                     ));
@@ -416,7 +870,9 @@ impl ControlServer {
                     .semantic_options
                     .get("role_ref")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| ServerError::Conflict("membership set requires role_ref".to_owned()))?;
+                    .ok_or_else(|| {
+                        ServerError::Conflict("membership set requires role_ref".to_owned())
+                    })?;
                 let binding = MembershipAuthorityBinding {
                     binding_id: membership_subject_id(scope, member_bot)?,
                     scope: scope.clone(),
@@ -428,6 +884,7 @@ impl ControlServer {
                 Ok(SecurityDelta {
                     membership: Some(MembershipBindingDelta::Upsert { binding }),
                     approval: None,
+                    parking: None,
                     audit_intent: Some(SecurityAuditIntent::new(
                         request.new_operation_id.clone(),
                         authenticated_principal.clone(),
@@ -437,7 +894,8 @@ impl ControlServer {
                 })
             }
             "project-member-remove" | "channel-member-remove" => {
-                let CanonicalTarget::Membership { scope, member_bot } = &payload.canonical_target else {
+                let CanonicalTarget::Membership { scope, member_bot } = &payload.canonical_target
+                else {
                     return Err(ServerError::Conflict(
                         "membership remove requires Membership target".to_owned(),
                     ));
@@ -478,6 +936,7 @@ impl ControlServer {
                 Ok(SecurityDelta {
                     membership: Some(MembershipBindingDelta::Upsert { binding }),
                     approval: None,
+                    parking: None,
                     audit_intent: Some(SecurityAuditIntent::new(
                         request.new_operation_id.clone(),
                         authenticated_principal.clone(),
@@ -491,12 +950,16 @@ impl ControlServer {
                     .semantic_options
                     .get("name")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| ServerError::Conflict("project-create requires name".to_owned()))?;
+                    .ok_or_else(|| {
+                        ServerError::Conflict("project-create requires name".to_owned())
+                    })?;
                 let owner = payload
                     .semantic_options
                     .get("owner_bot")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| ServerError::Conflict("project-create requires owner_bot".to_owned()))?;
+                    .ok_or_else(|| {
+                        ServerError::Conflict("project-create requires owner_bot".to_owned())
+                    })?;
                 let scope = ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
                     project.to_owned(),
                 )));
@@ -512,6 +975,7 @@ impl ControlServer {
                 Ok(SecurityDelta {
                     membership: Some(MembershipBindingDelta::Upsert { binding }),
                     approval: None,
+                    parking: None,
                     audit_intent: Some(SecurityAuditIntent::new(
                         request.new_operation_id.clone(),
                         authenticated_principal.clone(),
@@ -523,6 +987,7 @@ impl ControlServer {
             _ => Ok(SecurityDelta {
                 membership: None,
                 approval: None,
+                parking: None,
                 audit_intent: None,
             }),
         }
@@ -543,7 +1008,8 @@ impl ControlServer {
             ServerError::RecoveryRequired(format!(
                 "cannot load security coordination marker: {error}"
             ))
-        })? else {
+        })?
+        else {
             return Ok(());
         };
         let committed = match self
@@ -589,9 +1055,9 @@ impl ControlServer {
     }
 
     fn coordination_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, ServerError> {
-        self.coordination_lock.lock().map_err(|_| {
-            ServerError::InternalInvariant("coordination lock unavailable".to_owned())
-        })
+        self.coordination_lock
+            .lock()
+            .map_err(|_| ServerError::InternalInvariant("coordination lock unavailable".to_owned()))
     }
 
     fn lock_security(&self) -> Result<std::sync::MutexGuard<'_, SecurityState>, ServerError> {
@@ -605,12 +1071,15 @@ impl ControlServer {
         payload: &CommandPayload,
         raw_selector: Option<&Value>,
     ) -> Result<(CanonicalTarget, CasConditions), ServerError> {
-        let selector = selector_value(raw_selector).or_else(|| match &payload.canonical_target {
+        let selector = selector_value(raw_selector).or(match &payload.canonical_target {
             CanonicalTarget::Approval { id, .. } => Some(id.0.as_str()),
             _ => None,
         });
         let selector = selector.ok_or_else(|| {
-            ServerError::Conflict(format!("{} requires an approval selector", payload.command_key))
+            ServerError::Conflict(format!(
+                "{} requires an approval selector",
+                payload.command_key
+            ))
         })?;
         let security = self.lock_security()?;
         let record = if let Some(operation) = selector.strip_prefix("operation:") {
@@ -658,12 +1127,14 @@ impl ControlServer {
                     .list_approvals()
                     .into_iter()
                     .filter(|record| {
-                        state_filter.as_ref().is_none_or(|state| {
-                            approval_state_name(record.state) == state.as_str()
-                        })
+                        state_filter
+                            .as_ref()
+                            .is_none_or(|state| approval_state_name(record.state) == state.as_str())
                     })
                     .filter(|record| {
-                        scope_filter.is_none_or(|scope| approval_scope_matches(&record.binding.target, scope))
+                        scope_filter.is_none_or(|scope| {
+                            approval_scope_matches(&record.binding.target, scope)
+                        })
                     })
                     .collect();
                 page_approval_records(records, payload)
@@ -691,12 +1162,15 @@ impl ControlServer {
         payload: &CommandPayload,
         raw_selector: Option<&Value>,
     ) -> Result<(CanonicalTarget, CasConditions), ServerError> {
-        let selector = selector_value(raw_selector).or_else(|| match &payload.canonical_target {
+        let selector = selector_value(raw_selector).or(match &payload.canonical_target {
             CanonicalTarget::Provider { id, .. } => Some(id.0.as_str()),
             _ => None,
         });
         let selector = selector.ok_or_else(|| {
-            ServerError::Conflict(format!("{} requires a provider selector", payload.command_key))
+            ServerError::Conflict(format!(
+                "{} requires a provider selector",
+                payload.command_key
+            ))
         })?;
         let id = ProviderId(strip_ref(selector, "provider:"));
         let providers = self.providers.lock().map_err(|_| {
@@ -758,6 +1232,34 @@ impl ControlServer {
         self.require_active_principal(authenticated_principal)
     }
 
+    fn authorize_sender_override(
+        &self,
+        authenticated_principal: &PrincipalRef,
+        payload: &CommandPayload,
+    ) -> Result<(), ServerError> {
+        if payload.command_key != "task-submit"
+            || payload
+                .semantic_options
+                .get("requested_sender_bot")
+                .is_none()
+        {
+            return Ok(());
+        }
+        let security = self.lock_security()?;
+        let principal = active_principal(&security, authenticated_principal)?;
+        if security
+            .authority
+            .check_global_authority(&principal.ref_, LOCAL_OPERATOR_ROLE)
+            .map_err(map_security_error)?
+        {
+            Ok(())
+        } else {
+            Err(ServerError::PermissionDenied(
+                "requested_sender_bot requires local operator authority".to_owned(),
+            ))
+        }
+    }
+
     fn authorize_mutation(
         &self,
         authenticated_principal: &PrincipalRef,
@@ -800,6 +1302,58 @@ impl ControlServer {
     }
 }
 
+fn is_high_risk(command_key: &str) -> Result<bool, ServerError> {
+    application_contract::metadata_for_key(command_key)
+        .map(|metadata| metadata.security_class == "high-risk")
+        .ok_or_else(|| {
+            ServerError::InternalInvariant(format!(
+                "command registry metadata missing for {command_key}"
+            ))
+        })
+}
+
+fn validate_gate_retry(
+    request: &OperationRequest,
+    binding: &ParkedGateBinding,
+) -> Result<(), ServerError> {
+    if binding.operation_id != request.new_operation_id
+        || binding.request_digest != request.request_digest.0
+        || binding.command_key != request.payload.command_key
+        || binding.target != target_label(&request.payload.canonical_target)
+    {
+        return Err(ServerError::Conflict(
+            "parked operation identity does not match exact retry".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_parked_record(
+    record: &ParkedOperationRecord,
+    binding: &ParkedGateBinding,
+) -> Result<(), ServerError> {
+    validate_gate_retry(&record.request, binding)?;
+    if record.approval_id != binding.approval_id.0
+        || record.policy_generation != binding.policy_generation
+    {
+        return Err(ServerError::RecoveryRequired(format!(
+            "parked operation binding mismatch for approval {}",
+            binding.approval_id.0
+        )));
+    }
+    Ok(())
+}
+
+fn is_terminal_continuation_error(error: &ServerError) -> bool {
+    matches!(
+        error,
+        ServerError::PermissionDenied(_)
+            | ServerError::NotFound(_)
+            | ServerError::Conflict(_)
+            | ServerError::ProviderUnavailable(_)
+    )
+}
+
 fn validate_exact_retry(
     result: &OperationResult,
     request: &OperationRequest,
@@ -813,40 +1367,6 @@ fn validate_exact_retry(
         return Err(ServerError::Conflict(
             "existing command binding does not match exact retry identity".to_owned(),
         ));
-    }
-    Ok(())
-}
-
-fn reject_unowned_semantics(payload: &CommandPayload) -> Result<(), ServerError> {
-    let unsupported: &[&str] = match payload.command_key.as_str() {
-        "bot-create" => &[
-            "brain_policy",
-            "permission_policy",
-            "resource_policy",
-            "provider_policy",
-        ],
-        "task-submit" => &[
-            "delegate_to_bot",
-            "requested_sender_bot",
-            "deadline",
-            "budget",
-        ],
-        "task-cancel" | "task-suspend" => &["reason"],
-        "task-result" => &["artifact_id"],
-        "memory-get" => &["scope"],
-        "memory-promote" => &["declassification_ref"],
-        "approval-deny" => &["reason"],
-        _ => &[],
-    };
-    if let Some(field) = unsupported
-        .iter()
-        .copied()
-        .find(|field| payload.semantic_options.get(field).is_some())
-    {
-        return Err(ServerError::Conflict(format!(
-            "{} field '{field}' requires canonical owner semantics that are not yet available; refusing to ignore it",
-            payload.command_key
-        )));
     }
     Ok(())
 }
@@ -916,7 +1436,9 @@ fn page_rows(mut rows: Vec<(String, Value)>, page_size: usize, cursor: Option<&s
     }
     let has_more = rows.len() > page_size;
     let rows = rows.into_iter().take(page_size).collect::<Vec<_>>();
-    let next_cursor = has_more.then(|| rows.last().map(|(key, _)| key.clone())).flatten();
+    let next_cursor = has_more
+        .then(|| rows.last().map(|(key, _)| key.clone()))
+        .flatten();
     json!({
         "items": rows.into_iter().map(|(_, value)| value).collect::<Vec<_>>(),
         "next_cursor": next_cursor,
@@ -1067,6 +1589,18 @@ fn map_security_error(error: runtime_security::Error) -> ServerError {
         }
         runtime_security::Error::AuditIntentConflict(key) => {
             ServerError::Conflict(format!("audit intent conflict: {key}"))
+        }
+        runtime_security::Error::InvalidParkedGate(operation) => {
+            ServerError::Conflict(format!("invalid parked operation: {}", operation.0))
+        }
+        runtime_security::Error::ParkedGateConflict(operation) => {
+            ServerError::Conflict(format!("parked operation conflict: {}", operation.0))
+        }
+        runtime_security::Error::UnknownParkedGate(approval) => {
+            ServerError::NotFound(format!("parked approval not found: {}", approval.0))
+        }
+        runtime_security::Error::ParkedGateDenied(approval) => {
+            ServerError::Conflict(format!("parked approval was denied: {}", approval.0))
         }
     }
 }

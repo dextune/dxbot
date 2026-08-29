@@ -4,9 +4,7 @@ mod m1a_fixture;
 use std::error::Error;
 
 use rusqlite::Connection;
-use storage_spike::{
-    ReceiptDisposition, ReferenceStore, SnapshotBudget, SubmitOutcome,
-};
+use storage_spike::{ReceiptDisposition, ReferenceStore, SnapshotBudget, SubmitOutcome};
 
 use m1a_fixture::{database_path, effect_for, request};
 

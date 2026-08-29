@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ApprovalDecision, ApprovalManager, ApprovalState, AuthorityManager, Error,
-    MembershipAuthorityBinding, PrincipalManager,
+    MembershipAuthorityBinding, ParkedGateBinding, ParkingManager, PrincipalManager,
 };
 
 const SECURITY_SCHEMA_VERSION: u32 = 1;
@@ -59,7 +59,9 @@ pub struct ApprovalWakeup {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum MembershipBindingDelta {
-    Upsert { binding: MembershipAuthorityBinding },
+    Upsert {
+        binding: MembershipAuthorityBinding,
+    },
     Revoke {
         binding_id: String,
         expected_generation: i64,
@@ -74,10 +76,32 @@ pub struct ApprovalDecisionDelta {
     pub by: PrincipalRef,
 }
 
+/// Durable parked-operation gate transition carried alongside a security delta.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ParkingDelta {
+    /// Park a high-risk operation behind a bound approval before mutation.
+    Park { binding: ParkedGateBinding },
+    /// Record that the parked operation committed exactly once after approval.
+    Continue { approval_id: ApprovalId },
+    /// Record a terminal denial with durable reason audit semantics.
+    Deny {
+        approval_id: ApprovalId,
+        reason: Option<String>,
+    },
+    /// Record that approval succeeded but original-request re-evaluation failed.
+    Fail {
+        approval_id: ApprovalId,
+        reason: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityDelta {
     pub membership: Option<MembershipBindingDelta>,
     pub approval: Option<ApprovalDecisionDelta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parking: Option<ParkingDelta>,
     pub audit_intent: Option<SecurityAuditIntent>,
 }
 
@@ -86,12 +110,16 @@ impl SecurityDelta {
         Self {
             membership: None,
             approval: None,
+            parking: None,
             audit_intent: Some(intent),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.membership.is_none() && self.approval.is_none() && self.audit_intent.is_none()
+        self.membership.is_none()
+            && self.approval.is_none()
+            && self.parking.is_none()
+            && self.audit_intent.is_none()
     }
 }
 
@@ -100,6 +128,8 @@ pub struct SecurityState {
     pub principals: PrincipalManager,
     pub approvals: ApprovalManager,
     pub authority: AuthorityManager,
+    #[serde(default)]
+    pub parking: ParkingManager,
     audit_intents: BTreeMap<String, SecurityAuditIntent>,
     approval_wakeups: BTreeMap<String, ApprovalWakeup>,
 }
@@ -146,6 +176,38 @@ impl SecurityState {
             }
         }
 
+        if let Some(parking) = &delta.parking {
+            match parking {
+                ParkingDelta::Park { binding } => {
+                    self.parking.park(binding.clone(), now_secs())?;
+                }
+                ParkingDelta::Continue { approval_id } => {
+                    self.parking.mark_continued(approval_id)?;
+                    // The parked operation reached a terminal Application commit;
+                    // its approval wakeup is fully consumed.
+                    self.approval_wakeups.remove(&approval_id.0);
+                }
+                ParkingDelta::Deny {
+                    approval_id,
+                    reason,
+                } => {
+                    self.parking.mark_denied(approval_id, reason.clone())?;
+                    // A denied gate never continues; drop any wakeup so no
+                    // continuation can ever be driven from it.
+                    self.approval_wakeups.remove(&approval_id.0);
+                }
+                ParkingDelta::Fail {
+                    approval_id,
+                    reason,
+                } => {
+                    self.parking.mark_failed(approval_id, reason.clone())?;
+                    // Re-evaluation reached a terminal failure (for example
+                    // stale CAS), so the wakeup is acknowledged without mutation.
+                    self.approval_wakeups.remove(&approval_id.0);
+                }
+            }
+        }
+
         if let Some(intent) = &delta.audit_intent {
             let key = audit_intent_key(intent);
             match self.audit_intents.get(&key) {
@@ -186,10 +248,15 @@ pub struct SecurityStateStore {
 impl SecurityStateStore {
     pub fn open(path: PathBuf) -> Result<(Self, SecurityState), io::Error> {
         match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+            Ok(metadata)
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    format!("security state is not a direct regular file: {}", path.display()),
+                    format!(
+                        "security state is not a direct regular file: {}",
+                        path.display()
+                    ),
                 ));
             }
             Ok(_) => {}
@@ -199,12 +266,13 @@ impl SecurityStateStore {
         let store = Self { path };
         let state = match fs::read(&store.path) {
             Ok(bytes) => {
-                let snapshot: SecuritySnapshot = serde_json::from_slice(&bytes).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("cannot decode security state: {error}"),
-                    )
-                })?;
+                let snapshot: SecuritySnapshot =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("cannot decode security state: {error}"),
+                        )
+                    })?;
                 if snapshot.schema_version != SECURITY_SCHEMA_VERSION {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -300,9 +368,7 @@ fn now_secs() -> i64 {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use dxbot_core::types::{
-        BotId, BotSelector, ProjectId, ProjectSelector, ScopeSelector,
-    };
+    use dxbot_core::types::{BotId, BotSelector, ProjectId, ProjectSelector, ScopeSelector};
 
     use crate::{ApprovalBinding, ApprovalDecision};
 
@@ -330,6 +396,7 @@ mod tests {
                 binding: binding.clone(),
             }),
             approval: None,
+            parking: None,
             audit_intent: None,
         };
         state.apply_delta(&delta).expect("first apply");
@@ -355,6 +422,7 @@ mod tests {
                     binding: membership_binding(1, true),
                 }),
                 approval: None,
+                parking: None,
                 audit_intent: None,
             })
             .expect("create binding");
@@ -363,11 +431,15 @@ mod tests {
                 binding: membership_binding(1, false),
             }),
             approval: None,
+            parking: None,
             audit_intent: None,
         };
         state.apply_delta(&revoke).expect("revoke");
         state.apply_delta(&revoke).expect("replay revoke");
-        let tombstone = state.authority.membership_binding("member-a").expect("binding");
+        let tombstone = state
+            .authority
+            .membership_binding("member-a")
+            .expect("binding");
         assert!(!tombstone.active);
         assert_eq!(tombstone.generation, 2);
     }
@@ -426,6 +498,7 @@ mod tests {
                 decision: ApprovalDecision::Approve,
                 by: approver.clone(),
             }),
+            parking: None,
             audit_intent: Some(SecurityAuditIntent {
                 operation_id: OperationId("decision-operation".to_owned()),
                 principal_ref: approver,

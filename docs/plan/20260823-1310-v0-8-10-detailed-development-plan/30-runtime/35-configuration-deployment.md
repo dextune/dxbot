@@ -6,7 +6,7 @@ status: "Accepted"
 normative: true
 priority: "P0"
 last_updated: "2026-08-23"
-depends_on: ["DXB-ARC-011", "DXB-RUN-032", "DXB-IFC-043"]
+depends_on: ["DXB-ARC-011", "DXB-RUN-032"]
 ---
 # 구성·Bootstrap·Default Policy·Runtime Instance·배포
 

@@ -2,10 +2,10 @@
 title: "v0.8.10 Review Fix Plan — Clippy·Warning·Error Loss 개선"
 document_id: "DXB-DEL-065"
 version: "0.8.10"
-status: "Completed"
+status: "Reference Snapshot"
 normative: false
 priority: "P0"
-last_updated: "2026-08-23 (all 9 issues resolved: 6 plan + 3 hidden clippy)"
+last_updated: "2026-08-23"
 depends_on: ["DXB-DEL-061", "DXB-ENG-052", "DXB-IFC-040"]
 ---
 # v0.8.10 Review Fix Plan — Clippy·Warning·Error Loss 개선

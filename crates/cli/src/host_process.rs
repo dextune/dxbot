@@ -76,7 +76,11 @@ impl HostArgs {
 }
 
 #[cfg(unix)]
-fn require_value<'a>(args: &'a [OsString], index: usize, key: &str) -> Result<&'a OsString, String> {
+fn require_value<'a>(
+    args: &'a [OsString],
+    index: usize,
+    key: &str,
+) -> Result<&'a OsString, String> {
     args.get(index + 1)
         .ok_or_else(|| format!("Runtime Host option {key} requires a value"))
 }

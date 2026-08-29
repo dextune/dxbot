@@ -61,7 +61,7 @@ impl DiscoveryState {
 
         let mut data = Vec::with_capacity(metadata.len() as usize);
         File::open(&path)
-            .and_then(|mut file| {
+            .and_then(|file| {
                 file.take(MAX_DISCOVERY_STATE_BYTES + 1)
                     .read_to_end(&mut data)
                     .map(|_| ())
@@ -90,8 +90,7 @@ impl DiscoveryState {
             .map_err(|error| Error::CorruptState(format!("serialize discovery state: {error}")))?;
         if bytes.len() as u64 > MAX_DISCOVERY_STATE_BYTES {
             return Err(Error::CorruptState(format!(
-                "serialized discovery state exceeds {} bytes",
-                MAX_DISCOVERY_STATE_BYTES
+                "serialized discovery state exceeds {MAX_DISCOVERY_STATE_BYTES} bytes"
             )));
         }
 

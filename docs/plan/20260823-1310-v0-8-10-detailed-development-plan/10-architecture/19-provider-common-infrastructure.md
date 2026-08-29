@@ -2,7 +2,7 @@
 title: "Provider Common Infrastructure — HTTP·Async·Protocol Handler"
 document_id: "DXB-ARC-019"
 version: "0.8.11"
-status: "Draft"
+status: "Accepted"
 normative: true
 priority: "P0"
 last_updated: "2026-08-23"

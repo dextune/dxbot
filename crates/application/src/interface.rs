@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use crate::membership::{MembershipRecord, membership_key};
 use crate::mutation::{AppError, ApplicationMutator};
 use crate::query::scope_owner;
-use crate::state::{ConversationOwner, DomainState, MemoryAssertionStatus, ProcessState};
+use crate::state::{
+    ConversationOwner, DomainState, MemoryAssertionStatus, ProcessState, SideEffectResolveError,
+};
 
 pub const DEFAULT_PAGE_SIZE: usize = 50;
 pub const MAX_PAGE_SIZE: usize = 1000;
@@ -159,18 +161,14 @@ fn resolve_target(
             operation_id,
             command_id,
         } => resolve_operation_target(state, operation_id, command_id, raw),
-        CanonicalTarget::Membership { scope, member_bot } => {
-            Ok(CanonicalTarget::Membership {
-                scope: resolve_scope(state, scope)?,
-                member_bot: resolve_bot_selector(state, member_bot)?,
-            })
-        }
+        CanonicalTarget::Membership { scope, member_bot } => Ok(CanonicalTarget::Membership {
+            scope: resolve_scope(state, scope)?,
+            member_bot: resolve_bot_selector(state, member_bot)?,
+        }),
         CanonicalTarget::SideEffect { id, revision } => {
-            if !state.side_effects.contains_key(id) {
-                return Err(AppError::NotFound(format!("side effect not found: {raw}")));
-            }
+            let resolved = resolve_side_effect_reference(state, id, raw)?;
             Ok(CanonicalTarget::SideEffect {
-                id: id.clone(),
+                id: resolved,
                 revision: *revision,
             })
         }
@@ -221,11 +219,15 @@ fn resolve_operation_target(
         .collect::<Vec<_>>();
     match matching_commands.as_slice() {
         [matching_command] => {
-            let bound_operation = state.command_bindings.get(matching_command).ok_or_else(|| {
-                AppError::Internal(
-                    "idempotency binding exists without command binding".to_owned(),
-                )
-            })?;
+            let bound_operation =
+                state
+                    .command_bindings
+                    .get(matching_command)
+                    .ok_or_else(|| {
+                        AppError::Internal(
+                            "idempotency binding exists without command binding".to_owned(),
+                        )
+                    })?;
             Ok(CanonicalTarget::Operation {
                 operation_id: bound_operation.clone(),
                 command_id: matching_command.clone(),
@@ -239,6 +241,46 @@ fn resolve_operation_target(
             "ambiguous idempotency selector: {raw}"
         ))),
     }
+}
+
+/// Resolve a `side-effect reconcile` selector — which arrives as an opaque
+/// string that is either a canonical side-effect id or an `operation:`/
+/// `command:` reference — to a canonical side-effect id via the durable
+/// Operation linkage index. Ambiguous operation linkage fails closed rather
+/// than silently selecting one side effect.
+fn resolve_side_effect_reference(
+    state: &DomainState,
+    id: &str,
+    raw: &str,
+) -> Result<String, AppError> {
+    // Fast path: a direct canonical id.
+    if state.side_effects.contains_key(id) {
+        return Ok(id.to_owned());
+    }
+    // Interpret the reference as an operation linkage. Accept the same prefixes
+    // the operation selector resolver accepts.
+    let stripped = id
+        .strip_prefix("operation:")
+        .or_else(|| id.strip_prefix("command:"))
+        .unwrap_or(id);
+    let selector = if let Some(bound) = state.command_bindings.get(&CommandId(stripped.to_owned()))
+    {
+        SideEffectSelector::Operation(OperationSelector::OperationId(bound.clone()))
+    } else {
+        SideEffectSelector::Operation(OperationSelector::OperationId(OperationId(
+            stripped.to_owned(),
+        )))
+    };
+    state
+        .resolve_side_effect_id(&selector)
+        .map_err(|error| match error {
+            SideEffectResolveError::NotFound(_) => {
+                AppError::NotFound(format!("side effect not found: {raw}"))
+            }
+            SideEffectResolveError::Ambiguous(operation) => AppError::Conflict(format!(
+                "ambiguous side-effect operation linkage: {operation}"
+            )),
+        })
 }
 
 fn resolve_scope(state: &DomainState, scope: &ScopeSelector) -> Result<ScopeSelector, AppError> {
@@ -346,11 +388,7 @@ fn materialize_cas(
             cas.if_revision.get_or_insert(revision);
         }
         CanonicalTarget::Thread { id, .. } => {
-            let revision = state
-                .threads
-                .get(id)
-                .map(|row| row.revision)
-                .unwrap_or(0);
+            let revision = state.threads.get(id).map(|row| row.revision).unwrap_or(0);
             if command == "thread-branch" {
                 cas.if_source_revision.get_or_insert(revision);
             } else {
@@ -369,11 +407,7 @@ fn materialize_cas(
             }
         }
         CanonicalTarget::Project { id, .. } => {
-            let revision = state
-                .projects
-                .get(id)
-                .map(|row| row.revision)
-                .unwrap_or(0);
+            let revision = state.projects.get(id).map(|row| row.revision).unwrap_or(0);
             if matches!(command, "task-submit" | "memory-propose") {
                 cas.if_scope_revision.get_or_insert(revision);
             } else if matches!(
@@ -404,11 +438,7 @@ fn materialize_cas(
             }
         }
         CanonicalTarget::Memory { id, .. } => {
-            let revision = state
-                .memories
-                .get(id)
-                .map(|row| row.revision)
-                .unwrap_or(0);
+            let revision = state.memories.get(id).map(|row| row.revision).unwrap_or(0);
             if command == "memory-promote" {
                 cas.if_proposal_revision.get_or_insert(revision);
                 if cas.if_target_scope_revision.is_none() {
@@ -540,9 +570,7 @@ fn query_state(state: &DomainState, payload: &CommandPayload) -> Result<Value, A
                 "parent_message_ref": row.parent_message_id.as_ref().map(|id| format!("message:{}", id.0))
             }))
         }
-        "thread-history" => {
-            message_page_for_thread(state, payload, page_size, cursor.as_deref())
-        }
+        "thread-history" => message_page_for_thread(state, payload, page_size, cursor.as_deref()),
         "task-list" => task_page(state, payload, page_size, cursor.as_deref()),
         "task-show" => task_query(state, payload),
         "task-result" => {
@@ -553,11 +581,7 @@ fn query_state(state: &DomainState, payload: &CommandPayload) -> Result<Value, A
                 .tasks
                 .get(id)
                 .ok_or_else(|| AppError::NotFound(format!("task {} does not exist", id.0)))?;
-            Ok(json!({
-                "task_ref": format!("task:{}", id.0),
-                "state": format!("{:?}", row.status).to_ascii_lowercase(),
-                "result": row.result
-            }))
+            task_result_value(row, payload)
         }
         "memory-get" => memory_query(state, payload),
         "memory-search" => memory_search(state, payload, page_size, cursor.as_deref()),
@@ -744,6 +768,58 @@ fn task_value(row: &crate::state::TaskState) -> Value {
     })
 }
 
+/// Project a task result, optionally selecting a single artifact by id.
+///
+/// The canonical result convention is an optional top-level `artifacts` array
+/// of objects each carrying an `artifact_id`. When the caller supplies
+/// `artifact_id`, the selected artifact is returned and an unknown id fails
+/// closed instead of silently returning the whole result.
+fn task_result_value(
+    row: &crate::state::TaskState,
+    payload: &CommandPayload,
+) -> Result<Value, AppError> {
+    let task_ref = format!("task:{}", row.id.0);
+    let state_name = format!("{:?}", row.status).to_ascii_lowercase();
+    let Some(artifact_id) = optional_string(payload, "artifact_id") else {
+        return Ok(json!({
+            "task_ref": task_ref,
+            "state": state_name,
+            "result": row.result
+        }));
+    };
+    let artifacts = row
+        .result
+        .as_ref()
+        .and_then(|result| result.get("artifacts"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "task {} result has no artifacts to select from",
+                row.id.0
+            ))
+        })?;
+    let selected = artifacts
+        .iter()
+        .find(|artifact| {
+            artifact
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == artifact_id)
+        })
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "task {} result has no artifact {artifact_id}",
+                row.id.0
+            ))
+        })?;
+    Ok(json!({
+        "task_ref": task_ref,
+        "state": state_name,
+        "artifact_id": artifact_id,
+        "artifact": selected
+    }))
+}
+
 fn process_query(state: &DomainState, payload: &CommandPayload) -> Result<Value, AppError> {
     let CanonicalTarget::Process { id } = &payload.canonical_target else {
         return Err(target_error(payload));
@@ -780,6 +856,18 @@ fn memory_query(state: &DomainState, payload: &CommandPayload) -> Result<Value, 
         .memories
         .get(id)
         .ok_or_else(|| AppError::NotFound(format!("memory {} does not exist", id.0)))?;
+    // Optional `scope` disambiguation: when the caller supplies a scope, it must
+    // validate against the memory's canonical scope. An unresolvable or
+    // mismatching scope fails closed rather than silently returning the memory.
+    if let Some(scope) = optional_string(payload, "scope") {
+        let requested = scope_owner(&resolve_scope(state, &parse_scope(&scope))?);
+        if requested != row.scope_key {
+            return Err(AppError::NotFound(format!(
+                "memory {} is not in scope {}",
+                id.0, scope
+            )));
+        }
+    }
     Ok(memory_value(row))
 }
 
@@ -790,7 +878,12 @@ fn memory_value(row: &crate::state::MemoryState) -> Value {
         "revision": row.revision,
         "state": format!("{:?}", row.status).to_ascii_lowercase(),
         "statement": row.statement,
-        "evidence": row.evidence
+        "evidence": row.evidence,
+        "declassification_refs": row
+            .declassifications
+            .iter()
+            .map(|record| record.declassification_ref.clone())
+            .collect::<Vec<_>>()
     })
 }
 
@@ -1006,10 +1099,7 @@ fn optional_string(payload: &CommandPayload, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn required_string<'a>(
-    payload: &'a CommandPayload,
-    name: &str,
-) -> Result<&'a str, AppError> {
+fn required_string<'a>(payload: &'a CommandPayload, name: &str) -> Result<&'a str, AppError> {
     payload
         .semantic_options
         .get(name)
@@ -1033,16 +1123,10 @@ fn content_contains(content: &ContentSource, query: &str) -> bool {
     }
 }
 
-fn exactly_one<'a, T>(
-    values: Vec<&'a T>,
-    kind: &str,
-    selector: &str,
-) -> Result<&'a T, AppError> {
+fn exactly_one<'a, T>(values: Vec<&'a T>, kind: &str, selector: &str) -> Result<&'a T, AppError> {
     match values.as_slice() {
         [one] => Ok(*one),
-        [] => Err(AppError::NotFound(format!(
-            "{kind} not found: {selector}"
-        ))),
+        [] => Err(AppError::NotFound(format!("{kind} not found: {selector}"))),
         _ => Err(AppError::Conflict(format!(
             "ambiguous {kind} selector: {selector}"
         ))),
@@ -1147,6 +1231,7 @@ mod tests {
                 name: "a".to_owned(),
                 revision: 3,
                 lifecycle: LifecycleState::Active,
+                policy_bindings: Default::default(),
             },
         );
         state.projects.insert(
@@ -1179,18 +1264,16 @@ mod tests {
                 scope_key: "bot:bot-a".to_owned(),
                 revision: 1,
                 status: MemoryAssertionStatus::Proposed,
-                statement: ContentSource::Text { value: "x".to_owned() },
+                statement: ContentSource::Text {
+                    value: "x".to_owned(),
+                },
                 evidence: Vec::new(),
                 history: Vec::new(),
+                declassifications: Vec::new(),
             },
         );
-        materialize_cas(
-            &state,
-            &payload,
-            &payload.canonical_target,
-            &mut cas,
-        )
-        .expect("CAS materializes");
+        materialize_cas(&state, &payload, &payload.canonical_target, &mut cas)
+            .expect("CAS materializes");
         assert_eq!(cas.if_target_scope_revision, Some(7));
     }
 

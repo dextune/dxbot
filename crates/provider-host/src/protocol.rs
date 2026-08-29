@@ -322,9 +322,7 @@ impl ChatCompletionProtocol {
             }
 
             while let Some((position, separator_len)) = find_sse_separator(&buffer) {
-                let mut frame = buffer
-                    .drain(..position + separator_len)
-                    .collect::<Vec<_>>();
+                let mut frame = buffer.drain(..position + separator_len).collect::<Vec<_>>();
                 frame.truncate(position);
                 if process_sse_frame(
                     &frame,

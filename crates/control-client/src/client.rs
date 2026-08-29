@@ -32,7 +32,7 @@ pub enum ClientError {
     RecoveryRequired(CommandId),
     TransportUnavailable,
     Transport(String),
-    Remote(DxbotError),
+    Remote(Box<DxbotError>),
     IdempotencyKeyConflict(CommandId),
     RequestDigestConflict(CommandId),
     OperationIdConflict(CommandId),
@@ -55,10 +55,17 @@ impl fmt::Display for ClientError {
                 write!(formatter, "record not committed: {}", command_id.0)
             }
             Self::RecoveryRequired(command_id) => {
-                write!(formatter, "recovery required before reissue: {}", command_id.0)
+                write!(
+                    formatter,
+                    "recovery required before reissue: {}",
+                    command_id.0
+                )
             }
             Self::TransportUnavailable => {
-                write!(formatter, "authenticated control transport is not configured")
+                write!(
+                    formatter,
+                    "authenticated control transport is not configured"
+                )
             }
             Self::Transport(message) => write!(formatter, "control transport error: {message}"),
             Self::Remote(error) => write!(formatter, "remote {:?}: {}", error.code, error.message),
@@ -251,9 +258,7 @@ impl SubmissionClient {
                         self.journal.borrow_mut().dispatch(&command_id)?;
                     }
                     JournalState::Dispatching => self.ensure_transport()?,
-                    JournalState::Observed
-                    | JournalState::Terminal
-                    | JournalState::Abandoned => {
+                    JournalState::Observed | JournalState::Terminal | JournalState::Abandoned => {
                         return Err(ClientError::RecoveryRequired(command_id));
                     }
                 }
@@ -352,11 +357,7 @@ impl SubmissionClient {
         }
     }
 
-    fn crash_at(
-        &self,
-        requested: Option<CrashPoint>,
-        at: CrashPoint,
-    ) -> Result<(), ClientError> {
+    fn crash_at(&self, requested: Option<CrashPoint>, at: CrashPoint) -> Result<(), ClientError> {
         if requested == Some(at) {
             if self.hard_crash {
                 std::process::exit(at.exit_code());
@@ -412,10 +413,14 @@ fn ensure_replay_identity(
     request: &OperationRequest,
 ) -> Result<(), ClientError> {
     if record.command_id != request.command_id {
-        return Err(ClientError::IdempotencyKeyConflict(request.command_id.clone()));
+        return Err(ClientError::IdempotencyKeyConflict(
+            request.command_id.clone(),
+        ));
     }
     if record.request_digest != request.request_digest {
-        return Err(ClientError::RequestDigestConflict(request.command_id.clone()));
+        return Err(ClientError::RequestDigestConflict(
+            request.command_id.clone(),
+        ));
     }
     if record.operation_id != request.new_operation_id {
         return Err(ClientError::OperationIdConflict(request.command_id.clone()));

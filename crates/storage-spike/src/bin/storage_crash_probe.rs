@@ -8,9 +8,11 @@ use storage_spike::{CrashPoint, OperationEffect, OperationRequest, ReferenceStor
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
-    let path = PathBuf::from(arguments.next().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "missing database path")
-    })?);
+    let path = PathBuf::from(
+        arguments
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing database path"))?,
+    );
     let mode = arguments
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing crash mode"))?;

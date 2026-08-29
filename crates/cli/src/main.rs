@@ -37,8 +37,7 @@ fn main() {
 fn exit_invalid_unicode(argument: &OsStr) -> ! {
     let _ = writeln!(
         std::io::stderr(),
-        "error Usage: CLI argument is not valid UTF-8: {:?}",
-        argument
+        "error Usage: CLI argument is not valid UTF-8: {argument:?}"
     );
     std::process::exit(2)
 }

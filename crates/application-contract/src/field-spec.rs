@@ -23,7 +23,11 @@ pub(crate) fn parse_field_specs(source: &str) -> Vec<FieldSpec> {
 pub(crate) fn primary_selector_name(specs: &[FieldSpec]) -> Option<&str> {
     specs
         .iter()
-        .find(|spec| is_user_source(&spec.source) && is_selector_type(&spec.type_name))
+        .find(|spec| {
+            is_user_source(&spec.source)
+                && is_selector_type(&spec.type_name)
+                && spec.name != "owner_bot"
+        })
         .map(|spec| spec.name.as_str())
 }
 
@@ -43,10 +47,7 @@ pub(crate) fn local_field_names(typed_fields: &str) -> Vec<&str> {
             }
             let (name, rest) = raw.split_once(':')?;
             let (_, source) = rest.rsplit_once('@').unwrap_or((rest, "argv"));
-            source
-                .trim()
-                .starts_with("local")
-                .then_some(name.trim())
+            source.trim().starts_with("local").then_some(name.trim())
         })
         .collect()
 }

@@ -178,7 +178,10 @@ impl InteractiveJourney {
     ///
     /// Resolving the canonical id yields a concrete [`CanonicalTarget`]. An
     /// unresolved (ambiguous) result cannot be materialized.
-    pub fn materialize_target(&self, result: &PreflightResult) -> Result<CanonicalTarget, InteractiveError> {
+    pub fn materialize_target(
+        &self,
+        result: &PreflightResult,
+    ) -> Result<CanonicalTarget, InteractiveError> {
         let Some(canonical) = &result.canonical_id else {
             return Err(InteractiveError::NoCandidate {
                 selector: "ambiguous (no canonical id)".to_string(),
@@ -295,7 +298,8 @@ fn target_revision(target: &CanonicalTarget) -> i64 {
 fn target_generation(target: &CanonicalTarget) -> Option<i64> {
     match target {
         CanonicalTarget::Task {
-            execution_generation, ..
+            execution_generation,
+            ..
         } => *execution_generation,
         CanonicalTarget::Provider { generation, .. } => {
             if *generation == 0 {

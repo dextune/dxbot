@@ -109,7 +109,7 @@ def self_test(repo: Path):
 
         guide = copy / "docs/agent/guide-index.md"
         original = guide.read_text(encoding="utf-8")
-        guide.write_text(original.replace("repository/index.md", "repository/missing-index.md", 1), encoding="utf-8")
+        guide.write_text(original.replace("](repository/index.md)", "](repository/missing-index.md)", 1), encoding="utf-8")
         expect_failure(copy, "broken relative link", "broken link")
         guide.write_text(original, encoding="utf-8")
 

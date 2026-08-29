@@ -41,7 +41,9 @@ impl CliInput {
         }
         let command_key = args[0].clone();
         if !is_known_command(&command_key) {
-            return Err(util::input_error(format!("unknown command key: '{command_key}'")));
+            return Err(util::input_error(format!(
+                "unknown command key: '{command_key}'"
+            )));
         }
         let metadata = metadata_for_key(&command_key).ok_or_else(|| {
             util::invariant(format!("known command '{command_key}' has no metadata row"))
@@ -133,7 +135,9 @@ impl CliInput {
                         ))
                     })?;
                     if selector.is_some() {
-                        return Err(util::input_error("multiple primary selectors are not allowed"));
+                        return Err(util::input_error(
+                            "multiple primary selectors are not allowed",
+                        ));
                     }
                     let value = take_value(args, &mut i, arg)?;
                     selector = Some(json!({ "kind": kind, "value": value }));
@@ -153,9 +157,10 @@ impl CliInput {
                         .map(|next| !next.starts_with("--"))
                         .unwrap_or(false);
                     let val = if has_value {
-                        let value = args.get(i + 1).cloned().ok_or_else(|| {
-                            util::input_error(format!("{arg} requires a value"))
-                        })?;
+                        let value = args
+                            .get(i + 1)
+                            .cloned()
+                            .ok_or_else(|| util::input_error(format!("{arg} requires a value")))?;
                         i += 2;
                         Value::String(value)
                     } else {
@@ -239,7 +244,9 @@ fn parse_int(v: &str, flag: &str) -> Result<i64, DxbotError> {
 
 fn set_content(slot: &mut Option<ContentSource>, content: ContentSource) -> Result<(), DxbotError> {
     if slot.is_some() {
-        return Err(util::input_error("multiple content sources are not allowed"));
+        return Err(util::input_error(
+            "multiple content sources are not allowed",
+        ));
     }
     *slot = Some(content);
     Ok(())
@@ -425,7 +432,8 @@ mod tests {
 
     #[test]
     fn rejects_multiple_content_sources() {
-        let err = CliInput::parse(&sl(&["conversation-send", "--text", "a", "--stdin"])).unwrap_err();
+        let err =
+            CliInput::parse(&sl(&["conversation-send", "--text", "a", "--stdin"])).unwrap_err();
         assert!(err.message.contains("multiple content sources"));
     }
 

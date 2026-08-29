@@ -39,37 +39,55 @@ pub struct LocalControlHandshake {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum LocalControlRequest {
-    Hello { hello: LocalControlHello },
+    Hello {
+        hello: LocalControlHello,
+    },
     Preflight {
         payload: CommandPayload,
         raw_selector: Option<serde_json::Value>,
     },
-    Query { payload: CommandPayload },
+    Query {
+        payload: CommandPayload,
+    },
     WatchNext {
         payload: CommandPayload,
         cursor: Option<String>,
         timeout_ms: u64,
     },
-    Submit { request: OperationRequest },
+    Submit {
+        request: OperationRequest,
+    },
     LookupBinding {
         command_id: CommandId,
         idempotency_key: IdempotencyKey,
     },
-    StopHost { host_generation: i64 },
+    StopHost {
+        host_generation: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum LocalControlResponse {
-    Handshake { handshake: LocalControlHandshake },
+    Handshake {
+        handshake: LocalControlHandshake,
+    },
     Preflight {
         canonical_target: CanonicalTarget,
         cas: CasConditions,
     },
-    Data { value: serde_json::Value },
-    Operation { result: OperationResult },
-    Binding { result: Option<OperationResult> },
-    Error { error: DxbotError },
+    Data {
+        value: serde_json::Value,
+    },
+    Operation {
+        result: OperationResult,
+    },
+    Binding {
+        result: Option<OperationResult>,
+    },
+    Error {
+        error: DxbotError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +107,9 @@ impl fmt::Display for LocalControlCodecError {
                 formatter,
                 "local control frame exceeds bound: {length} > {maximum}"
             ),
-            Self::InvalidJson(message) => write!(formatter, "invalid local control JSON: {message}"),
+            Self::InvalidJson(message) => {
+                write!(formatter, "invalid local control JSON: {message}")
+            }
         }
     }
 }
@@ -126,10 +146,11 @@ where
             maximum: MAX_LOCAL_CONTROL_FRAME_BYTES,
         });
     }
-    let length = u32::try_from(payload.len()).map_err(|_| LocalControlCodecError::OversizedFrame {
-        length: payload.len(),
-        maximum: MAX_LOCAL_CONTROL_FRAME_BYTES,
-    })?;
+    let length =
+        u32::try_from(payload.len()).map_err(|_| LocalControlCodecError::OversizedFrame {
+            length: payload.len(),
+            maximum: MAX_LOCAL_CONTROL_FRAME_BYTES,
+        })?;
     writer
         .write_all(&length.to_be_bytes())
         .and_then(|()| writer.write_all(&payload))
@@ -245,6 +266,9 @@ mod tests {
         let oversized = (MAX_LOCAL_CONTROL_FRAME_BYTES as u32 + 1).to_be_bytes();
         let error = read_local_control_frame::<_, LocalControlRequest>(&mut oversized.as_slice())
             .expect_err("oversized frame must fail");
-        assert!(matches!(error, LocalControlCodecError::OversizedFrame { .. }));
+        assert!(matches!(
+            error,
+            LocalControlCodecError::OversizedFrame { .. }
+        ));
     }
 }

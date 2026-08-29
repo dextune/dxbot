@@ -16,10 +16,11 @@ use crate::outcome::{DomainOutcome, resolve_outcome};
 use crate::persistence::ApplicationStateStore;
 use crate::query::scope_owner;
 use crate::state::{
-    BotState, ChannelState, ConversationOwner, ConversationState, DomainState,
-    IdempotencyBindingState, LifecycleState, MemoryAssertionStatus, MemoryRevisionState,
-    MemoryState, MessageState, ProjectLifecycle, ProjectState, SideEffectStatus, TaskState,
-    TaskStatus, ThreadState,
+    BotPolicyBindings, BotState, ChannelState, ConversationOwner, ConversationState,
+    DeclassificationRecord, DomainState, IdempotencyBindingState, LifecycleState,
+    MemoryAssertionStatus, MemoryRevisionState, MemoryState, MessageState, ProcessLifecycle,
+    ProcessState, ProjectLifecycle, ProjectState, SideEffectStatus, TaskControlDirective,
+    TaskExecutionConstraints, TaskState, TaskStatus, ThreadState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,8 @@ struct OperationIdentity {
     instance_id: InstanceId,
     request_digest: RequestDigest,
 }
+
+type CommitHook<'a> = dyn FnMut(&CommandPayload, &DomainState) -> Result<(), AppError> + 'a;
 
 #[derive(Debug)]
 pub struct ApplicationMutator {
@@ -73,11 +76,9 @@ impl ApplicationMutator {
     }
 
     pub fn snapshot(&self) -> Result<DomainState, AppError> {
-        self.lock().map(|guard| guard.clone()).map_err(AppError::Internal)
-    }
-
-    pub(crate) fn state_handle(&self) -> Arc<Mutex<DomainState>> {
-        self.state.clone()
+        self.lock()
+            .map(|guard| guard.clone())
+            .map_err(AppError::Internal)
     }
 
     pub fn mutate(&self, request: &OperationRequest) -> Result<OperationResult, AppError> {
@@ -98,7 +99,7 @@ impl ApplicationMutator {
     fn mutate_internal(
         &self,
         request: &OperationRequest,
-        mut hook: Option<&mut dyn FnMut(&CommandPayload, &DomainState) -> Result<(), AppError>>,
+        mut hook: Option<&mut CommitHook<'_>>,
     ) -> Result<OperationResult, AppError> {
         validate_request_identity(request)?;
         let payload = &request.payload;
@@ -139,14 +140,20 @@ impl ApplicationMutator {
             ));
         }
 
-        let rollback = (self.persistence.is_some() || hook.is_some()).then(|| guard.clone());
+        let rollback = guard.clone();
         let identity = OperationIdentity {
             operation_id: request.new_operation_id.clone(),
             command_id: request.command_id.clone(),
             instance_id: payload.instance_id.clone(),
             request_digest: request.request_digest.clone(),
         };
-        let committed_payload = apply_command(&mut guard, payload, &identity)?;
+        let committed_payload = match apply_command(&mut guard, payload, &identity) {
+            Ok(payload) => payload,
+            Err(error) => {
+                *guard = rollback;
+                return Err(error);
+            }
+        };
         let receipt = ReceiptRecord {
             operation_id: identity.operation_id.0.clone(),
             disposition: ReceiptDisposition::Committed,
@@ -167,12 +174,15 @@ impl ApplicationMutator {
             error: None,
             operation_may_continue: false,
         };
-        guard.receipts.insert(identity.operation_id.clone(), receipt);
-        guard.results.insert(identity.operation_id.clone(), result.clone());
-        guard.command_request_digests.insert(
-            identity.command_id.clone(),
-            identity.request_digest.clone(),
-        );
+        guard
+            .receipts
+            .insert(identity.operation_id.clone(), receipt);
+        guard
+            .results
+            .insert(identity.operation_id.clone(), result.clone());
+        guard
+            .command_request_digests
+            .insert(identity.command_id.clone(), identity.request_digest.clone());
         guard
             .command_bindings
             .insert(identity.command_id.clone(), identity.operation_id.clone());
@@ -186,17 +196,13 @@ impl ApplicationMutator {
 
         if let Some(hook) = hook.as_mut() {
             if let Err(error) = hook(payload, &guard) {
-                if let Some(previous) = rollback {
-                    *guard = previous;
-                }
+                *guard = rollback;
                 return Err(error);
             }
         }
         if let Some(store) = &self.persistence {
             if let Err(error) = store.persist(&guard) {
-                if let Some(previous) = rollback {
-                    *guard = previous;
-                }
+                *guard = rollback;
                 return Err(error);
             }
         }
@@ -289,9 +295,9 @@ fn apply_command(
         "channel-send" => send_channel(state, payload, identity),
         "operation-reconcile" => reconcile_operation(state, payload),
         "side-effect-reconcile" => reconcile_side_effect(state, payload),
-        other if target_exists(state, &payload.canonical_target) => Err(AppError::Conflict(format!(
-            "no Application mutation owner for command {other}"
-        ))),
+        other if target_exists(state, &payload.canonical_target) => Err(AppError::Conflict(
+            format!("no Application mutation owner for command {other}"),
+        )),
         other => Err(AppError::NotFound(format!(
             "target for unsupported Application command {other} does not exist"
         ))),
@@ -304,10 +310,18 @@ fn create_bot(
 ) -> Result<Option<serde_json::Value>, AppError> {
     let name = required_field(payload, "name")?;
     if state.bots.values().any(|bot| bot.name == name) {
-        return Err(AppError::Conflict(format!("bot name already exists: {name}")));
+        return Err(AppError::Conflict(format!(
+            "bot name already exists: {name}"
+        )));
     }
     let id = BotId(name.to_owned());
     let conversation_id = ConversationId(format!("{}:main", id.0));
+    let policy_bindings = BotPolicyBindings {
+        brain_policy: optional_field(payload, "brain_policy").map(str::to_owned),
+        permission_policy: optional_field(payload, "permission_policy").map(str::to_owned),
+        resource_policy: optional_field(payload, "resource_policy").map(str::to_owned),
+        provider_policy: optional_field(payload, "provider_policy").map(str::to_owned),
+    };
     state.bots.insert(
         id.clone(),
         BotState {
@@ -315,6 +329,7 @@ fn create_bot(
             name: name.to_owned(),
             revision: 1,
             lifecycle: LifecycleState::Inactive,
+            policy_bindings: policy_bindings.clone(),
         },
     );
     state.conversations.insert(
@@ -331,6 +346,7 @@ fn create_bot(
         "bot_revision": 1,
         "lifecycle": "inactive",
         "main_conversation_ref": format!("conversation:{}", conversation_id.0),
+        "policy_bindings": policy_bindings_value(&policy_bindings),
     })))
 }
 
@@ -350,7 +366,11 @@ fn mutate_bot(
         "bot-activate" => LifecycleState::Active,
         "bot-deactivate" | "bot-restore" => LifecycleState::Inactive,
         "bot-archive" => LifecycleState::Terminated,
-        _ => return Err(AppError::Internal("invalid bot lifecycle command".to_owned())),
+        _ => {
+            return Err(AppError::Internal(
+                "invalid bot lifecycle command".to_owned(),
+            ));
+        }
     };
     bot.revision = next_revision(bot.revision, "bot")?;
     Ok(Some(serde_json::json!({
@@ -372,9 +392,10 @@ fn send_conversation(
     let content = required_materialized_content(payload)?;
     let message_id = MessageId(format!("message:{}", identity.operation_id.0));
     let (sequence, revision) = {
-        let conversation = state.conversations.get_mut(id).ok_or_else(|| {
-            AppError::NotFound(format!("conversation {} does not exist", id.0))
-        })?;
+        let conversation = state
+            .conversations
+            .get_mut(id)
+            .ok_or_else(|| AppError::NotFound(format!("conversation {} does not exist", id.0)))?;
         let sequence = i64::try_from(conversation.messages.len())
             .map_err(|_| AppError::Internal("conversation message count exceeds i64".to_owned()))?
             .checked_add(1)
@@ -532,7 +553,42 @@ fn submit_task(
         &scope,
         payload.cas.as_ref().and_then(|cas| cas.if_scope_revision),
     )?;
+    let constraints = TaskExecutionConstraints {
+        delegate_to_bot: optional_field(payload, "delegate_to_bot").map(str::to_owned),
+        requested_sender_bot: optional_field(payload, "requested_sender_bot").map(str::to_owned),
+        deadline: optional_field(payload, "deadline").map(str::to_owned),
+        budget: optional_field(payload, "budget").map(str::to_owned),
+    };
+    // Explicit delegation/sender refs must resolve so neither field can become
+    // a dangling, silently stored binding. Authority policy remains owned by
+    // Control/Security; Application validates canonical referents.
+    for (field, reference) in [
+        ("delegate_to_bot", constraints.delegate_to_bot.as_deref()),
+        (
+            "requested_sender_bot",
+            constraints.requested_sender_bot.as_deref(),
+        ),
+    ] {
+        let Some(reference) = reference else {
+            continue;
+        };
+        let bot_id = BotId(strip_prefix(reference, "bot:"));
+        if !state.bots.contains_key(&bot_id) && !state.bots.values().any(|bot| bot.name == bot_id.0)
+        {
+            return Err(AppError::NotFound(format!(
+                "{field} references unknown bot: {reference}"
+            )));
+        }
+    }
     let id = TaskId(format!("task:{}", identity.operation_id.0));
+    // Create the durable orchestration Process aggregate. The Process is the
+    // internal producer tied to task submission; it owns only refs/progress and
+    // never copies task lifecycle. Its identity is derived deterministically
+    // from the committing operation so exact retry and restart converge on the
+    // same ProcessId without a second create command.
+    let process_id = ProcessId(format!("process:{}", identity.operation_id.0));
+    let task_ref = format!("task:{}", id.0);
+    let process_ref = format!("process:{}", process_id.0);
     state.tasks.insert(
         id.clone(),
         TaskState {
@@ -543,13 +599,36 @@ fn submit_task(
             status: TaskStatus::Pending,
             intent: payload.content.clone(),
             result: None,
+            constraints: constraints.clone(),
+            control_history: Vec::new(),
+            process_ref: Some(process_ref.clone()),
+        },
+    );
+    state.processes.insert(
+        process_id.clone(),
+        ProcessState {
+            id: process_id.clone(),
+            definition_id: "task-execution".to_owned(),
+            definition_version: "1".to_owned(),
+            revision: 1,
+            scope_ref: scope_owner(&scope),
+            initiator_ref: payload.principal_ref.0.clone(),
+            lifecycle: ProcessLifecycle::Running,
+            current_step_ref: Some(task_ref.clone()),
+            waiting_condition_ref: None,
+            child_refs: vec![task_ref.clone()],
+            progress: 0,
+            terminal_reason: None,
         },
     );
     Ok(Some(serde_json::json!({
-        "task_ref": format!("task:{}", id.0),
+        "task_ref": task_ref,
         "task_revision": 1,
         "execution_generation": 1,
-        "state": "pending"
+        "state": "pending",
+        "process_ref": process_ref,
+        "process_revision": 1,
+        "constraints": constraints_value(&constraints),
     })))
 }
 
@@ -571,13 +650,19 @@ fn control_task(
     } else {
         None
     };
+    let reason = optional_field(payload, "reason").map(str::to_owned);
     let task = state
         .tasks
         .get_mut(id)
         .ok_or_else(|| AppError::NotFound(format!("task {} does not exist", id.0)))?;
     if matches!(payload.command_key.as_str(), "task-cancel" | "task-suspend") {
         let expected = execution_generation
-            .or_else(|| payload.cas.as_ref().and_then(|cas| cas.if_execution_generation))
+            .or_else(|| {
+                payload
+                    .cas
+                    .as_ref()
+                    .and_then(|cas| cas.if_execution_generation)
+            })
             .ok_or_else(|| {
                 AppError::Conflict("task control requires execution generation".to_owned())
             })?;
@@ -588,25 +673,56 @@ fn control_task(
             )));
         }
     }
+    validate_task_control_transition(task.status, payload.command_key.as_str())?;
     match payload.command_key.as_str() {
         "task-cancel" => task.status = TaskStatus::Cancelled,
         "task-suspend" => task.status = TaskStatus::Suspended,
         "task-resume" => {
             task.status = TaskStatus::Running;
-            task.execution_generation = next_revision(task.execution_generation, "execution generation")?;
+            task.execution_generation =
+                next_revision(task.execution_generation, "execution generation")?;
         }
         "task-redirect" => {
             task.intent = replacement;
             task.status = TaskStatus::Pending;
         }
-        _ => return Err(AppError::Internal("invalid task control command".to_owned())),
+        _ => {
+            return Err(AppError::Internal(
+                "invalid task control command".to_owned(),
+            ));
+        }
     }
     task.revision = next_revision(task.revision, "task")?;
+    // Durably record the supervision directive (including its reason) as an
+    // append-only audit entry. The directive references the task revision it
+    // took effect at; it never copies task lifecycle into a second owner.
+    task.control_history.push(TaskControlDirective {
+        command_key: payload.command_key.clone(),
+        applied_revision: task.revision,
+        execution_generation: task.execution_generation,
+        reason: reason.clone(),
+    });
+    let task_status = task.status;
+    let task_revision = task.revision;
+    let process_ref = task.process_ref.clone();
+
+    // Transition the linked orchestration Process by reference. Legacy tasks
+    // have no process_ref and remain controllable; a present but unresolved ref
+    // is corruption and rolls the whole Task+Process mutation back.
+    if let Some(process_ref) = process_ref.as_deref() {
+        advance_process_for_task_control(
+            state,
+            process_ref,
+            payload.command_key.as_str(),
+            reason.as_deref(),
+        )?;
+    }
     Ok(Some(serde_json::json!({
         "task_ref": format!("task:{}", id.0),
-        "task_revision": task.revision,
-        "execution_generation": task.execution_generation,
-        "state": task_status_name(task.status)
+        "task_revision": task_revision,
+        "execution_generation": execution_generation_of(state, id),
+        "state": task_status_name(task_status),
+        "process_ref": process_ref,
     })))
 }
 
@@ -635,6 +751,7 @@ fn propose_memory(
                 statement,
                 evidence,
             }],
+            declassifications: Vec::new(),
         },
     );
     Ok(Some(serde_json::json!({
@@ -681,17 +798,32 @@ fn promote_memory(
     memory.status = MemoryAssertionStatus::Accepted;
     memory.scope_key = scope_owner(&target_scope);
     memory.evidence.extend(evidence);
+    if let Some(declassification_ref) = optional_field(payload, "declassification_ref") {
+        // Persist declassification provenance. The Application does not own the
+        // information-label policy; it durably records the reference and the
+        // revision it was applied at so the field is auditable, not dropped.
+        memory.declassifications.push(DeclassificationRecord {
+            declassification_ref: declassification_ref.to_owned(),
+            applied_revision: memory.revision,
+        });
+    }
     memory.history.push(MemoryRevisionState {
         revision: memory.revision,
         status: memory.status,
         statement: memory.statement.clone(),
         evidence: memory.evidence.clone(),
     });
+    let declassification_refs: Vec<&str> = memory
+        .declassifications
+        .iter()
+        .map(|record| record.declassification_ref.as_str())
+        .collect();
     Ok(Some(serde_json::json!({
         "memory_ref": format!("memory:{}", id.0),
         "revision": memory.revision,
         "state": "accepted",
-        "scope": memory.scope_key
+        "scope": memory.scope_key,
+        "declassification_refs": declassification_refs,
     })))
 }
 
@@ -821,11 +953,14 @@ fn mutate_membership(
             let expected = expected_generation.ok_or_else(|| {
                 AppError::Conflict("membership remove requires generation CAS".to_owned())
             })?;
-            let current = state.memberships.get_mut(&key).ok_or_else(|| {
-                AppError::NotFound(format!("membership {key} does not exist"))
-            })?;
+            let current = state
+                .memberships
+                .get_mut(&key)
+                .ok_or_else(|| AppError::NotFound(format!("membership {key} does not exist")))?;
             if !current.active {
-                return Err(AppError::NotFound(format!("membership {key} is not active")));
+                return Err(AppError::NotFound(format!(
+                    "membership {key} is not active"
+                )));
             }
             if current.generation != expected {
                 return Err(AppError::Conflict(format!(
@@ -984,10 +1119,15 @@ fn reconcile_side_effect(
     };
     row.revision = next_revision(row.revision, "side effect")?;
     row.evidence.extend(evidence);
+    let operation_ref = row
+        .operation_ref
+        .as_ref()
+        .map(|operation| format!("operation:{}", operation.0));
     Ok(Some(serde_json::json!({
         "side_effect_ref": id,
         "revision": row.revision,
-        "status": side_effect_status_name(row.status)
+        "status": side_effect_status_name(row.status),
+        "operation_ref": operation_ref,
     })))
 }
 
@@ -1175,17 +1315,17 @@ fn required_materialized_content(payload: &CommandPayload) -> Result<ContentSour
     }
 }
 
-fn required_field<'a>(
-    payload: &'a CommandPayload,
-    name: &str,
-) -> Result<&'a str, AppError> {
+fn required_field<'a>(payload: &'a CommandPayload, name: &str) -> Result<&'a str, AppError> {
     optional_field(payload, name).ok_or_else(|| {
         AppError::Conflict(format!("{} requires field '{name}'", payload.command_key))
     })
 }
 
 fn optional_field<'a>(payload: &'a CommandPayload, name: &str) -> Option<&'a str> {
-    payload.semantic_options.get(name).and_then(|value| value.as_str())
+    payload
+        .semantic_options
+        .get(name)
+        .and_then(|value| value.as_str())
 }
 
 fn string_list(payload: &CommandPayload, name: &str) -> Vec<String> {
@@ -1214,6 +1354,118 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
+}
+
+fn policy_bindings_value(bindings: &BotPolicyBindings) -> serde_json::Value {
+    serde_json::json!({
+        "brain_policy": bindings.brain_policy,
+        "permission_policy": bindings.permission_policy,
+        "resource_policy": bindings.resource_policy,
+        "provider_policy": bindings.provider_policy,
+    })
+}
+
+fn constraints_value(constraints: &TaskExecutionConstraints) -> serde_json::Value {
+    serde_json::json!({
+        "delegate_to_bot": constraints.delegate_to_bot,
+        "requested_sender_bot": constraints.requested_sender_bot,
+        "deadline": constraints.deadline,
+        "budget": constraints.budget,
+    })
+}
+
+fn execution_generation_of(state: &DomainState, id: &TaskId) -> i64 {
+    state
+        .tasks
+        .get(id)
+        .map(|task| task.execution_generation)
+        .unwrap_or_default()
+}
+
+fn validate_task_control_transition(
+    current: TaskStatus,
+    command_key: &str,
+) -> Result<(), AppError> {
+    let allowed = match command_key {
+        "task-cancel" => matches!(
+            current,
+            TaskStatus::Pending
+                | TaskStatus::Running
+                | TaskStatus::Suspended
+                | TaskStatus::Deferred
+        ),
+        "task-suspend" => matches!(current, TaskStatus::Pending | TaskStatus::Running),
+        "task-resume" => current == TaskStatus::Suspended,
+        "task-redirect" => matches!(
+            current,
+            TaskStatus::Pending
+                | TaskStatus::Running
+                | TaskStatus::Suspended
+                | TaskStatus::Deferred
+        ),
+        _ => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(AppError::Conflict(format!(
+            "{command_key} is invalid while task is {}",
+            task_status_name(current)
+        )))
+    }
+}
+
+/// Transition the orchestration Process linked to a task control directive.
+///
+/// The Process owns only lifecycle/progress; it never copies task fields. A
+/// process reference that no longer resolves (e.g. legacy task predating the
+/// producer) is not fatal — the task control already committed. Terminal
+/// process transitions are idempotent: re-applying the same terminal control
+/// does not advance progress twice or resurrect a terminal Process.
+fn advance_process_for_task_control(
+    state: &mut DomainState,
+    process_ref: &str,
+    command_key: &str,
+    reason: Option<&str>,
+) -> Result<(), AppError> {
+    let process_id = ProcessId(strip_prefix(process_ref, "process:"));
+    let process = state.processes.get_mut(&process_id).ok_or_else(|| {
+        AppError::Internal(format!(
+            "task references missing orchestration process: {process_ref}"
+        ))
+    })?;
+    let (next_lifecycle, terminal_reason) = match command_key {
+        "task-cancel" => (
+            ProcessLifecycle::Cancelled,
+            Some(reason.unwrap_or("task cancelled").to_owned()),
+        ),
+        "task-suspend" => (ProcessLifecycle::Suspended, None),
+        "task-resume" | "task-redirect" => (ProcessLifecycle::Running, None),
+        _ => return Ok(()),
+    };
+    // A terminal Process can never be resurrected or advanced by another
+    // control operation. Exact retries are intercepted by operation identity
+    // before this function is reached.
+    if matches!(
+        process.lifecycle,
+        ProcessLifecycle::Completed
+            | ProcessLifecycle::Cancelled
+            | ProcessLifecycle::Failed
+            | ProcessLifecycle::RecoveryRequired
+    ) {
+        return Err(AppError::Conflict(format!(
+            "process {} is already terminal",
+            process.id.0
+        )));
+    }
+    process.lifecycle = next_lifecycle;
+    process.terminal_reason = terminal_reason;
+    process.progress = process
+        .progress
+        .checked_add(1)
+        .ok_or_else(|| AppError::Internal("process progress exhausted".to_owned()))?;
+    process.revision = next_revision(process.revision, "process")?;
+    Ok(())
 }
 
 fn target_error(payload: &CommandPayload, expected: &str) -> AppError {

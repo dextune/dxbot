@@ -9,12 +9,12 @@ impl ReferenceStore {
         let synchronous = self
             .connection
             .query_row("PRAGMA synchronous", [], |row| row.get(0))?;
-        let wal_autocheckpoint_pages = self
-            .connection
-            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
-        let journal_size_limit_bytes = self
-            .connection
-            .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))?;
+        let wal_autocheckpoint_pages =
+            self.connection
+                .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
+        let journal_size_limit_bytes =
+            self.connection
+                .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))?;
         let temp_store: i64 = self
             .connection
             .query_row("PRAGMA temp_store", [], |row| row.get(0))?;
@@ -43,9 +43,9 @@ impl ReferenceStore {
         let page_count: i64 = self
             .connection
             .query_row("PRAGMA page_count", [], |row| row.get(0))?;
-        let freelist_count: i64 = self
-            .connection
-            .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        let freelist_count: i64 =
+            self.connection
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
         if page_size <= 0 || page_count <= 0 || freelist_count < 0 {
             return Err(SpikeError::InvariantViolation(
                 "invalid sqlite page accounting for disk-full fixture",
@@ -54,25 +54,27 @@ impl ReferenceStore {
 
         self.connection
             .pragma_update(Some("main"), "max_page_count", page_count)?;
-        let max_page_count: i64 = self
-            .connection
-            .query_row("PRAGMA main.max_page_count", [], |row| row.get(0))?;
+        let max_page_count: i64 =
+            self.connection
+                .query_row("PRAGMA main.max_page_count", [], |row| row.get(0))?;
         if max_page_count != page_count {
             return Err(SpikeError::InvariantViolation(
                 "sqlite did not apply disk-full fixture page ceiling",
             ));
         }
 
-        let required_pages = freelist_count
-            .checked_add(8)
-            .ok_or(SpikeError::InvariantViolation(
-                "disk-full fixture page count overflow",
-            ))?;
-        let required_bytes = required_pages
-            .checked_mul(page_size)
-            .ok_or(SpikeError::InvariantViolation(
-                "disk-full fixture byte count overflow",
-            ))?;
+        let required_pages =
+            freelist_count
+                .checked_add(8)
+                .ok_or(SpikeError::InvariantViolation(
+                    "disk-full fixture page count overflow",
+                ))?;
+        let required_bytes =
+            required_pages
+                .checked_mul(page_size)
+                .ok_or(SpikeError::InvariantViolation(
+                    "disk-full fixture byte count overflow",
+                ))?;
         usize::try_from(required_bytes).map_err(|_| {
             SpikeError::InvariantViolation("disk-full fixture byte count does not fit usize")
         })

@@ -6,10 +6,10 @@
 //! stored golden files must not be hand-edited (see the fixture layout guide).
 
 use dxbot_core::DxbotError;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
-use crate::registry::{command_count, REGISTRY};
+use crate::registry::{REGISTRY, command_count};
 use crate::util;
 
 /// Snapshot generator name, embedded so a snapshot can always be traced to its source.
@@ -76,9 +76,8 @@ impl GoldenContract {
             "commands": commands,
         });
 
-        serde_json::to_string_pretty(&snapshot).unwrap_or_else(|e| {
-            panic!("golden snapshot must be serializable: {e}")
-        })
+        serde_json::to_string_pretty(&snapshot)
+            .unwrap_or_else(|e| panic!("golden snapshot must be serializable: {e}"))
     }
 
     /// Verify `expected` (the stored golden file) matches the freshly-generated snapshot.
@@ -156,7 +155,10 @@ fn split_type_cardinality(tp: &str) -> (String, String) {
 }
 
 /// Parse the part after `@`: source token, optional `{items}` and optional `=default`.
-fn parse_source_suffix(after: &str, raw: &str) -> Result<(String, Vec<String>, Option<String>), String> {
+fn parse_source_suffix(
+    after: &str,
+    raw: &str,
+) -> Result<(String, Vec<String>, Option<String>), String> {
     let (token, rest) = match after.find('{') {
         Some(idx) => (&after[..idx], Some(&after[idx..])),
         None => (after, None),
@@ -223,7 +225,10 @@ mod tests {
         assert_eq!(content.field_type, "ContentSource");
         assert_eq!(content.cardinality, "required-one");
         assert_eq!(content.source, "@oneof");
-        assert_eq!(content.items, ["text", "input-file", "stdin", "artifact-ref"]);
+        assert_eq!(
+            content.items,
+            ["text", "input-file", "stdin", "artifact-ref"]
+        );
         assert_eq!(content.default, None);
 
         let ready = &fields[1];

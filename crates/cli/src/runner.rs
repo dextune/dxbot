@@ -35,6 +35,9 @@ const WATCH_POLL_MAX: Duration = Duration::from_secs(1);
 const MAX_ALL_PAGES: usize = 10_000;
 const MAX_ALL_ITEMS: usize = 100_000;
 const MAX_ACCUMULATED_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_DIAGNOSTIC_PAGE_SIZE: usize = 50;
+const MAX_DIAGNOSTIC_PAGE_SIZE: usize = 1000;
+const DIAGNOSTIC_CURSOR_PREFIX: &str = "d";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliOutput {
@@ -99,8 +102,8 @@ impl LocalPaths {
 /// stream would violate the CLI contract.
 pub fn execute(args: &[String]) -> CliOutput {
     let format_hint = requested_format(args);
-    let color_enabled = format_hint == OutputFormat::Human
-        && requested_color(args) == ColorMode::Always;
+    let color_enabled =
+        format_hint == OutputFormat::Human && requested_color(args) == ColorMode::Always;
     match prepare_invocation(args).and_then(execute_prepared_buffered) {
         Ok(output) => decorate_output(output, color_enabled),
         Err(error) => decorate_output(render_error(error, format_hint), color_enabled),
@@ -158,9 +161,9 @@ fn prepare_invocation(args: &[String]) -> Result<PreparedInvocation, DxbotError>
         )));
     }
     if normalized.root_version && normalized.command_tokens.is_empty() {
-        return Ok(PreparedInvocation::Offline(render_version(format_from_tokens(
-            &normalized.global_tokens,
-        )?)));
+        return Ok(PreparedInvocation::Offline(render_version(
+            format_from_tokens(&normalized.global_tokens)?,
+        )));
     }
     if normalized.command_tokens.is_empty() {
         return Err(usage_error("missing command"));
@@ -376,12 +379,10 @@ fn stop_runtime_host(input: &CliInput, format: OutputFormat) -> Result<CliOutput
             .cas
             .and_then(|cas| cas.if_host_generation)
             .unwrap_or(handshake.host_generation);
-        let value = client.stop_host(requested_generation).map_err(client_error)?;
-        Ok(render_value(
-            value,
-            format,
-            Some("Runtime host stopped"),
-        ))
+        let value = client
+            .stop_host(requested_generation)
+            .map_err(client_error)?;
+        Ok(render_value(value, format, Some("Runtime host stopped")))
     }
 }
 
@@ -397,23 +398,34 @@ fn runtime_doctor(input: &CliInput, format: OutputFormat) -> Result<CliOutput, D
     {
         let paths = LocalPaths::discover();
         let discovery = Discovery::at(paths.discovery_root);
-        let (selected, _client, handshake) = authenticated_client(input)?;
+        let (_selected, _client, handshake) = authenticated_client(input)?;
         let provider = discovery
             .doctor_provider(&handshake.instance_id)
             .map_err(|error| error.to_dxbot_error())?;
-        Ok(render_value(
+        let diagnostics = vec![
             json!({
+                "section": "control",
+                "status": "ready",
                 "instance_id": handshake.instance_id,
                 "host_generation": handshake.host_generation,
-                "endpoint": selected.descriptor.endpoint,
-                "control": "ready",
-                "provider": {
-                    "provider_id": provider.provider_id,
-                    "status": provider.status,
-                    "required_capabilities": provider.required_capabilities,
-                    "available": provider.available,
-                }
+                "endpoint_verified": true,
             }),
+            json!({
+                "section": "journal",
+                "status": if paths.journal_root.is_dir() { "ready" } else { "unavailable" },
+                "available": paths.journal_root.is_dir(),
+            }),
+            json!({
+                "section": "provider",
+                "provider_id": provider.provider_id,
+                "status": provider.status,
+                "required_capabilities": provider.required_capabilities,
+                "available": provider.available,
+            }),
+        ];
+        let value = diagnostic_page(input, diagnostics)?;
+        Ok(render_value(
+            value,
             format,
             Some("Runtime doctor completed"),
         ))
@@ -748,10 +760,7 @@ fn render_stream_value(
                 .get("state")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            let cursor = value
-                .get("cursor")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
+            let cursor = value.get("cursor").and_then(Value::as_str).unwrap_or("?");
             let headline = format!("{event}: state={state} cursor={cursor}");
             let headline = if color_enabled {
                 format!("\x1b[36m{headline}\x1b[0m")
@@ -766,11 +775,14 @@ fn render_stream_value(
 #[cfg(unix)]
 fn authenticated_client(
     input: &CliInput,
-) -> Result<(
-    crate::discovery::SelectedEndpoint,
-    LocalControlClient,
-    application_contract::LocalControlHandshake,
-), DxbotError> {
+) -> Result<
+    (
+        crate::discovery::SelectedEndpoint,
+        LocalControlClient,
+        application_contract::LocalControlHandshake,
+    ),
+    DxbotError,
+> {
     let paths = LocalPaths::discover();
     let discovery = Discovery::at(paths.discovery_root);
     let selected = discovery
@@ -826,7 +838,11 @@ fn connect_selected(
     .map_err(client_error)
 }
 
-fn render_operation(result: &OperationResult, command_key: &str, format: OutputFormat) -> CliOutput {
+fn render_operation(
+    result: &OperationResult,
+    command_key: &str,
+    format: OutputFormat,
+) -> CliOutput {
     let renderer = MachineRenderer::new();
     match format {
         OutputFormat::Human => CliOutput::success(format!(
@@ -838,9 +854,9 @@ fn render_operation(result: &OperationResult, command_key: &str, format: OutputF
             output.push('\n');
             CliOutput::success(output)
         }
-        OutputFormat::Jsonl => CliOutput::success(renderer.render_jsonl(&[
-            StreamEvent::Terminal(Box::new(result.clone())),
-        ])),
+        OutputFormat::Jsonl => CliOutput::success(
+            renderer.render_jsonl(&[StreamEvent::Terminal(Box::new(result.clone()))]),
+        ),
     }
 }
 
@@ -977,6 +993,7 @@ fn normalize_invocation(args: &[String]) -> Result<NormalizedInvocation, DxbotEr
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| usage_error(format!("{token} requires a value")))?;
+                validate_global_option_value(token, value)?;
                 global_tokens.push(token.clone());
                 global_tokens.push(value.clone());
                 index += 2;
@@ -1008,6 +1025,21 @@ fn normalize_invocation(args: &[String]) -> Result<NormalizedInvocation, DxbotEr
         root_help,
         root_version,
     })
+}
+
+/// Rejects malformed enumerated global option values (format/color) before any
+/// offline or group-help short-circuit can silently accept them. Value-bearing
+/// options whose grammar is command-scoped are validated later during binding.
+fn validate_global_option_value(flag: &str, value: &str) -> Result<(), DxbotError> {
+    match flag {
+        "--format" => matches!(value, "human" | "json" | "jsonl")
+            .then_some(())
+            .ok_or_else(|| usage_error(format!("invalid --format: '{value}'"))),
+        "--color" => matches!(value, "auto" | "always" | "never")
+            .then_some(())
+            .ok_or_else(|| usage_error(format!("invalid --color: '{value}'"))),
+        _ => Ok(()),
+    }
 }
 
 fn requested_format(args: &[String]) -> OutputFormat {
@@ -1082,6 +1114,66 @@ fn parse_timeout(value: Option<&str>) -> Result<Duration, DxbotError> {
     Ok(duration)
 }
 
+fn diagnostic_page(input: &CliInput, diagnostics: Vec<Value>) -> Result<Value, DxbotError> {
+    let section = local_string(input, "section")?;
+    let mut diagnostics = diagnostics
+        .into_iter()
+        .filter(|item| {
+            section
+                .as_deref()
+                .is_none_or(|wanted| item.get("section").and_then(Value::as_str) == Some(wanted))
+        })
+        .collect::<Vec<_>>();
+    diagnostics.sort_by(|left, right| {
+        left.get("section")
+            .and_then(Value::as_str)
+            .cmp(&right.get("section").and_then(Value::as_str))
+    });
+    if let Some(section) = section.as_deref()
+        && diagnostics.is_empty()
+    {
+        return Err(input_error(format!(
+            "unknown runtime doctor section: {section}; expected control, journal, or provider"
+        )));
+    }
+
+    let page_size = match local_string(input, "page_size")? {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| input_error("runtime doctor page_size must be an integer"))?,
+        None => DEFAULT_DIAGNOSTIC_PAGE_SIZE,
+    };
+    if !(1..=MAX_DIAGNOSTIC_PAGE_SIZE).contains(&page_size) {
+        return Err(input_error(format!(
+            "runtime doctor page_size must be in 1..={MAX_DIAGNOSTIC_PAGE_SIZE}"
+        )));
+    }
+    let offset = match local_string(input, "cursor")? {
+        Some(cursor) => {
+            let encoded = cursor
+                .strip_prefix(DIAGNOSTIC_CURSOR_PREFIX)
+                .ok_or_else(|| input_error("invalid runtime doctor cursor"))?;
+            encoded
+                .parse::<usize>()
+                .map_err(|_| input_error("invalid runtime doctor cursor"))?
+        }
+        None => 0,
+    };
+    if offset > diagnostics.len() {
+        return Err(input_error(
+            "runtime doctor cursor is beyond the result set",
+        ));
+    }
+    let end = offset.saturating_add(page_size).min(diagnostics.len());
+    let has_more = end < diagnostics.len();
+    let next_cursor = has_more.then(|| format!("{DIAGNOSTIC_CURSOR_PREFIX}{end:019}"));
+    Ok(json!({
+        "items": diagnostics[offset..end].to_vec(),
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }))
+}
+
 fn local_bool(input: &CliInput, key: &str) -> Result<bool, DxbotError> {
     match input.fields.get(key) {
         None => Ok(false),
@@ -1117,7 +1209,7 @@ fn render_command_help(command_key: &str) -> String {
     let Some(metadata) = metadata_for_key(command_key) else {
         return format!("unknown command: {command_key}\n");
     };
-    let path = cli_path_tokens(command_key).join(" ");
+    let path = cli_path_tokens(metadata.command_key).join(" ");
     format!(
         "dxb {path}\n\ncommand-key: {}\nkind: {}\ninput: {}\ntarget: {}\noutput: {}\nsecurity: {}\nwait: default={}, allowed={}\nfields: {}\n",
         metadata.command_key,
@@ -1169,7 +1261,7 @@ fn submission_flow_error(error: SubmissionFlowError) -> DxbotError {
 
 fn client_error(error: ClientError) -> DxbotError {
     match error {
-        ClientError::Remote(error) => error,
+        ClientError::Remote(error) => *error,
         ClientError::TransportUnavailable | ClientError::Transport(_) => {
             runtime_unavailable(error.to_string())
         }
@@ -1197,9 +1289,9 @@ fn client_error(error: ClientError) -> DxbotError {
             "Runtime Instance mismatch: client={}, request={}",
             client.0, request.0
         )),
-        ClientError::SimulatedCrash(point) => {
-            internal_error(format!("simulated crash escaped production path: {point:?}"))
-        }
+        ClientError::SimulatedCrash(point) => internal_error(format!(
+            "simulated crash escaped production path: {point:?}"
+        )),
     }
 }
 
@@ -1212,11 +1304,7 @@ fn owner_unavailable(command_key: &str, kind: &str) -> DxbotError {
 }
 
 fn partial_error(message: impl Into<String>, resume_cursor: Option<String>) -> DxbotError {
-    let mut error = error_with(
-        ErrorCode::PartialOrResync,
-        ErrorCategory::Recovery,
-        message,
-    );
+    let mut error = error_with(ErrorCode::PartialOrResync, ErrorCategory::Recovery, message);
     error.resume_cursor = resume_cursor;
     error.retryable = true;
     error
@@ -1231,7 +1319,11 @@ fn input_error(message: impl Into<String>) -> DxbotError {
 }
 
 fn local_error(message: impl Into<String>) -> DxbotError {
-    error_with(ErrorCode::StorageOrCorruption, ErrorCategory::Local, message)
+    error_with(
+        ErrorCode::StorageOrCorruption,
+        ErrorCategory::Local,
+        message,
+    )
 }
 
 fn storage_error(message: impl Into<String>) -> DxbotError {
@@ -1265,14 +1357,14 @@ fn interrupted_error(message: impl Into<String>) -> DxbotError {
 }
 
 fn internal_error(message: impl Into<String>) -> DxbotError {
-    error_with(ErrorCode::InternalInvariant, ErrorCategory::Internal, message)
+    error_with(
+        ErrorCode::InternalInvariant,
+        ErrorCategory::Internal,
+        message,
+    )
 }
 
-fn error_with(
-    code: ErrorCode,
-    category: ErrorCategory,
-    message: impl Into<String>,
-) -> DxbotError {
+fn error_with(code: ErrorCode, category: ErrorCategory, message: impl Into<String>) -> DxbotError {
     DxbotError {
         code,
         category,
@@ -1358,7 +1450,7 @@ mod tests {
                 assert_eq!(kind, "S");
                 assert_eq!(input.global_options.format, OutputFormat::Json);
             }
-            PreparedInvocation::Offline(_) => assert!(false, "expected command"),
+            PreparedInvocation::Offline(_) => panic!("expected command"),
         }
     }
 
@@ -1375,9 +1467,56 @@ mod tests {
     }
 
     #[test]
+    fn runtime_doctor_fields_drive_section_and_cursor_page() {
+        let first_input = parse_bound_input(&args(&["runtime-doctor", "--page-size", "1"]))
+            .expect("doctor input");
+        let diagnostics = vec![
+            json!({"section": "provider", "status": "ready"}),
+            json!({"section": "control", "status": "ready"}),
+        ];
+        let first = diagnostic_page(&first_input, diagnostics.clone()).expect("first page");
+        assert_eq!(first["items"].as_array().expect("items").len(), 1);
+        assert_eq!(first["items"][0]["section"], "control");
+        assert_eq!(first["next_cursor"], "d0000000000000000001");
+
+        let second_input = parse_bound_input(&args(&[
+            "runtime-doctor",
+            "--page-size",
+            "1",
+            "--cursor",
+            "d0000000000000000001",
+        ]))
+        .expect("doctor cursor input");
+        let second = diagnostic_page(&second_input, diagnostics).expect("second page");
+        assert_eq!(second["items"][0]["section"], "provider");
+        assert_eq!(second["has_more"], false);
+    }
+
+    #[test]
+    fn runtime_doctor_section_filters_and_unknown_fails_closed() {
+        let provider = parse_bound_input(&args(&["runtime-doctor", "--section", "provider"]))
+            .expect("provider input");
+        let diagnostics = vec![
+            json!({"section": "control"}),
+            json!({"section": "provider"}),
+        ];
+        let page = diagnostic_page(&provider, diagnostics.clone()).expect("provider page");
+        assert_eq!(page["items"].as_array().expect("items").len(), 1);
+        assert_eq!(page["items"][0]["section"], "provider");
+
+        let unknown = parse_bound_input(&args(&["runtime-doctor", "--section", "secrets"]))
+            .expect("unknown section parses generically");
+        assert!(diagnostic_page(&unknown, diagnostics).is_err());
+    }
+
+    #[test]
     fn machine_output_never_contains_ansi_even_when_color_is_always() {
         let output = execute(&args(&[
-            "--format", "json", "--color", "always", "--version",
+            "--format",
+            "json",
+            "--color",
+            "always",
+            "--version",
         ]));
         assert!(!output.stdout.contains("\u{1b}["));
         let _: Value = serde_json::from_str(output.stdout.trim()).expect("valid json");

@@ -22,11 +22,23 @@ const SUBSCRIPTION_LEASE_SECONDS: i64 = 3600;
 /// A structured event delivered on a subscription.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
-    Progress { message: String, percent: Option<u8> },
-    StatusChange { from: String, to: String },
-    Output { data: String },
-    Complete { result: TaskResult },
-    Error { message: String },
+    Progress {
+        message: String,
+        percent: Option<u8>,
+    },
+    StatusChange {
+        from: String,
+        to: String,
+    },
+    Output {
+        data: String,
+    },
+    Complete {
+        result: TaskResult,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// The terminal result of a task observed through a subscription.
@@ -236,10 +248,7 @@ impl SubscriptionManager {
         (record.delivered_cursor > 0).then(|| record.delivered_cursor.to_string())
     }
 
-    fn try_next_event(
-        &self,
-        subscription: &Subscription,
-    ) -> Result<Option<StreamEvent>, AppError> {
+    fn try_next_event(&self, subscription: &Subscription) -> Result<Option<StreamEvent>, AppError> {
         let mut guard = self.lock()?;
         let (target_id, delivered) = {
             let record = guard
@@ -254,11 +263,10 @@ impl SubscriptionManager {
         };
 
         let next = {
-            let stream = guard
-                .subscriptions
-                .streams
-                .get(&target_id)
-                .ok_or_else(|| AppError::NotFound(format!("no stream for target {target_id}")))?;
+            let stream =
+                guard.subscriptions.streams.get(&target_id).ok_or_else(|| {
+                    AppError::NotFound(format!("no stream for target {target_id}"))
+                })?;
             validate_resume_cursor(&target_id, delivered, stream)?;
             stream
                 .entries
@@ -282,11 +290,7 @@ impl SubscriptionManager {
         Ok(None)
     }
 
-    fn subscribe(
-        &self,
-        target_id: &str,
-        cursor: Option<&str>,
-    ) -> Result<Subscription, AppError> {
+    fn subscribe(&self, target_id: &str, cursor: Option<&str>) -> Result<Subscription, AppError> {
         let mut guard = self.lock()?;
         let registry = &mut guard.subscriptions;
 
@@ -307,9 +311,9 @@ impl SubscriptionManager {
         };
 
         let sequence = registry.next_subscription_seq;
-        registry.next_subscription_seq = sequence.checked_add(1).ok_or_else(|| {
-            AppError::Internal("subscription id space exhausted".to_owned())
-        })?;
+        registry.next_subscription_seq = sequence
+            .checked_add(1)
+            .ok_or_else(|| AppError::Internal("subscription id space exhausted".to_owned()))?;
         let id = format!("sub-{sequence}");
         let now = now_epoch();
         let expires_at = now.saturating_add(SUBSCRIPTION_LEASE_SECONDS);
@@ -385,9 +389,9 @@ fn resync_hint(target_id: &str, oldest: u64, next: u64) -> String {
 fn parse_cursor(cursor: Option<&str>) -> Result<u64, AppError> {
     match cursor {
         None => Ok(0),
-        Some(cursor) => cursor.parse::<u64>().map_err(|_| {
-            AppError::Conflict(format!("invalid subscription cursor: {cursor}"))
-        }),
+        Some(cursor) => cursor
+            .parse::<u64>()
+            .map_err(|_| AppError::Conflict(format!("invalid subscription cursor: {cursor}"))),
     }
 }
 

@@ -4,7 +4,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 /// Stable transport-construction failure that never echoes credential bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -52,7 +52,13 @@ fn membership_remove_requires_exact_generation_and_retains_tombstone() {
     let tombstone = snapshot.memberships.values().next().unwrap();
     assert!(!tombstone.active);
     assert_eq!(tombstone.generation, 2);
-    assert!(manager.list_memberships(&scope, 10, None).unwrap().items.is_empty());
+    assert!(
+        manager
+            .list_memberships(&scope, 10, None)
+            .unwrap()
+            .items
+            .is_empty()
+    );
 }
 
 #[test]
@@ -61,12 +67,7 @@ fn membership_list_returns_paginated_members() {
     let scope = project_scope();
     for index in 0..5 {
         manager
-            .set_membership(
-                &scope,
-                &bot(&format!("bot-{index:02}")),
-                "member",
-                None,
-            )
+            .set_membership(&scope, &bot(&format!("bot-{index:02}")), "member", None)
             .unwrap();
     }
     let page1 = manager.list_memberships(&scope, 2, None).unwrap();
@@ -111,9 +112,7 @@ fn delegation_role_matching_is_exact_not_substring_based() {
 #[test]
 fn membership_keys_do_not_collide_on_delimiters() {
     let mut manager = membership_manager();
-    let scope_a = ScopeSelector::Project(ProjectSelector::VisibleExact(
-        "x|exact:y".to_owned(),
-    ));
+    let scope_a = ScopeSelector::Project(ProjectSelector::VisibleExact("x|exact:y".to_owned()));
     let scope_b = ScopeSelector::Project(ProjectSelector::VisibleExact("x".to_owned()));
     let bot_a = BotSelector::ScopedExact("z".to_owned());
     let bot_b = BotSelector::ScopedExact("y|exact:z".to_owned());

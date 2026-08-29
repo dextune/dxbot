@@ -11,7 +11,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use application_contract::{CliInput, LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_VERSION};
+use application_contract::{
+    CliInput, LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_VERSION,
+};
 use dxbot_core::DxbotError;
 use dxbot_core::error::{ErrorCategory, ErrorCode};
 use dxbot_core::types::{
@@ -219,7 +221,8 @@ mod tests {
     fn request_digest_binds_raw_selector_even_when_payload_is_same() {
         let payload = payload();
         let first = request_digest_for_input(&input("alpha"), &payload).expect("digest computes");
-        let second = request_digest_for_input(&input("bot:alpha"), &payload).expect("digest computes");
+        let second =
+            request_digest_for_input(&input("bot:alpha"), &payload).expect("digest computes");
         assert_ne!(first, second);
     }
 
@@ -230,7 +233,10 @@ mod tests {
         let second = build_operation_request(&input, payload()).expect("request builds");
         assert_ne!(first.command_id, second.command_id);
         assert_ne!(first.new_operation_id, second.new_operation_id);
-        assert_ne!(first.idempotency_key.key_digest, second.idempotency_key.key_digest);
+        assert_ne!(
+            first.idempotency_key.key_digest,
+            second.idempotency_key.key_digest
+        );
         assert_eq!(
             first.idempotency_key.principal_ref,
             first.payload.principal_ref

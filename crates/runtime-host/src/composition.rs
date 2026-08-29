@@ -70,16 +70,40 @@ pub trait RuntimeExtension: fmt::Debug + Send {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompositionError {
-    RegistrationClosed { state: RuntimeCompositionState },
-    InvalidExtensionId { id: String },
-    InvalidCompatibilityGeneration { id: String, generation: i64 },
-    DuplicateExtension { id: String },
-    MissingDependency { id: String, dependency: String },
-    SelfDependency { id: String },
-    DependencyCycle { extension_ids: Vec<String> },
-    StartFailed { id: String, rollback_failures: Vec<String> },
-    MandatoryExtensionDegraded { id: String, rollback_failures: Vec<String> },
-    StopFailed { extension_ids: Vec<String> },
+    RegistrationClosed {
+        state: RuntimeCompositionState,
+    },
+    InvalidExtensionId {
+        id: String,
+    },
+    InvalidCompatibilityGeneration {
+        id: String,
+        generation: i64,
+    },
+    DuplicateExtension {
+        id: String,
+    },
+    MissingDependency {
+        id: String,
+        dependency: String,
+    },
+    SelfDependency {
+        id: String,
+    },
+    DependencyCycle {
+        extension_ids: Vec<String>,
+    },
+    StartFailed {
+        id: String,
+        rollback_failures: Vec<String>,
+    },
+    MandatoryExtensionDegraded {
+        id: String,
+        rollback_failures: Vec<String>,
+    },
+    StopFailed {
+        extension_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,10 +237,7 @@ impl RuntimeComposition {
             for dependent in &dependents[index] {
                 indegree[*dependent] = indegree[*dependent].saturating_sub(1);
                 if indegree[*dependent] == 0 {
-                    ready.insert((
-                        self.entries[*dependent].descriptor.id.clone(),
-                        *dependent,
-                    ));
+                    ready.insert((self.entries[*dependent].descriptor.id.clone(), *dependent));
                 }
             }
         }
@@ -351,11 +372,7 @@ impl RuntimeComposition {
             .any(|entry| entry.descriptor.kind == kind)
     }
 
-    pub fn health(
-        &self,
-        source_watermark: i64,
-        latest_backstop_verified: bool,
-    ) -> InstanceHealth {
+    pub fn health(&self, source_watermark: i64, latest_backstop_verified: bool) -> InstanceHealth {
         let diagnostic_watermark = self
             .diagnostics
             .as_ref()

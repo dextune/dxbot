@@ -1,9 +1,11 @@
+#![allow(clippy::unwrap_used)]
 //! Acceptance tests for `AT-VERSION-001`: minimum client/protocol/schema
 //! compatibility query on the control client.
 //!
 //! `cargo test -p control-client version` runs every test below. The version
 //! compatibility matrix is injected in-memory via the builder, so no network
 //! I/O is required.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use control_client::SubmissionClient;
 use dxbot_core::types::{InstanceId, RemoteVersionInfo, VersionInfo};
@@ -50,9 +52,7 @@ fn version_matrix_includes_minimum_protocol_and_schema() {
 
     // The matrix carries the minimum supported protocol and schema versions.
     assert!(
-        info.supported_protocol_versions
-            .iter()
-            .any(|v| v == "1.0"),
+        info.supported_protocol_versions.iter().any(|v| v == "1.0"),
         "protocol v1.0 must be advertised in the matrix"
     );
     assert!(

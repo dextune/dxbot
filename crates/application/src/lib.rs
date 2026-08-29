@@ -1,15 +1,15 @@
 #![forbid(unsafe_code)]
 
-pub mod mutation;
-pub mod state;
-pub mod persistence;
-pub mod outcome;
-pub mod query;
-pub mod interface;
-pub mod watch;
-pub mod subscription;
-pub mod membership;
 pub mod delegation;
+pub mod interface;
+pub mod membership;
+pub mod mutation;
+pub mod outcome;
+pub mod persistence;
+pub mod query;
+pub mod state;
+pub mod subscription;
+pub mod watch;
 
 pub use delegation::{DelegationManager, DelegationRecord, DelegationStatus, DelegationSummary};
 pub use interface::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
@@ -22,10 +22,12 @@ pub use query::{
     ThreadSummary, all_loop, resync,
 };
 pub use state::{
-    BotState, ChannelState, ConversationOwner, ConversationState, DomainState,
-    IdempotencyBindingState, LifecycleState, MemoryAssertionStatus, MemoryRevisionState,
-    MemoryState, MessageState, ProcessLifecycle, ProcessState, ProjectLifecycle, ProjectState,
-    SideEffectState, SideEffectStatus, TaskState, TaskStatus, ThreadState,
+    BotPolicyBindings, BotState, ChannelState, ConversationOwner, ConversationState,
+    DeclassificationRecord, DomainState, IdempotencyBindingState, LifecycleState,
+    MemoryAssertionStatus, MemoryRevisionState, MemoryState, MessageState, ProcessLifecycle,
+    ProcessState, ProjectLifecycle, ProjectState, SideEffectResolveError, SideEffectState,
+    SideEffectStatus, TaskControlDirective, TaskExecutionConstraints, TaskState, TaskStatus,
+    ThreadState,
 };
 pub use subscription::{
     MAX_EVENTS_PER_STREAM, StreamEvent, Subscription, SubscriptionManager, TaskResult,

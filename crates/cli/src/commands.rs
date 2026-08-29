@@ -145,10 +145,9 @@ impl CoreCommands {
         validate_name(owner)?;
         self.project(
             CMD_TASK_SUBMIT,
-            Some(selector("task", owner)),
+            Some(selector("scope", owner)),
             Some(intent.clone()),
             json!({
-                "owner": owner,
                 "delegate_to_bot": options.delegate_to_bot.as_ref().map(encode_bot),
                 "deadline": options.deadline,
                 "budget": options.budget,

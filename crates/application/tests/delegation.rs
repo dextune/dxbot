@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 //! Acceptance tests for AT-DELEGATE-001: typed multi-bot delegation with
 //! membership and scope-boundary enforcement.
 //!
@@ -5,16 +6,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use application::delegation::{
-    DelegationManager, DelegationStatus, DelegationSummary,
-};
+use application::delegation::{DelegationManager, DelegationStatus, DelegationSummary};
 use application::membership::MembershipManager;
 use application::mutation::AppError;
 use application::query::Page;
 use application::state::DomainState;
-use dxbot_core::types::{
-    BotId, BotSelector, ProjectId, ProjectSelector, ScopeSelector, TaskId,
-};
+use dxbot_core::types::{BotId, BotSelector, ProjectId, ProjectSelector, ScopeSelector, TaskId};
 
 /// A stable Project scope used by every test.
 fn project_scope(id: &str) -> ScopeSelector {
@@ -87,12 +84,7 @@ fn delegation_requires_membership_in_scope() {
 
     // The target bot must also be a member of the scope.
     let err = dm
-        .delegate_task(
-            &TaskId("task-1".to_owned()),
-            &outsider,
-            &outsider,
-            &scope,
-        )
+        .delegate_task(&TaskId("task-1".to_owned()), &outsider, &outsider, &scope)
         .unwrap_err();
     assert!(matches!(err, AppError::PermissionDenied(_)));
 }
@@ -114,7 +106,10 @@ fn delegation_only_target_can_accept() {
     assert!(matches!(err, AppError::PermissionDenied(_)));
 
     // The record remains pending after the failed attempts.
-    assert_eq!(dm.get_delegation(&record.id).unwrap().status, DelegationStatus::Pending);
+    assert_eq!(
+        dm.get_delegation(&record.id).unwrap().status,
+        DelegationStatus::Pending
+    );
 
     // The target bot can accept.
     let accepted = dm.accept_delegation(&record.id, &worker).unwrap();
@@ -134,7 +129,10 @@ fn delegation_only_target_can_reject() {
     assert!(matches!(err, AppError::PermissionDenied(_)));
 
     // Still pending after the failed reject attempt.
-    assert_eq!(dm.get_delegation(&record.id).unwrap().status, DelegationStatus::Pending);
+    assert_eq!(
+        dm.get_delegation(&record.id).unwrap().status,
+        DelegationStatus::Pending
+    );
 
     // The target bot can reject.
     let rejected = dm.reject_delegation(&record.id, &worker).unwrap();

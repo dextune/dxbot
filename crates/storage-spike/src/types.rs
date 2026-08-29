@@ -38,7 +38,9 @@ pub struct OperationEffect<'a> {
 /// Result of accepting or replaying an operation in the M1A reference store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitOutcome {
-    Created { operation_id: String },
+    Created {
+        operation_id: String,
+    },
     Existing {
         operation_id: String,
         disposition: ReceiptDisposition,
@@ -94,7 +96,10 @@ impl fmt::Display for SpikeError {
             Self::IdempotencyConflict => formatter.write_str("idempotency conflict"),
             Self::StaleWriter => formatter.write_str("stale writer fence"),
             Self::UnsupportedSchema(version) => {
-                write!(formatter, "unsupported storage spike schema version: {version}")
+                write!(
+                    formatter,
+                    "unsupported storage spike schema version: {version}"
+                )
             }
             Self::SnapshotLimitExceeded => formatter.write_str("snapshot limit exceeded"),
             Self::SnapshotExpired => formatter.write_str("snapshot expired"),
@@ -120,11 +125,9 @@ impl From<rusqlite::Error> for SpikeError {
 
 impl From<dxbot_core::DxbotError> for SpikeError {
     fn from(error: dxbot_core::DxbotError) -> Self {
-        Self::InvariantViolation(
-            Box::leak(
-                format!("core domain error in storage spike: {}", error.message).into_boxed_str()
-            )
-        )
+        Self::InvariantViolation(Box::leak(
+            format!("core domain error in storage spike: {}", error.message).into_boxed_str(),
+        ))
     }
 }
 

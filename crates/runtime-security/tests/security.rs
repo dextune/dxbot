@@ -36,9 +36,11 @@ fn principal_registration_and_resolution() -> Result<(), Box<dyn Error>> {
     ));
 
     // Unknown principals fail resolution.
-    assert!(manager
-        .resolve_principal(&PrincipalRef("http:stranger".into()))
-        .is_err());
+    assert!(
+        manager
+            .resolve_principal(&PrincipalRef("http:stranger".into()))
+            .is_err()
+    );
     Ok(())
 }
 
@@ -130,8 +132,7 @@ fn pending_operation_continuation_after_approval() -> Result<(), Box<dyn Error>>
     let a = PrincipalRef("http:approver-a".into());
     let b = PrincipalRef("http:approver-b".into());
     let operation = OperationId("op-critical".into());
-    let id: ApprovalId =
-        manager.create_approval(operation.clone(), vec![a.clone(), b.clone()])?;
+    let id: ApprovalId = manager.create_approval(operation.clone(), vec![a.clone(), b.clone()])?;
 
     // The operation is parked behind the pending approval: no continuation.
     assert_eq!(manager.continuation_ready(&id)?, None);

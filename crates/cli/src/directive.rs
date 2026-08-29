@@ -149,7 +149,14 @@ impl DirectiveController {
         task_selector: &str,
         if_revision: Option<i64>,
     ) -> Result<CommandPayload, DirectiveError> {
-        self.task_directive(CMD_TASK_RESUME, task_selector, if_revision, None, None, None)
+        self.task_directive(
+            CMD_TASK_RESUME,
+            task_selector,
+            if_revision,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Creates a `task-redirect` directive on `task_selector`, replacing the

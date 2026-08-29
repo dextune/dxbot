@@ -5,18 +5,18 @@
 
 /// User-facing CLI input types parsed from argv/stdin.
 pub mod cli_input;
-/// Generated command payload and target materialization.
-pub mod contract;
 /// Canonical command metadata and user-facing path resolution.
 pub mod command;
+/// Generated command payload and target materialization.
+pub mod contract;
 /// Verified Instance/authenticated Principal projection for production execution.
 pub mod execution;
+/// Golden-file contract test support.
+pub mod golden;
 /// Registry-driven user path/positional invocation binding.
 pub mod invocation;
 /// Versioned bounded local control protocol shared by client/server.
 pub mod local_control;
-/// Golden-file contract test support.
-pub mod golden;
 
 #[path = "field-spec.rs"]
 mod field_spec;

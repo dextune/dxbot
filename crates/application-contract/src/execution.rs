@@ -60,9 +60,10 @@ fn remove_local_semantic_fields(
             input.command_key
         ))
     })?;
-    let options = payload.semantic_options.as_object_mut().ok_or_else(|| {
-        util::invariant("CommandPayload semantic_options must be a JSON object")
-    })?;
+    let options = payload
+        .semantic_options
+        .as_object_mut()
+        .ok_or_else(|| util::invariant("CommandPayload semantic_options must be a JSON object"))?;
     for name in local_field_names(metadata.typed_fields) {
         options.remove(name);
     }
@@ -109,8 +110,8 @@ mod tests {
 
     #[test]
     fn registry_local_fields_never_cross_wire() {
-        let input = crate::parse_bound_input(&args(&["bot-list", "--all"]))
-            .expect("local all parses");
+        let input =
+            crate::parse_bound_input(&args(&["bot-list", "--all"])).expect("local all parses");
         assert_eq!(input.fields["all"], true);
         let context = ExecutionContext::new(
             InstanceId("verified-instance".to_owned()),

@@ -1,12 +1,13 @@
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::schema::{
     configure_connection, initialize_schema, initialize_writer_fence, verify_writer_fence,
 };
 use crate::{
-    CrashPoint, OperationArtifactCounts, OperationEffect, OperationRequest, SpikeError, SubmitOutcome,
+    CrashPoint, OperationArtifactCounts, OperationEffect, OperationRequest, SpikeError,
+    SubmitOutcome,
 };
 use dxbot_core::receipt::ReceiptDisposition;
 
@@ -200,7 +201,9 @@ impl ReferenceStore {
     pub fn operation_count(&self) -> Result<i64, SpikeError> {
         Ok(self
             .connection
-            .query_row("SELECT COUNT(*) FROM command_bindings", [], |row| row.get(0))?)
+            .query_row("SELECT COUNT(*) FROM command_bindings", [], |row| {
+                row.get(0)
+            })?)
     }
 
     /// Deletes one projection row only for the concurrent snapshot fixture.
@@ -386,7 +389,11 @@ fn insert_new_operation(
              revision = aggregate_state.revision + 1, \
              state_value = excluded.state_value, \
              last_operation_id = excluded.last_operation_id",
-        params![effect.aggregate_id, effect.state_value, request.new_operation_id],
+        params![
+            effect.aggregate_id,
+            effect.state_value,
+            request.new_operation_id
+        ],
     )?;
     transaction.execute(
         "INSERT INTO events(operation_id, aggregate_id, payload) VALUES (?1, ?2, ?3)",

@@ -406,11 +406,20 @@ mod tests {
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     fn path() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "dxbot-application-snapshot-{}-{}.json",
+        let root = std::env::temp_dir().join(format!(
+            "dxbot-application-snapshot-{}-{}",
             std::process::id(),
             TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ))
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).expect("private test root");
+        root.join("application-state.json")
+    }
+
+    fn cleanup(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
     }
 
     #[test]
@@ -428,10 +437,38 @@ mod tests {
         store.persist(&state).expect("snapshot persists");
         let (_, restored) = ApplicationStateStore::open(path.clone()).expect("snapshot restores");
         assert_eq!(
-            restored.command_bindings.get(&CommandId("command-a".to_owned())),
+            restored
+                .command_bindings
+                .get(&CommandId("command-a".to_owned())),
             Some(&OperationId("operation-a".to_owned()))
         );
-        let _ = fs::remove_file(path);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn side_effect_operation_linkage_survives_snapshot_round_trip() {
+        let path = path();
+        let (store, mut state) = ApplicationStateStore::open(path.clone()).expect("store opens");
+        state.side_effects.insert(
+            "effect-a".to_owned(),
+            SideEffectState {
+                id: "effect-a".to_owned(),
+                revision: 1,
+                status: crate::state::SideEffectStatus::Dispatched,
+                evidence: Vec::new(),
+                operation_ref: Some(OperationId("operation-a".to_owned())),
+            },
+        );
+        store.persist(&state).expect("snapshot persists");
+        let (_, restored) = ApplicationStateStore::open(path.clone()).expect("snapshot restores");
+        assert_eq!(
+            restored
+                .side_effects
+                .get("effect-a")
+                .and_then(|effect| effect.operation_ref.as_ref()),
+            Some(&OperationId("operation-a".to_owned()))
+        );
+        cleanup(&path);
     }
 
     #[test]
@@ -456,11 +493,12 @@ mod tests {
             "memberships": [],
             "delegations": []
         });
-        fs::write(&path, serde_json::to_vec(&legacy).expect("legacy encodes")).expect("legacy writes");
+        fs::write(&path, serde_json::to_vec(&legacy).expect("legacy encodes"))
+            .expect("legacy writes");
         #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(OWNER_FILE_MODE)).expect("mode sets");
         let (_, restored) = ApplicationStateStore::open(path.clone()).expect("legacy loads");
         assert!(restored.processes.is_empty());
-        let _ = fs::remove_file(path);
+        cleanup(&path);
     }
 }

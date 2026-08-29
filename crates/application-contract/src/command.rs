@@ -89,7 +89,10 @@ pub fn resolve_cli_path(tokens: &[String]) -> Result<ResolvedCommand, DxbotError
 
     let mut best: Option<ResolvedCommand> = None;
     for row in &REGISTRY {
-        if matches!(row.command_key, "runtime-stop-graceful" | "runtime-stop-host") {
+        if matches!(
+            row.command_key,
+            "runtime-stop-graceful" | "runtime-stop-host"
+        ) {
             continue;
         }
         let path = cli_path_tokens(row.command_key);
@@ -105,9 +108,9 @@ pub fn resolve_cli_path(tokens: &[String]) -> Result<ResolvedCommand, DxbotError
                 command_key: row.command_key,
                 consumed_path_tokens: path.len(),
             };
-            if best.is_none_or(|current| {
-                candidate.consumed_path_tokens > current.consumed_path_tokens
-            }) {
+            if best
+                .is_none_or(|current| candidate.consumed_path_tokens > current.consumed_path_tokens)
+            {
                 best = Some(candidate);
             }
         }
@@ -176,8 +179,8 @@ mod tests {
 
     #[test]
     fn host_stop_mode_is_distinct_from_graceful_stop() {
-        let graceful = resolve_cli_path(&args(&["runtime", "stop"]))
-            .expect("graceful stop must resolve");
+        let graceful =
+            resolve_cli_path(&args(&["runtime", "stop"])).expect("graceful stop must resolve");
         let host = resolve_cli_path(&args(&["runtime", "stop", "--host-stop"]))
             .expect("host stop must resolve");
         assert_eq!(graceful.command_key, "runtime-stop-graceful");

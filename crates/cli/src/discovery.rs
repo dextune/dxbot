@@ -14,9 +14,9 @@ use application_contract::{LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_
 use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
 use dxbot_core::types::{InstanceId, VersionInfo};
 
-pub use runtime_bootstrap::{DISCOVERY_STATE_FILE, DiscoveryEndpoint, DiscoveryState};
 use runtime_bootstrap::bootstrap::Error as BootstrapError;
 use runtime_bootstrap::discovery_state_owner_uid;
+pub use runtime_bootstrap::{DISCOVERY_STATE_FILE, DiscoveryEndpoint, DiscoveryState};
 
 pub const REQUIRED_PROVIDER_CAPABILITIES: &[&str] = &["llm-chat", "embeddings", "auth"];
 
@@ -92,7 +92,10 @@ impl DiscoveryError {
             Self::StateIo { path, message } => dxbot_error(
                 ErrorCode::StorageOrCorruption,
                 ErrorCategory::Local,
-                format!("cannot access discovery state {}: {message}", path.display()),
+                format!(
+                    "cannot access discovery state {}: {message}",
+                    path.display()
+                ),
             ),
             Self::BootstrapConflict { existing } => {
                 let names: Vec<String> = existing.iter().map(|id| id.0.clone()).collect();
@@ -312,12 +315,13 @@ Runtime bootstrap:
     ) -> Result<ProviderDiagnostic, DiscoveryError> {
         let state = DiscoveryState::load_state(&self.base_path)
             .map_err(|error| map_state_error(&self.base_path, error))?;
-        let descriptor = state
-            .instance_endpoints
-            .get(instance_id)
-            .ok_or_else(|| DiscoveryError::NotFound {
-                instance_id: instance_id.clone(),
-            })?;
+        let descriptor =
+            state
+                .instance_endpoints
+                .get(instance_id)
+                .ok_or_else(|| DiscoveryError::NotFound {
+                    instance_id: instance_id.clone(),
+                })?;
         let status = if descriptor.provider_ready {
             "ready"
         } else {

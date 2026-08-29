@@ -10,8 +10,7 @@ use cli::journal::{JournalError, LocalJournal, PrunePolicy};
 use dxbot_core::types::*;
 use dxbot_core::{ReceiptDisposition, ReceiptRecord};
 
-const ZERO_HASH_HEX: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const ZERO_HASH_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 struct TempDir(PathBuf);
 impl TempDir {
@@ -30,10 +29,7 @@ fn temp_base() -> TempDir {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "dxbot-journal-{}-{nanos}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("dxbot-journal-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     TempDir(dir)
 }
@@ -291,7 +287,10 @@ fn journal_multi_process_uses_real_journal_path() {
     while !created.is_file() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(created.is_file(), "first writer did not publish Prepared in time");
+    assert!(
+        created.is_file(),
+        "first writer did not publish Prepared in time"
+    );
 
     let second = std::process::Command::new(helper)
         .arg(base.as_path())

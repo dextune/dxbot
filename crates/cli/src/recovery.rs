@@ -163,10 +163,7 @@ impl RecoveryManager {
         }
     }
 
-    pub fn with_binding_lookup(
-        journal: Arc<Mutex<LocalJournal>>,
-        lookup: BindingLookup,
-    ) -> Self {
+    pub fn with_binding_lookup(journal: Arc<Mutex<LocalJournal>>, lookup: BindingLookup) -> Self {
         Self {
             journal,
             binding_lookup: lookup,
@@ -209,10 +206,10 @@ impl RecoveryManager {
             });
         }
 
-        if self.journal()?.is_prepared_eligible_for_prune(
-            &entry.command_id,
-            DEFAULT_PRUNE_MIN_RETENTION_SECONDS,
-        ) {
+        if self
+            .journal()?
+            .is_prepared_eligible_for_prune(&entry.command_id, DEFAULT_PRUNE_MIN_RETENTION_SECONDS)
+        {
             Ok(RecoveryAction::Prune)
         } else {
             Ok(RecoveryAction::Abandon)
@@ -278,10 +275,7 @@ impl RecoveryManager {
         ))
     }
 
-    pub fn prune_stale_prepared(
-        &mut self,
-        policy: &PrunePolicy,
-    ) -> Result<usize, RecoveryError> {
+    pub fn prune_stale_prepared(&mut self, policy: &PrunePolicy) -> Result<usize, RecoveryError> {
         Ok(self.journal()?.prune_prepared(policy)?)
     }
 

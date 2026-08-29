@@ -4,16 +4,27 @@
 
 use dxbot_core::types::ProviderId;
 use provider_host::{
-    HarnessAdapter, HarnessError, ProviderHost, ProviderStatus, ReferenceProvider,
-    TaskDescription, TaskStatus,
+    HarnessAdapter, HarnessError, ProviderHost, ProviderStatus, ReferenceProvider, TaskDescription,
+    TaskStatus,
 };
+
+/// Absolute wall-clock deadline (Unix epoch seconds) far enough in the future
+/// that the bounded task never expires while the suite runs. `deadline` is an
+/// absolute timestamp, not a relative budget, so a fixed past constant would
+/// spuriously trip `DeadlineExceeded`.
+fn future_deadline() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    i64::try_from(now).unwrap_or(i64::MAX).saturating_add(3_600)
+}
 
 fn task(intent: &str) -> TaskDescription {
     TaskDescription {
         intent: intent.to_string(),
         context: "bounded-context".to_string(),
         budget: Some(10),
-        deadline: Some(1_700_000_000),
+        deadline: Some(future_deadline()),
     }
 }
 
@@ -32,10 +43,12 @@ fn harness_reference_provider_is_always_available() {
     let result = host.execute_task(&task("write a plan")).unwrap();
     assert_eq!(result.output, "write a plan");
     assert_eq!(result.status, TaskStatus::Completed);
-    assert!(result
-        .evidence
-        .iter()
-        .any(|e| e.provider == ProviderId("ref-1".to_string())));
+    assert!(
+        result
+            .evidence
+            .iter()
+            .any(|e| e.provider == ProviderId("ref-1".to_string()))
+    );
 }
 
 #[test]
@@ -59,11 +72,13 @@ fn harness_real_adapter_canary_executes_task() {
     let result = host.execute_task(&task("write a plan")).unwrap();
     assert_eq!(result.output, "adapter:write a plan");
     assert_eq!(result.status, TaskStatus::Completed);
-    assert!(result
-        .evidence
-        .iter()
-        .any(|e| e.provider == ProviderId("adapter-1".to_string())
-            && e.observation == "harness-adapter-canary"));
+    assert!(
+        result
+            .evidence
+            .iter()
+            .any(|e| e.provider == ProviderId("adapter-1".to_string())
+                && e.observation == "harness-adapter-canary")
+    );
 }
 
 #[test]
@@ -86,10 +101,12 @@ fn harness_provider_chain_falls_back_to_reference() {
     // available Reference Provider instead of failing the task.
     let result = host.execute_task(&task("write a plan")).unwrap();
     assert_eq!(result.output, "write a plan");
-    assert!(result
-        .evidence
-        .iter()
-        .any(|e| e.provider == ProviderId("ref-1".to_string())));
+    assert!(
+        result
+            .evidence
+            .iter()
+            .any(|e| e.provider == ProviderId("ref-1".to_string()))
+    );
 }
 
 #[test]
@@ -122,7 +139,9 @@ fn harness_list_providers_filters_by_capability() {
     let none = host.list_providers(Some("vision"));
     assert!(none.is_empty());
 
-    let info = host.get_provider(&ProviderId("adapter-code".to_string())).unwrap();
+    let info = host
+        .get_provider(&ProviderId("adapter-code".to_string()))
+        .unwrap();
     assert_eq!(info.capability, "code");
     assert_eq!(info.status, ProviderStatus::Ready);
     assert!(matches!(

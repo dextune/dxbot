@@ -70,7 +70,9 @@ fn grant(
     let mut guard = security
         .lock()
         .map_err(|_| "security state lock unavailable")?;
-    guard.authority.bind_authority(principal, scope, "mutator")?;
+    guard
+        .authority
+        .bind_authority(principal, scope, "mutator")?;
     Ok(())
 }
 
@@ -99,10 +101,12 @@ fn security_authenticate_resolves_principal() -> Result<(), Box<dyn Error>> {
     assert_eq!(result.command_id, request.command_id);
     assert_eq!(result.operation_id, request.new_operation_id);
     assert!(result.error.is_none());
-    assert!(result
-        .committed_payload
-        .as_ref()
-        .is_some_and(|payload| payload.get("bot_ref").is_some()));
+    assert!(
+        result
+            .committed_payload
+            .as_ref()
+            .is_some_and(|payload| payload.get("bot_ref").is_some())
+    );
     Ok(())
 }
 
@@ -181,12 +185,14 @@ fn security_nonexistent_target_does_not_disclose_existence() -> Result<(), Box<d
     let alice = PrincipalRef("http:alice".to_string());
     register(&security, &alice)?;
     grant(&security, &alice, &bot_scope("ghost-bot"))?;
-    assert!(server
-        .handle_request(
-            &alice,
-            &create_bot_request("alice", "ghost-bot", "cmd-ghost")
-        )
-        .is_ok());
+    assert!(
+        server
+            .handle_request(
+                &alice,
+                &create_bot_request("alice", "ghost-bot", "cmd-ghost")
+            )
+            .is_ok()
+    );
 
     let carol = PrincipalRef("http:carol".to_string());
     register(&security, &carol)?;
@@ -216,8 +222,8 @@ fn security_unknown_target_scope_fails_closed() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn security_same_command_id_with_changed_digest_conflicts_after_authorization(
-) -> Result<(), Box<dyn Error>> {
+fn security_same_command_id_with_changed_digest_conflicts_after_authorization()
+-> Result<(), Box<dyn Error>> {
     let (server, security) = server();
     let alice = PrincipalRef("http:alice".to_string());
     register(&security, &alice)?;

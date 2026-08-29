@@ -62,8 +62,12 @@ pub fn materialize_content(input: &mut CliInput) -> Result<(), DxbotError> {
 }
 
 fn read_bounded_file(path: &Path) -> Result<String, DxbotError> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| local_error(format!("cannot stat input file {}: {error}", path.display())))?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        local_error(format!(
+            "cannot stat input file {}: {error}",
+            path.display()
+        ))
+    })?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err(input_error(format!(
             "input file must be a direct regular file: {}",
@@ -79,7 +83,12 @@ fn read_bounded_file(path: &Path) -> Result<String, DxbotError> {
                 .read_to_end(&mut bytes)
                 .map(|_| ())
         })
-        .map_err(|error| local_error(format!("cannot read input file {}: {error}", path.display())))?;
+        .map_err(|error| {
+            local_error(format!(
+                "cannot read input file {}: {error}",
+                path.display()
+            ))
+        })?;
     ensure_bound(bytes.len() as u64, "input file")?;
     String::from_utf8(bytes).map_err(|_| {
         input_error(format!(
@@ -92,8 +101,7 @@ fn read_bounded_file(path: &Path) -> Result<String, DxbotError> {
 fn ensure_bound(length: u64, label: &str) -> Result<(), DxbotError> {
     if length > MAX_MATERIALIZED_CONTENT_BYTES {
         return Err(input_error(format!(
-            "{label} exceeds {} bytes",
-            MAX_MATERIALIZED_CONTENT_BYTES
+            "{label} exceeds {MAX_MATERIALIZED_CONTENT_BYTES} bytes"
         )));
     }
     Ok(())
@@ -104,14 +112,14 @@ fn input_error(message: impl Into<String>) -> DxbotError {
 }
 
 fn local_error(message: impl Into<String>) -> DxbotError {
-    error(ErrorCode::StorageOrCorruption, ErrorCategory::Local, message)
+    error(
+        ErrorCode::StorageOrCorruption,
+        ErrorCategory::Local,
+        message,
+    )
 }
 
-fn error(
-    code: ErrorCode,
-    category: ErrorCategory,
-    message: impl Into<String>,
-) -> DxbotError {
+fn error(code: ErrorCode, category: ErrorCategory, message: impl Into<String>) -> DxbotError {
     DxbotError {
         code,
         category,

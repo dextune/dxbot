@@ -1,4 +1,5 @@
 //! Acceptance tests for `AT-AUDIT-001`: required audit intent atomicity and
+#![allow(clippy::expect_used)]
 //! write-time redacted observation.
 
 use std::sync::Arc;

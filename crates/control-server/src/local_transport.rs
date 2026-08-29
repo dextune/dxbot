@@ -5,8 +5,6 @@
 //! its owner/type/generation, but pathname permissions are not treated as peer
 //! identity. Same-UID process isolation is intentionally not claimed.
 
-#![cfg(unix)]
-
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -120,8 +118,8 @@ impl LocalControlServer {
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         let authenticated_principal = local_principal(&self.instance_id, peer_uid(&stream)?);
 
-        let first = read_local_control_frame::<_, LocalControlRequest>(&mut stream)
-            .map_err(codec_io)?;
+        let first =
+            read_local_control_frame::<_, LocalControlRequest>(&mut stream).map_err(codec_io)?;
         let hello = match first {
             LocalControlRequest::Hello { hello } => hello,
             _ => {
@@ -165,8 +163,8 @@ impl LocalControlServer {
         )
         .map_err(codec_io)?;
 
-        let second = read_local_control_frame::<_, LocalControlRequest>(&mut stream)
-            .map_err(codec_io)?;
+        let second =
+            read_local_control_frame::<_, LocalControlRequest>(&mut stream).map_err(codec_io)?;
         match second {
             LocalControlRequest::Hello { .. } => write_error(
                 &mut stream,
@@ -175,10 +173,11 @@ impl LocalControlServer {
             LocalControlRequest::Preflight {
                 payload,
                 raw_selector,
-            } => match self
-                .control
-                .preflight(&authenticated_principal, &payload, raw_selector.as_ref())
-            {
+            } => match self.control.preflight(
+                &authenticated_principal,
+                &payload,
+                raw_selector.as_ref(),
+            ) {
                 Ok((canonical_target, cas)) => write_local_control_frame(
                     &mut stream,
                     &LocalControlResponse::Preflight {
@@ -318,11 +317,10 @@ fn local_principal(instance_id: &InstanceId, uid: u32) -> PrincipalRef {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn peer_uid(stream: &UnixStream) -> Result<u32, io::Error> {
-    let credentials = nix::sys::socket::getsockopt(
-        stream,
-        nix::sys::socket::sockopt::PeerCredentials,
-    )
-    .map_err(|error| io::Error::other(format!("cannot authenticate local peer: {error}")))?;
+    let credentials =
+        nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials).map_err(
+            |error| io::Error::other(format!("cannot authenticate local peer: {error}")),
+        )?;
     Ok(credentials.uid())
 }
 
@@ -362,11 +360,19 @@ fn write_error(stream: &mut UnixStream, error: DxbotError) -> Result<(), io::Err
 }
 
 fn protocol_error(message: impl Into<String>) -> DxbotError {
-    dxbot_error(ErrorCode::InvalidInput, ErrorCategory::Input, message.into())
+    dxbot_error(
+        ErrorCode::InvalidInput,
+        ErrorCategory::Input,
+        message.into(),
+    )
 }
 
 fn incompatible_error(message: impl Into<String>) -> DxbotError {
-    dxbot_error(ErrorCode::Incompatible, ErrorCategory::Conflict, message.into())
+    dxbot_error(
+        ErrorCode::Incompatible,
+        ErrorCategory::Conflict,
+        message.into(),
+    )
 }
 
 fn permission_error(message: impl Into<String>) -> DxbotError {

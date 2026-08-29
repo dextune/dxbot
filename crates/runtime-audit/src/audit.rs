@@ -124,11 +124,7 @@ impl AuditLogger {
         }
     }
 
-    pub fn log_operation(
-        &self,
-        operation_id: &OperationId,
-        payload: &str,
-    ) -> Result<AuditRecord> {
+    pub fn log_operation(&self, operation_id: &OperationId, payload: &str) -> Result<AuditRecord> {
         self.log_operation_as(&PrincipalRef(String::new()), operation_id, payload)
     }
 
@@ -275,7 +271,13 @@ fn redact_payload(payload: &str, level: RedactionLevel) -> String {
         RedactionLevel::Full => REDACTED.to_owned(),
         RedactionLevel::Partial => payload
             .split_whitespace()
-            .map(|token| if is_secret_like(token) { REDACTED } else { token })
+            .map(|token| {
+                if is_secret_like(token) {
+                    REDACTED
+                } else {
+                    token
+                }
+            })
             .collect::<Vec<_>>()
             .join(" "),
     }

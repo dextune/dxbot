@@ -4,9 +4,7 @@ mod m1a_fixture;
 use std::error::Error;
 use std::process::Command;
 
-use storage_spike::{
-    OperationArtifactCounts, ReceiptDisposition, ReferenceStore, SubmitOutcome,
-};
+use storage_spike::{OperationArtifactCounts, ReceiptDisposition, ReferenceStore, SubmitOutcome};
 
 use m1a_fixture::{database_path, effect_for, request};
 

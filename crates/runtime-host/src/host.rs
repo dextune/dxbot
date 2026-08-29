@@ -107,7 +107,9 @@ impl RuntimeHost {
     ) -> Result<HostStatus, Error> {
         let result = composition.stop();
         self.status = HostStatus::Stopped;
-        result.map(|()| HostStatus::Stopped).map_err(Error::Composition)
+        result
+            .map(|()| HostStatus::Stopped)
+            .map_err(Error::Composition)
     }
 
     /// Explicitly stop the host, but only if `host_generation` matches the

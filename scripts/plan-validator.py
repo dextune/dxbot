@@ -16,7 +16,7 @@ PRI={'P0','P1','P2'}; ASTAT={'Specified','Executable','Passed','Blocked'}
 EXITS={0,*range(2,19)}; APPLIED={'task-cancel','task-suspend','task-resume','task-redirect'}
 LOCAL={'ready_at','timeout','all','output','confirmation'}
 MILES=('M0A','M1A','M1B','M2','M3','M4','M5','M6'); MORDER={v:i for i,v in enumerate(MILES)}
-INVS={f'INV-{i:03d}' for i in range(1,16)}; ADRS={f'ADR-{i:04d}' for i in range(95,133)}
+INVS={f'INV-{i:03d}' for i in range(1,16)}; ADRS={f'ADR-{i:04d}' for i in range(95,138)}
 
 @dataclass(frozen=True)
 class Doc:

@@ -3,7 +3,9 @@
 //! target.
 #![allow(clippy::unwrap_used)]
 
-use cli::selector::{BotSummary, ConversationSummary, Error, SelectorResolver, TaskSummary, ThreadSummary};
+use cli::selector::{
+    BotSummary, ConversationSummary, Error, SelectorResolver, TaskSummary, ThreadSummary,
+};
 use dxbot_core::types::{BotId, ConversationId, TaskId, ThreadId};
 
 fn resolver() -> SelectorResolver {
@@ -53,7 +55,10 @@ fn selector_exact_canonical_id_resolves_immediately() {
     }
 
     // resolve_target for threads/tasks identical semantics.
-    match r.resolve_thread("thread:tx", &[thread("tx", "main")]).unwrap() {
+    match r
+        .resolve_thread("thread:tx", &[thread("tx", "main")])
+        .unwrap()
+    {
         dxbot_core::types::ThreadSelector::CanonicalId(id) => {
             assert_eq!(id, ThreadId("thread:tx".to_string()))
         }
@@ -79,7 +84,10 @@ fn selector_single_scoped_match_resolves() {
         other => panic!("expected ScopedExact, got {other:?}"),
     }
 
-    let conversations = vec![conversation("1", "project-x/main"), conversation("2", "project-y/main")];
+    let conversations = vec![
+        conversation("1", "project-x/main"),
+        conversation("2", "project-y/main"),
+    ];
     match r
         .resolve_conversation("project-y/main", &conversations)
         .unwrap()
@@ -101,7 +109,10 @@ fn selector_multiple_matches_returns_ambiguous_with_candidates() {
         Err(Error::Ambiguous { candidates }) => {
             // Visible canonical refs of every matched candidate, so the user
             // can disambiguate (never auto-selected).
-            assert_eq!(candidates, vec!["bot:bx-1".to_string(), "bot:bx-2".to_string()]);
+            assert_eq!(
+                candidates,
+                vec!["bot:bx-1".to_string(), "bot:bx-2".to_string()]
+            );
         }
         other => panic!("expected Ambiguous, got {other:?}"),
     }
@@ -144,8 +155,14 @@ fn selector_fuzzy_match_is_suggestion_only_not_mutation_target() {
     }
 
     // But it is surfaced as a distance-thresholded help suggestion.
-    let suggestions = r.suggest_candidates("bot-alix", &["bot-alice".to_string(), "bot-bob".to_string()]);
-    assert!(suggestions.contains(&"bot-alice".to_string()), "expected fuzzy suggestion, got {suggestions:?}");
+    let suggestions = r.suggest_candidates(
+        "bot-alix",
+        &["bot-alice".to_string(), "bot-bob".to_string()],
+    );
+    assert!(
+        suggestions.contains(&"bot-alice".to_string()),
+        "expected fuzzy suggestion, got {suggestions:?}"
+    );
 
     // Exact inputs are not re-suggested (they resolve, not suggest).
     let exact_suggestions = r.suggest_candidates("bot-alice", &["bot-alice".to_string()]);

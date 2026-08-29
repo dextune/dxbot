@@ -102,12 +102,7 @@ impl SafeWriter {
     /// `no_follow` refuses when `path` is a symlink. If `path` already exists
     /// (symlink or not), returns [`Error::AlreadyExists`]; the existing
     /// destination is never overwritten.
-    pub fn write_to_path(
-        &self,
-        path: &Path,
-        content: &[u8],
-        no_follow: bool,
-    ) -> Result<(), Error> {
+    pub fn write_to_path(&self, path: &Path, content: &[u8], no_follow: bool) -> Result<(), Error> {
         if no_follow {
             match path.symlink_metadata() {
                 Ok(md) if md.file_type().is_symlink() => {
@@ -210,8 +205,5 @@ fn unique_temp_path(path: &Path, parent: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    parent.join(format!(
-        ".{name}.safewrite.{}.{nanos}",
-        std::process::id()
-    ))
+    parent.join(format!(".{name}.safewrite.{}.{nanos}", std::process::id()))
 }

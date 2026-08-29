@@ -15,7 +15,10 @@ fn confirmation_non_tty_without_yes_returns_error() {
     );
     // The error projects to a normal usage error with exit code 2.
     assert_eq!(
-        ConfirmationError::NonInteractive.to_dxbot_error().code.exit_code(),
+        ConfirmationError::NonInteractive
+            .to_dxbot_error()
+            .code
+            .exit_code(),
         2
     );
 }
@@ -38,7 +41,9 @@ fn confirmation_destructive_shows_extra_warning() {
     // line that a plain prompt does not. The action and target are named.
     let destructive_prompt = Confirmation::destructive_prompt("archive", "bot alpha");
     assert!(
-        destructive_prompt.to_lowercase().contains("cannot be undone"),
+        destructive_prompt
+            .to_lowercase()
+            .contains("cannot be undone"),
         "destructive prompt must carry an irreversible warning: {destructive_prompt}"
     );
     assert!(

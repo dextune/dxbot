@@ -21,11 +21,7 @@ fn task(intent: &str) -> TaskDescription {
 
 #[test]
 fn deepseek_001_implements_real_provider_trait() {
-    let adapter = DeepSeekFlashAdapter::new(
-        ProviderId("deepseek-flash".to_string()),
-        "text",
-        1,
-    );
+    let adapter = DeepSeekFlashAdapter::new(ProviderId("deepseek-flash".to_string()), "text", 1);
     assert_eq!(adapter.id(), &ProviderId("deepseek-flash".to_string()));
     assert_eq!(adapter.capability(), "text");
     assert_eq!(adapter.generation(), 1);
@@ -103,9 +99,11 @@ fn deepseek_003_reasoning_tokens_in_stream() {
         event,
         ProviderEvent::ReasoningDelta { .. } | ProviderEvent::ContentDelta { .. }
     )));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, ProviderEvent::Completed { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::Completed { .. }))
+    );
 }
 
 #[test]

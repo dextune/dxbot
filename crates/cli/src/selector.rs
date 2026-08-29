@@ -151,7 +151,8 @@ impl Error {
             Self::NotFound => DxbotError {
                 code: ErrorCode::NotFound,
                 category: ErrorCategory::Input,
-                message: "no matching resource found; a fuzzy suggestion is for help only".to_string(),
+                message: "no matching resource found; a fuzzy suggestion is for help only"
+                    .to_string(),
                 retryable: false,
                 operation_ref: None,
                 target_refs: Vec::new(),
@@ -194,12 +195,8 @@ impl SelectorResolver {
         candidates: &[BotSummary],
     ) -> Result<BotSelector, Error> {
         match resolve_exact(input, candidates) {
-            ResolveOutcome::Canonical(i) => {
-                Ok(BotSelector::CanonicalId(candidates[i].id.clone()))
-            }
-            ResolveOutcome::Scoped(i) => {
-                Ok(BotSelector::ScopedExact(candidates[i].name.clone()))
-            }
+            ResolveOutcome::Canonical(i) => Ok(BotSelector::CanonicalId(candidates[i].id.clone())),
+            ResolveOutcome::Scoped(i) => Ok(BotSelector::ScopedExact(candidates[i].name.clone())),
             ResolveOutcome::Ambiguous(c) => Err(Error::Ambiguous { candidates: c }),
             ResolveOutcome::NotFound => Err(Error::NotFound),
         }
@@ -212,9 +209,9 @@ impl SelectorResolver {
         candidates: &[ConversationSummary],
     ) -> Result<ConversationSelector, Error> {
         match resolve_exact(input, candidates) {
-            ResolveOutcome::Canonical(i) | ResolveOutcome::Scoped(i) => {
-                Ok(ConversationSelector::ConversationId(candidates[i].id.clone()))
-            }
+            ResolveOutcome::Canonical(i) | ResolveOutcome::Scoped(i) => Ok(
+                ConversationSelector::ConversationId(candidates[i].id.clone()),
+            ),
             ResolveOutcome::Ambiguous(c) => Err(Error::Ambiguous { candidates: c }),
             ResolveOutcome::NotFound => Err(Error::NotFound),
         }
@@ -245,12 +242,8 @@ impl SelectorResolver {
         candidates: &[TaskSummary],
     ) -> Result<TaskSelector, Error> {
         match resolve_exact(input, candidates) {
-            ResolveOutcome::Canonical(i) => {
-                Ok(TaskSelector::CanonicalId(candidates[i].id.clone()))
-            }
-            ResolveOutcome::Scoped(i) => {
-                Ok(TaskSelector::ScopedExact(candidates[i].name.clone()))
-            }
+            ResolveOutcome::Canonical(i) => Ok(TaskSelector::CanonicalId(candidates[i].id.clone())),
+            ResolveOutcome::Scoped(i) => Ok(TaskSelector::ScopedExact(candidates[i].name.clone())),
             ResolveOutcome::Ambiguous(c) => Err(Error::Ambiguous { candidates: c }),
             ResolveOutcome::NotFound => Err(Error::NotFound),
         }
@@ -328,4 +321,3 @@ fn edit_distance(a: &str, b: &str) -> usize {
     }
     prev[b.len()]
 }
-

@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::schema::verify_writer_fence;
 use crate::{ReferenceStore, SnapshotBudget, SnapshotPage, SpikeError};
@@ -25,13 +25,12 @@ impl ReferenceStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         verify_writer_fence(&transaction, instance_id, host_generation)?;
 
-        let projection_watermark: i64 = transaction.query_row(
-            "SELECT COALESCE(MAX(sequence), 0) FROM events",
-            [],
-            |row| row.get(0),
-        )?;
-        let query_limit = i64::try_from(budget.max_items + 1)
-            .map_err(|_| SpikeError::SnapshotLimitExceeded)?;
+        let projection_watermark: i64 =
+            transaction.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |row| {
+                row.get(0)
+            })?;
+        let query_limit =
+            i64::try_from(budget.max_items + 1).map_err(|_| SpikeError::SnapshotLimitExceeded)?;
         let items = {
             let mut statement = transaction.prepare(
                 "SELECT aggregate_id FROM aggregate_state ORDER BY aggregate_id LIMIT ?1",
@@ -56,7 +55,8 @@ impl ReferenceStore {
             }
         }
 
-        let item_count = i64::try_from(items.len()).map_err(|_| SpikeError::SnapshotLimitExceeded)?;
+        let item_count =
+            i64::try_from(items.len()).map_err(|_| SpikeError::SnapshotLimitExceeded)?;
         let retained_bytes_i64 =
             i64::try_from(retained_bytes).map_err(|_| SpikeError::SnapshotLimitExceeded)?;
         transaction.execute(
@@ -73,8 +73,7 @@ impl ReferenceStore {
             ],
         )?;
         for (ordinal, aggregate_id) in items.iter().enumerate() {
-            let ordinal =
-                i64::try_from(ordinal).map_err(|_| SpikeError::SnapshotLimitExceeded)?;
+            let ordinal = i64::try_from(ordinal).map_err(|_| SpikeError::SnapshotLimitExceeded)?;
             transaction.execute(
                 "INSERT INTO snapshot_items(snapshot_id, ordinal, aggregate_id) \
                  VALUES (?1, ?2, ?3)",
@@ -114,16 +113,17 @@ impl ReferenceStore {
         }
 
         let after_ordinal = after_ordinal.unwrap_or(-1);
-        let query_limit = i64::try_from(page_size + 1)
-            .map_err(|_| SpikeError::SnapshotLimitExceeded)?;
+        let query_limit =
+            i64::try_from(page_size + 1).map_err(|_| SpikeError::SnapshotLimitExceeded)?;
         let mut statement = self.connection.prepare(
             "SELECT ordinal, aggregate_id FROM snapshot_items \
              WHERE snapshot_id = ?1 AND ordinal > ?2 \
              ORDER BY ordinal LIMIT ?3",
         )?;
-        let rows = statement.query_map(params![snapshot_id, after_ordinal, query_limit], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let rows = statement
+            .query_map(params![snapshot_id, after_ordinal, query_limit], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
         let mut rows = rows.collect::<Result<Vec<_>, _>>()?;
         let has_more = rows.len() > page_size;
         if has_more {
@@ -134,7 +134,10 @@ impl ReferenceStore {
         } else {
             None
         };
-        let items = rows.into_iter().map(|(_, aggregate_id)| aggregate_id).collect();
+        let items = rows
+            .into_iter()
+            .map(|(_, aggregate_id)| aggregate_id)
+            .collect();
 
         Ok(SnapshotPage {
             projection_watermark,

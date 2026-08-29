@@ -1,4 +1,14 @@
 #![forbid(unsafe_code)]
+//! DXBOT CLI library crate.
+//!
+//! `DxbotError` (owned by `dxbot-core`) and `CliInput` (owned by
+//! `application-contract`) are deliberately rich, wide value types that this
+//! crate threads through its single orchestration path by value. `dxbot-core`
+//! and `application-contract` already accept the same size tradeoff via
+//! `#![allow(clippy::result_large_err)]`; mirroring it here keeps the local
+//! `Result`/enum plumbing consistent with the canonical owners instead of
+//! boxing on every hot-path boundary.
+#![allow(clippy::result_large_err, clippy::large_enum_variant)]
 
 #[path = "journal-sha256.rs"]
 pub(crate) mod sha256;

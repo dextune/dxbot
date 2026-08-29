@@ -54,7 +54,8 @@ fn compacted_receipt_keeps_two_binding_tombstones() -> Result<(), SpikeError> {
 }
 
 #[test]
-fn stored_tombstone_horizon_is_inclusive_then_expires_without_new_mutation() -> Result<(), SpikeError> {
+fn stored_tombstone_horizon_is_inclusive_then_expires_without_new_mutation()
+-> Result<(), SpikeError> {
     let path = database_path("expired-tombstone");
     let mut store = ReferenceStore::open_file(&path, "instance-1", 1)?;
     let operation = request(

@@ -118,7 +118,9 @@ fn directive_redirect_requires_replacement_content() {
     let empty = controller.redirect_task(
         "task:alpha-13",
         Some(7),
-        &ContentSource::Text { value: String::new() },
+        &ContentSource::Text {
+            value: String::new(),
+        },
     );
     assert_eq!(empty, Err(DirectiveError::ReplacementRequired));
 

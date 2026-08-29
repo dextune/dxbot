@@ -56,9 +56,11 @@ fn provider_infra_002_non_streaming_completion() {
         .block_on(protocol.execute(&request, &config))
         .expect("protocol execute");
     assert!(!events.is_empty(), "should get at least one event");
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, ProviderEvent::Completed { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::Completed { .. }))
+    );
 }
 
 #[test]
@@ -90,9 +92,11 @@ fn provider_infra_003_streaming_parse() {
     let events = rt
         .block_on(protocol.execute(&request, &config))
         .expect("protocol execute");
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, ProviderEvent::Completed { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::Completed { .. }))
+    );
 }
 
 #[test]
@@ -208,10 +212,12 @@ fn provider_infra_007_chain_fallback_to_reference() {
     let result = host.execute_task(&task("write a plan")).unwrap();
     assert_eq!(result.output, "write a plan");
     assert_eq!(result.status, TaskStatus::Completed);
-    assert!(result
-        .evidence
-        .iter()
-        .any(|evidence| evidence.provider == ProviderId("ref-1".to_string())));
+    assert!(
+        result
+            .evidence
+            .iter()
+            .any(|evidence| evidence.provider == ProviderId("ref-1".to_string()))
+    );
 }
 
 #[test]

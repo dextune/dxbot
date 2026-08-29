@@ -189,6 +189,9 @@ fn automation_next_action_has_typed_args_not_shell_string() {
     assert_eq!(value["args"]["section"], "provider");
 
     // The stable schema is typed args, never a raw shell command string.
-    assert!(!doc.contains("dxb runtime doctor"), "no raw shell command string");
+    assert!(
+        !doc.contains("dxb runtime doctor"),
+        "no raw shell command string"
+    );
     assert!(!doc.contains("--section provider"), "no shell-flag string");
 }

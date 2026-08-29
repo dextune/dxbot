@@ -80,7 +80,10 @@ fn submission_normal_submits_and_returns_result() -> Result<(), Box<dyn Error>> 
     assert_eq!(result.command_id, request.command_id);
     assert_eq!(result.operation_id, request.new_operation_id);
     assert_eq!(result.receipt.operation_id, request.new_operation_id.0);
-    assert_eq!(result.receipt.resolved_binding_digest, request.request_digest.0);
+    assert_eq!(
+        result.receipt.resolved_binding_digest,
+        request.request_digest.0
+    );
     assert_eq!(result.status, "committed");
     assert_eq!(client.journal_len(), 1);
     Ok(())
@@ -198,7 +201,7 @@ fn submission_same_binding_different_operation_id_is_conflict() {
 fn submission_transport_identity_mismatch_is_not_journaled_as_observed() {
     let request = request();
     let client = SubmissionClient::builder(InstanceId("instance-1".to_owned()))
-        .with_transport(Box::new(|request| OperationResult {
+        .with_transport(Box::new(|request: &OperationRequest| OperationResult {
             operation_id: OperationId("wrong-operation".to_owned()),
             command_id: request.command_id.clone(),
             instance_id: request.payload.instance_id.clone(),

@@ -301,10 +301,13 @@ impl ProviderHost {
         let deadline = deadline_instant(task.deadline)?;
 
         for provider in &self.real_providers {
-            let protocol = self.protocol.as_ref().ok_or_else(|| HarnessError::ExecutionFailed {
-                id: provider.id().clone(),
-                reason: "common provider transport is not configured".to_string(),
-            })?;
+            let protocol = self
+                .protocol
+                .as_ref()
+                .ok_or_else(|| HarnessError::ExecutionFailed {
+                    id: provider.id().clone(),
+                    reason: "common provider transport is not configured".to_string(),
+                })?;
             let request = provider.build_request(task);
             let config = ProviderExecuteConfig {
                 deadline,

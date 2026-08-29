@@ -64,7 +64,11 @@ impl MembershipManager {
         let key = membership_key(scope, member_bot);
 
         if let Some(want) = if_membership_generation {
-            match guard.memberships.get(&key).map(|membership| membership.generation) {
+            match guard
+                .memberships
+                .get(&key)
+                .map(|membership| membership.generation)
+            {
                 None => {
                     return Err(AppError::NotFound(format!(
                         "membership {key} does not exist but a generation precondition was set"
@@ -120,7 +124,9 @@ impl MembershipManager {
             .get_mut(&key)
             .ok_or_else(|| AppError::NotFound(format!("membership {key} does not exist")))?;
         if !membership.active {
-            return Err(AppError::NotFound(format!("membership {key} is not active")));
+            return Err(AppError::NotFound(format!(
+                "membership {key} is not active"
+            )));
         }
         if membership.generation != if_membership_generation {
             return Err(AppError::Conflict(format!(
@@ -128,9 +134,10 @@ impl MembershipManager {
                 membership.generation
             )));
         }
-        membership.generation = membership.generation.checked_add(1).ok_or_else(|| {
-            AppError::Internal(format!("membership {key} generation exhausted"))
-        })?;
+        membership.generation = membership
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| AppError::Internal(format!("membership {key} generation exhausted")))?;
         membership.active = false;
         Ok(())
     }
@@ -195,6 +202,7 @@ impl MembershipManager {
         let role = role.trim();
         role.eq_ignore_ascii_case("owner")
             || role.eq_ignore_ascii_case("admin")
+            || role.eq_ignore_ascii_case("manager")
             || role.eq_ignore_ascii_case("delegate")
             || role.eq_ignore_ascii_case("coordinator")
     }

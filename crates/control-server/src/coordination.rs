@@ -40,7 +40,9 @@ impl SecurityCoordinationStore {
 
     pub fn load(&self) -> Result<Option<SecurityCoordinationRecord>, io::Error> {
         match fs::symlink_metadata(&self.path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+            Ok(metadata)
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
@@ -111,7 +113,9 @@ impl SecurityCoordinationStore {
 
     pub fn clear(&self) -> Result<(), io::Error> {
         match fs::symlink_metadata(&self.path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+            Ok(metadata)
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
+            {
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
@@ -211,7 +215,10 @@ mod tests {
         store.prepare(&record).expect("prepare");
         assert_eq!(store.load().expect("load"), Some(record.clone()));
         assert_eq!(
-            store.prepare(&record).expect_err("second prepare fails").kind(),
+            store
+                .prepare(&record)
+                .expect_err("second prepare fails")
+                .kind(),
             io::ErrorKind::AlreadyExists
         );
         store.clear().expect("clear");

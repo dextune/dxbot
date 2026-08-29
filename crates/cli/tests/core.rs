@@ -65,16 +65,14 @@ fn core_task_submit_show_result_path() {
         .task_submit("alpha", &intent, &TaskOptions::default())
         .unwrap();
     assert_eq!(submit.command_key, "task-submit");
+    // `task-submit` targets the owner scope (`owner:ScopeSelector`, spec
+    // `tgt-task-owner-revision-v1`), not a not-yet-existent Task. A bare
+    // owner selector resolves to the owning Bot scope.
     match &submit.canonical_target {
-        CanonicalTarget::Task {
-            id,
-            revision: 0,
-            execution_generation,
-        } => {
-            assert_eq!(id, &TaskId("alpha".to_string()));
-            assert_eq!(*execution_generation, None);
+        CanonicalTarget::Bot { id, revision: 0 } => {
+            assert_eq!(id, &BotId("alpha".to_string()));
         }
-        other => panic!("expected Task target, got {other:?}"),
+        other => panic!("expected Bot owner-scope target, got {other:?}"),
     }
     assert_eq!(submit.content, Some(intent));
 
@@ -117,7 +115,10 @@ fn core_projection_preserves_boundary_identity_without_owning_target_policy() {
     );
     let payload = commands.bot_create("alpha", &HashMap::new()).unwrap();
     assert_eq!(payload.instance_id, InstanceId("instance-a".to_string()));
-    assert_eq!(payload.principal_ref, PrincipalRef("principal-a".to_string()));
+    assert_eq!(
+        payload.principal_ref,
+        PrincipalRef("principal-a".to_string())
+    );
     assert_eq!(
         payload.canonical_target,
         CanonicalTarget::Instance(InstanceId("instance-a".to_string()))
