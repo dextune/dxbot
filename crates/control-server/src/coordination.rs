@@ -39,28 +39,37 @@ impl SecurityCoordinationStore {
     }
 
     pub fn load(&self) -> Result<Option<SecurityCoordinationRecord>, io::Error> {
-        match fs::read(&self.path) {
-            Ok(bytes) => {
-                let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("cannot decode security coordination marker: {error}"),
-                    )
-                })?;
-                if envelope.schema_version != COORDINATION_SCHEMA_VERSION {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "unsupported security coordination schema {}",
-                            envelope.schema_version
-                        ),
-                    ));
-                }
-                Ok(Some(envelope.record))
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "security coordination marker is not a direct regular file: {}",
+                        self.path.display()
+                    ),
+                ));
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
         }
+        let bytes = fs::read(&self.path)?;
+        let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cannot decode security coordination marker: {error}"),
+            )
+        })?;
+        if envelope.schema_version != COORDINATION_SCHEMA_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported security coordination schema {}",
+                    envelope.schema_version
+                ),
+            ));
+        }
+        Ok(Some(envelope.record))
     }
 
     pub fn prepare(&self, record: &SecurityCoordinationRecord) -> Result<(), io::Error> {
@@ -101,8 +110,18 @@ impl SecurityCoordinationStore {
     }
 
     pub fn clear(&self) -> Result<(), io::Error> {
-        match fs::remove_file(&self.path) {
-            Ok(()) => {
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to remove unexpected coordination path: {}",
+                        self.path.display()
+                    ),
+                ))
+            }
+            Ok(_) => {
+                fs::remove_file(&self.path)?;
                 let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
                 File::open(parent)?.sync_all()
             }
