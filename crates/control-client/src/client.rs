@@ -21,7 +21,6 @@ use crate::backend::SubmissionJournal;
 use crate::crash::CrashPoint;
 use crate::journal::JournalStore;
 
-/// Fallible authenticated control transport used by production submission.
 pub type Transport = Box<dyn Fn(&OperationRequest) -> Result<OperationResult, ClientError>>;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -141,10 +140,6 @@ impl SubmissionClientBuilder {
         self
     }
 
-    /// Convenience adapter for deterministic in-process transports used by
-    /// component tests. Production transports should use
-    /// [`Self::with_fallible_transport`] so connect/write/read/decode failures
-    /// remain explicit.
     pub fn with_transport<F>(mut self, transport: F) -> Self
     where
         F: Fn(&OperationRequest) -> OperationResult + 'static,
@@ -221,8 +216,6 @@ impl SubmissionClient {
         self.submit_internal(request, Some(crash_point))
     }
 
-    /// Binding lookup is read-only discovery. It returns the original durable
-    /// OperationId even when a terminal result has not yet been observed.
     pub fn lookup_operation(
         &self,
         command_id: &CommandId,
@@ -235,6 +228,9 @@ impl SubmissionClient {
         }
     }
 
+    /// Replay only states where sending is permitted by the durable journal.
+    /// Prepared is first advanced to Dispatching; Observed/Terminal never blind
+    /// replay because a canonical binding lookup is required first.
     pub fn replay_operation(
         &self,
         request: &OperationRequest,
@@ -249,16 +245,60 @@ impl SubmissionClient {
             }
             Some((record, None)) => {
                 ensure_replay_identity(&record, request)?;
-                self.ensure_transport()?;
+                match record.state {
+                    JournalState::Prepared => {
+                        self.ensure_transport()?;
+                        self.journal.borrow_mut().dispatch(&command_id)?;
+                    }
+                    JournalState::Dispatching => self.ensure_transport()?,
+                    JournalState::Observed
+                    | JournalState::Terminal
+                    | JournalState::Abandoned => {
+                        return Err(ClientError::RecoveryRequired(command_id));
+                    }
+                }
                 let result = self.send(request)?;
                 validate_result_identity(request, &result)?;
                 let mut store = self.journal.borrow_mut();
-                store.observe(&command_id, &result)?;
-                store.terminate(&command_id, &result)?;
+                store.observe(&request.command_id, &result)?;
+                store.terminate(&request.command_id, &result)?;
                 Ok(result)
             }
             None => Err(ClientError::RecoveryRequired(command_id)),
         }
+    }
+
+    /// Persist a canonical server lookup result into a surviving local journal
+    /// without sending the mutation again.
+    pub fn finalize_recovered_result(
+        &self,
+        request: &OperationRequest,
+        result: &OperationResult,
+    ) -> Result<OperationResult, ClientError> {
+        self.validate_request(request)?;
+        let command_id = request.command_id.clone();
+        let Some((record, stored)) = self.bind(&command_id, &request.idempotency_key)? else {
+            return Err(ClientError::RecoveryRequired(command_id));
+        };
+        ensure_replay_identity(&record, request)?;
+        validate_result_identity(request, result)?;
+        if let Some(stored) = stored {
+            validate_result_identity(request, &stored)?;
+            return Ok(stored);
+        }
+        let mut journal = self.journal.borrow_mut();
+        match record.state {
+            JournalState::Dispatching => {
+                journal.observe(&command_id, result)?;
+                journal.terminate(&command_id, result)?;
+            }
+            JournalState::Observed => journal.terminate(&command_id, result)?,
+            JournalState::Terminal => {}
+            JournalState::Prepared | JournalState::Abandoned => {
+                return Err(ClientError::RecoveryRequired(command_id));
+            }
+        }
+        Ok(result.clone())
     }
 
     fn submit_internal(
@@ -284,8 +324,6 @@ impl SubmissionClient {
             return Err(ClientError::IdempotencyKeyConflict(command_id));
         }
 
-        // Missing transport is a PreAccept/local failure. Do not create a
-        // Prepared record for an operation that cannot be dispatched at all.
         self.ensure_transport()?;
         self.crash_at(crash, CrashPoint::BeforeCommit)?;
         self.journal
@@ -373,6 +411,9 @@ fn ensure_replay_identity(
     record: &JournalRecord,
     request: &OperationRequest,
 ) -> Result<(), ClientError> {
+    if record.command_id != request.command_id {
+        return Err(ClientError::IdempotencyKeyConflict(request.command_id.clone()));
+    }
     if record.request_digest != request.request_digest {
         return Err(ClientError::RequestDigestConflict(request.command_id.clone()));
     }
