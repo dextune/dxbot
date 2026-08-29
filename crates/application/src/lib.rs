@@ -2,8 +2,10 @@
 
 /// Domain mutation: target materialization, receipt, and domain-outcome semantics.
 pub mod mutation;
-/// In-memory domain state store backing the mutator.
+/// In-memory canonical domain state backing Application owners.
 pub mod state;
+/// Crash-safe versioned snapshot adapter for canonical Application state.
+pub mod persistence;
 /// Domain-outcome resolution semantics.
 pub mod outcome;
 /// Domain query: bounded pagination, cursor continuation, `--all` bounding and resync.
@@ -23,6 +25,7 @@ pub use delegation::{
 pub use membership::{MembershipManager, MembershipRecord, MembershipSummary};
 pub use mutation::{AppError, ApplicationMutator};
 pub use outcome::{DomainOutcome, cas_if_revision, resolve_outcome};
+pub use persistence::ApplicationStateStore;
 pub use query::{
     AllLoopResult, ApplicationQuery, BotSummary, ConversationSummary, Page, TaskSummary,
     ThreadSummary, all_loop, resync,
