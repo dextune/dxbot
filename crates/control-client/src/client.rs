@@ -9,6 +9,8 @@
 use std::cell::RefCell;
 use std::fmt;
 
+use application_contract::{LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_VERSION};
+use dxbot_core::DxbotError;
 use dxbot_core::receipt::{ReceiptDisposition, ReceiptRecord};
 use dxbot_core::types::{
     CommandId, IdempotencyKey, InstanceId, JournalRecord, JournalState, OperationRequest,
@@ -31,6 +33,7 @@ pub enum ClientError {
     RecoveryRequired(CommandId),
     TransportUnavailable,
     Transport(String),
+    Remote(DxbotError),
     IdempotencyKeyConflict(CommandId),
     RequestDigestConflict(CommandId),
     OperationIdConflict(CommandId),
@@ -59,6 +62,7 @@ impl fmt::Display for ClientError {
                 write!(formatter, "authenticated control transport is not configured")
             }
             Self::Transport(message) => write!(formatter, "control transport error: {message}"),
+            Self::Remote(error) => write!(formatter, "remote {:?}: {}", error.code, error.message),
             Self::IdempotencyKeyConflict(command_id) => write!(
                 formatter,
                 "command id {} is already bound to a different idempotency key",
@@ -398,8 +402,8 @@ fn validate_result_identity(
 fn default_version() -> VersionInfo {
     VersionInfo {
         client_version: env!("CARGO_PKG_VERSION").to_owned(),
-        supported_protocol_versions: vec!["1.0".to_owned()],
-        supported_schema_versions: vec!["1.0".to_owned()],
+        supported_protocol_versions: vec![LOCAL_CONTROL_PROTOCOL_VERSION.to_owned()],
+        supported_schema_versions: vec![LOCAL_CONTROL_SCHEMA_VERSION.to_owned()],
         remote_compatibility: None,
     }
 }
