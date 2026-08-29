@@ -3,7 +3,7 @@
 //! The binary delegates here so every invocation follows one reusable path:
 //! registry path resolution -> typed argv binding -> local content materialize ->
 //! verified Instance discovery -> authenticated local Principal handshake ->
-//! bounded preflight -> durable submission/recovery -> Runtime owner -> render.
+//! bounded remote preflight -> query or durable submission/recovery -> render.
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -18,7 +18,7 @@ use application_contract::{
 };
 use control_client::{ClientError, LocalControlClient};
 use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
-use dxbot_core::types::{OperationResult, OutputFormat};
+use dxbot_core::types::{CommandPayload, OperationResult, OutputFormat};
 use serde_json::{Value, json};
 
 use crate::{
@@ -91,7 +91,6 @@ fn execute_inner(args: &[String]) -> Result<CliOutput, DxbotError> {
     if args.is_empty() {
         return Ok(CliOutput::success(Discovery::show_help()));
     }
-
     let normalized = normalize_invocation(args)?;
     if normalized.root_help && normalized.command_tokens.is_empty() {
         return Ok(CliOutput::success(Discovery::show_help()));
@@ -102,7 +101,6 @@ fn execute_inner(args: &[String]) -> Result<CliOutput, DxbotError> {
     if normalized.command_tokens.is_empty() {
         return Err(usage_error("missing command"));
     }
-
     let group = &normalized.command_tokens[0];
     if !commands_in_group(group).is_empty()
         && (normalized.command_tokens.len() == 1
@@ -110,7 +108,6 @@ fn execute_inner(args: &[String]) -> Result<CliOutput, DxbotError> {
     {
         return Ok(CliOutput::success(render_group_help(group)));
     }
-
     resolve_command(normalized)
 }
 
@@ -137,6 +134,7 @@ fn resolve_command(normalized: NormalizedInvocation) -> Result<CliOutput, DxbotE
         "runtime-status" => runtime_status(&input, format),
         "runtime-doctor" => runtime_doctor(&input, format),
         _ if metadata.kind == "C" => submit_command(&mut input, metadata.command_key, format),
+        _ if metadata.kind == "Q" => query_command(&mut input, metadata.command_key, format),
         _ => Err(owner_unavailable(metadata.command_key, metadata.kind)),
     }
 }
@@ -222,7 +220,6 @@ fn start_runtime(
                     }
                 }
             }
-
             if let Some(status) = child
                 .try_wait()
                 .map_err(|error| local_error(format!("cannot inspect Runtime Host process: {error}")))?
@@ -252,18 +249,7 @@ fn runtime_status(
     }
     #[cfg(unix)]
     {
-        let paths = LocalPaths::discover();
-        let discovery = Discovery::at(paths.discovery_root);
-        let selected = discovery
-            .select_endpoint(
-                input.global_options.profile.as_deref(),
-                input.global_options.instance.as_deref(),
-            )
-            .map_err(|error| error.to_dxbot_error())?;
-        let timeout = parse_timeout(input.global_options.timeout.as_deref())?;
-        let handshake = connect_selected(&selected, timeout)?
-            .handshake()
-            .map_err(client_error)?;
+        let (selected, client, handshake) = authenticated_client(input)?;
         Ok(render_value(
             json!({
                 "status": "running",
@@ -296,16 +282,7 @@ fn runtime_doctor(
     {
         let paths = LocalPaths::discover();
         let discovery = Discovery::at(paths.discovery_root);
-        let selected = discovery
-            .select_endpoint(
-                input.global_options.profile.as_deref(),
-                input.global_options.instance.as_deref(),
-            )
-            .map_err(|error| error.to_dxbot_error())?;
-        let timeout = parse_timeout(input.global_options.timeout.as_deref())?;
-        let handshake = connect_selected(&selected, timeout)?
-            .handshake()
-            .map_err(client_error)?;
+        let (selected, _client, handshake) = authenticated_client(input)?;
         let provider = discovery
             .doctor_provider(&handshake.instance_id)
             .map_err(|error| error.to_dxbot_error())?;
@@ -313,6 +290,7 @@ fn runtime_doctor(
             json!({
                 "instance_id": handshake.instance_id,
                 "host_generation": handshake.host_generation,
+                "endpoint": selected.descriptor.endpoint,
                 "control": "ready",
                 "provider": {
                     "provider_id": provider.provider_id,
@@ -324,6 +302,27 @@ fn runtime_doctor(
             format,
             Some("Runtime doctor completed"),
         ))
+    }
+}
+
+fn query_command(
+    input: &mut application_contract::CliInput,
+    command_key: &str,
+    format: OutputFormat,
+) -> Result<CliOutput, DxbotError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (input, command_key, format);
+        Err(incompatible_error(
+            "P0 query requires a Unix-domain control endpoint",
+        ))
+    }
+    #[cfg(unix)]
+    {
+        let (_selected, client, handshake) = authenticated_client(input)?;
+        let payload = prepare_remote_payload(input, &client, &handshake)?;
+        let value = client.query(&payload).map_err(client_error)?;
+        Ok(render_value(value, format, Some(command_key)))
     }
 }
 
@@ -343,23 +342,14 @@ fn submit_command(
     {
         materialize_content(input)?;
         let paths = LocalPaths::discover();
-        let discovery = Discovery::at(paths.discovery_root.clone());
-        let selected = discovery
-            .select_endpoint(
-                input.global_options.profile.as_deref(),
-                input.global_options.instance.as_deref(),
-            )
-            .map_err(|error| error.to_dxbot_error())?;
-        let timeout = parse_timeout(input.global_options.timeout.as_deref())?;
-        let local_client = connect_selected(&selected, timeout)?;
-        let handshake = local_client.handshake().map_err(client_error)?;
+        let (_selected, client, handshake) = authenticated_client(input)?;
 
         if metadata_for_key(command_key)
             .is_some_and(|metadata| metadata.typed_fields.contains("confirmation:"))
         {
             let target = input
                 .selector_value()
-                .unwrap_or_else(|| selected.descriptor.instance_id.0.clone());
+                .unwrap_or_else(|| handshake.instance_id.0.clone());
             let confirmed = Confirmation::require_destructive(
                 command_key,
                 &target,
@@ -372,24 +362,57 @@ fn submit_command(
             }
         }
 
-        let target = TargetMaterialization::from_cli_input(input)?;
-        let preflight = target.plan_preflight(input);
-        if !preflight.queries.is_empty() {
-            return Err(input_error(format!(
-                "{command_key} requires remote preflight before execution: {:?}",
-                preflight.queries
-            )));
-        }
-
-        let context = ExecutionContext::new(
-            handshake.instance_id.clone(),
-            handshake.principal_ref.clone(),
-        );
-        let payload = project_for_execution(input, &context)?;
-        let result = submit_or_recover(input, payload, &paths.journal_root, local_client)
+        let payload = prepare_remote_payload(input, &client, &handshake)?;
+        let result = submit_or_recover(input, payload, &paths.journal_root, client)
             .map_err(submission_flow_error)?;
         Ok(render_operation(&result, command_key, format))
     }
+}
+
+#[cfg(unix)]
+fn authenticated_client(
+    input: &application_contract::CliInput,
+) -> Result<(
+    crate::discovery::SelectedEndpoint,
+    LocalControlClient,
+    application_contract::LocalControlHandshake,
+), DxbotError> {
+    let paths = LocalPaths::discover();
+    let discovery = Discovery::at(paths.discovery_root);
+    let selected = discovery
+        .select_endpoint(
+            input.global_options.profile.as_deref(),
+            input.global_options.instance.as_deref(),
+        )
+        .map_err(|error| error.to_dxbot_error())?;
+    let timeout = parse_timeout(input.global_options.timeout.as_deref())?;
+    let client = connect_selected(&selected, timeout)?;
+    let handshake = client.handshake().map_err(client_error)?;
+    Ok((selected, client, handshake))
+}
+
+#[cfg(unix)]
+fn prepare_remote_payload(
+    input: &mut application_contract::CliInput,
+    client: &LocalControlClient,
+    handshake: &application_contract::LocalControlHandshake,
+) -> Result<CommandPayload, DxbotError> {
+    let context = ExecutionContext::new(
+        handshake.instance_id.clone(),
+        handshake.principal_ref.clone(),
+    );
+    let mut payload = project_for_execution(input, &context)?;
+    let target = TargetMaterialization::from_cli_input(input)?;
+    let plan = target.plan_preflight(input);
+    if input.selector.is_some() || !plan.queries.is_empty() {
+        let (canonical_target, cas) = client
+            .preflight(&payload, input.selector.clone())
+            .map_err(client_error)?;
+        input.cas = Some(cas);
+        payload.canonical_target = canonical_target;
+        payload.cas = Some(cas);
+    }
+    Ok(payload)
 }
 
 #[cfg(unix)]
@@ -514,7 +537,6 @@ fn normalize_invocation(args: &[String]) -> Result<NormalizedInvocation, DxbotEr
             index += 1;
             continue;
         }
-
         match token.as_str() {
             "--profile" | "--instance" | "--format" | "--color" | "--wait" | "--timeout" => {
                 if !seen.insert(token.clone()) {
@@ -548,7 +570,6 @@ fn normalize_invocation(args: &[String]) -> Result<NormalizedInvocation, DxbotEr
             }
         }
     }
-
     Ok(NormalizedInvocation {
         global_tokens,
         command_tokens,
@@ -663,12 +684,18 @@ fn submission_flow_error(error: SubmissionFlowError) -> DxbotError {
         SubmissionFlowError::PreparedAlreadyBound(command_id) => error_with(
             ErrorCode::InternalInvariant,
             ErrorCategory::Internal,
-            format!("Prepared command unexpectedly has a server binding: {}", command_id.0),
+            format!(
+                "Prepared command unexpectedly has a server binding: {}",
+                command_id.0
+            ),
         ),
         SubmissionFlowError::ObservedBindingMissing(command_id) => error_with(
             ErrorCode::RecoveryRequired,
             ErrorCategory::Recovery,
-            format!("Observed command has no canonical server binding: {}", command_id.0),
+            format!(
+                "Observed command has no canonical server binding: {}",
+                command_id.0
+            ),
         ),
     }
 }
@@ -716,23 +743,18 @@ fn owner_unavailable(command_key: &str, kind: &str) -> DxbotError {
         format!("registry command {command_key} ({kind}) has no connected production owner"),
     )
 }
-
 fn usage_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::Usage, ErrorCategory::Input, message)
 }
-
 fn input_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::InvalidInput, ErrorCategory::Input, message)
 }
-
 fn local_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::StorageOrCorruption, ErrorCategory::Local, message)
 }
-
 fn storage_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::StorageOrCorruption, ErrorCategory::Integrity, message)
 }
-
 fn runtime_unavailable(message: impl Into<String>) -> DxbotError {
     error_with(
         ErrorCode::RuntimeUnavailable,
@@ -740,23 +762,18 @@ fn runtime_unavailable(message: impl Into<String>) -> DxbotError {
         message,
     )
 }
-
 fn incompatible_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::Incompatible, ErrorCategory::Conflict, message)
 }
-
 fn timeout_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::Timeout, ErrorCategory::Availability, message)
 }
-
 fn interrupted_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::Interrupted, ErrorCategory::Local, message)
 }
-
 fn internal_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::InternalInvariant, ErrorCategory::Internal, message)
 }
-
 fn error_with(
     code: ErrorCode,
     category: ErrorCategory,
