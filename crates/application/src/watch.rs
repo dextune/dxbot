@@ -16,7 +16,6 @@ use crate::mutation::{AppError, ApplicationMutator};
 use crate::state::{ProcessLifecycle, TaskStatus};
 
 const CURSOR_PREFIX: &str = "r";
-const CURSOR_WIDTH: usize = 19;
 
 impl ApplicationMutator {
     pub fn watch_next(
@@ -137,7 +136,7 @@ fn format_cursor(revision: i64) -> Result<String, AppError> {
             "canonical watch revision must be non-negative".to_owned(),
         ));
     }
-    Ok(format!("{CURSOR_PREFIX}{revision:0CURSOR_WIDTH$}"))
+    Ok(format!("{CURSOR_PREFIX}{revision:019}"))
 }
 
 fn parse_cursor(cursor: Option<&str>) -> Result<Option<i64>, AppError> {
