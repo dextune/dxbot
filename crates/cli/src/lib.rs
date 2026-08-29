@@ -19,6 +19,12 @@ pub mod identity;
 /// bootstrap delegation, and provider descriptor diagnostics.
 pub mod discovery;
 
+/// Production registry-driven execution orchestration.
+pub mod runner;
+
+/// Thin hidden process entrypoint delegating Runtime ownership to runtime-host.
+pub mod host_process;
+
 /// Exact, ambiguity-safe resource selector resolution (`AT-CLI-009`).
 pub mod selector;
 
@@ -55,6 +61,7 @@ pub use directive::{
     DirectiveError, WaitResult,
 };
 pub use discovery::{Discovery, DiscoveryState, ProviderDiagnostic};
+pub use host_process::run_runtime_host_process;
 pub use identity::{build_operation_request, request_digest_for_payload};
 pub use interactive::{
     ConflictStatus, InteractiveError, InteractiveJourney, PreflightResult, ProviderStatus,
@@ -64,5 +71,6 @@ pub use recovery::{
     BindingKey, BindingLookup, RecoveryAction, RecoveryEntry, RecoveryError, RecoveryManager,
     ReusedIds,
 };
+pub use runner::{CliOutput, execute};
 pub use safe_writer::SafeWriter;
 pub use selector::SelectorResolver;
