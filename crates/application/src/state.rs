@@ -1,15 +1,18 @@
 //! Canonical in-process Application state.
 //!
 //! This store owns durable Domain facts and operation bindings. Runtime
-//! security Authority/Approval and Provider/Host process state remain in their
-//! own canonical owners and are deliberately not duplicated here.
+//! security Authority/Approval and Provider Host registrations remain in their
+//! own canonical owners and are deliberately not duplicated here. Durable
+//! Process orchestration state lives here as an Application aggregate and only
+//! stores refs/progress, never child Task/Memory copies.
 
 use std::collections::HashMap;
 
 use dxbot_core::receipt::ReceiptRecord;
 use dxbot_core::types::{
     BotId, ChannelId, CommandId, ContentSource, ConversationId, MemoryId, MessageId, OperationId,
-    OperationResult, ProjectId, RequestDigest, ScopeSelector, SideEffectSelector, TaskId, ThreadId,
+    OperationResult, ProcessId, ProjectId, RequestDigest, ScopeSelector, SideEffectSelector, TaskId,
+    ThreadId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +46,19 @@ pub enum TaskStatus {
     Rejected,
     Deferred,
     Cancelled,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProcessLifecycle {
+    Created,
+    Running,
+    Waiting,
+    Suspended,
+    Completed,
+    Cancelled,
+    Failed,
     RecoveryRequired,
 }
 
@@ -123,6 +139,22 @@ pub struct TaskState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessState {
+    pub id: ProcessId,
+    pub definition_id: String,
+    pub definition_version: String,
+    pub revision: i64,
+    pub scope_ref: String,
+    pub initiator_ref: String,
+    pub lifecycle: ProcessLifecycle,
+    pub current_step_ref: Option<String>,
+    pub waiting_condition_ref: Option<String>,
+    pub child_refs: Vec<String>,
+    pub progress: i64,
+    pub terminal_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectState {
     pub id: ProjectId,
     pub name: String,
@@ -167,15 +199,12 @@ pub struct SideEffectState {
     pub evidence: Vec<String>,
 }
 
-/// Durable metadata attached to the principal/key-digest idempotency index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyBindingState {
     pub command_id: CommandId,
     pub expires_at: i64,
 }
 
-/// Canonical Application state. Search indexes, cursor leases and subscription
-/// retained windows are rebuildable projections and are not durable truth.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DomainState {
     pub bots: HashMap<BotId, BotState>,
@@ -183,6 +212,7 @@ pub struct DomainState {
     pub messages: HashMap<MessageId, MessageState>,
     pub threads: HashMap<ThreadId, ThreadState>,
     pub tasks: HashMap<TaskId, TaskState>,
+    pub processes: HashMap<ProcessId, ProcessState>,
     pub projects: HashMap<ProjectId, ProjectState>,
     pub channels: HashMap<ChannelId, ChannelState>,
     pub memories: HashMap<MemoryId, MemoryState>,
