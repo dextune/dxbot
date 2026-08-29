@@ -9,6 +9,9 @@ pub mod journal;
 /// Adapter from the CLI-owned durable journal to the control-client submission protocol.
 pub mod submission_journal;
 
+/// Converged fresh submission / crash recovery orchestration.
+pub mod submission;
+
 /// Bounded local content materialization before Prepared.
 pub mod content;
 
@@ -62,7 +65,7 @@ pub use directive::{
 };
 pub use discovery::{Discovery, DiscoveryState, ProviderDiagnostic};
 pub use host_process::run_runtime_host_process;
-pub use identity::{build_operation_request, request_digest_for_input};
+pub use identity::{build_operation_request, build_replay_request, request_digest_for_input};
 pub use interactive::{
     ConflictStatus, InteractiveError, InteractiveJourney, PreflightResult, ProviderStatus,
 };
@@ -74,3 +77,4 @@ pub use recovery::{
 pub use runner::{CliOutput, execute};
 pub use safe_writer::SafeWriter;
 pub use selector::SelectorResolver;
+pub use submission::{SubmissionFlowError, submit_or_recover};
