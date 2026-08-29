@@ -3,7 +3,7 @@
 //! The binary delegates here so every invocation follows one reusable path:
 //! registry path resolution -> typed argv binding -> local content materialize ->
 //! verified Instance discovery -> authenticated local Principal handshake ->
-//! bounded remote preflight -> query or durable submission/recovery -> render.
+//! bounded remote preflight -> query, host action or durable submission/recovery -> render.
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -132,6 +132,7 @@ fn resolve_command(normalized: NormalizedInvocation) -> Result<CliOutput, DxbotE
         "version" => Ok(render_version(format)),
         "runtime-start" => start_runtime(&input, format),
         "runtime-status" => runtime_status(&input, format),
+        "runtime-stop-host" => stop_runtime_host(&input, format),
         "runtime-doctor" => runtime_doctor(&input, format),
         _ if metadata.kind == "C" => submit_command(&mut input, metadata.command_key, format),
         _ if metadata.kind == "Q" => query_command(&mut input, metadata.command_key, format),
@@ -249,7 +250,7 @@ fn runtime_status(
     }
     #[cfg(unix)]
     {
-        let (selected, client, handshake) = authenticated_client(input)?;
+        let (selected, _client, handshake) = authenticated_client(input)?;
         Ok(render_value(
             json!({
                 "status": "running",
@@ -264,6 +265,41 @@ fn runtime_status(
             format,
             Some("Runtime running"),
         ))
+    }
+}
+
+fn stop_runtime_host(
+    input: &application_contract::CliInput,
+    format: OutputFormat,
+) -> Result<CliOutput, DxbotError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (input, format);
+        Err(incompatible_error(
+            "P0 Runtime host stop requires a Unix-domain control endpoint",
+        ))
+    }
+    #[cfg(unix)]
+    {
+        let (_selected, client, handshake) = authenticated_client(input)?;
+        let confirmed = Confirmation::require_destructive(
+            "runtime-stop-host",
+            &handshake.instance_id.0,
+            std::io::stdin().is_terminal(),
+            input.global_options.yes,
+        )
+        .map_err(|error| error.to_dxbot_error())?;
+        if !confirmed {
+            return Err(interrupted_error("host stop cancelled by user"));
+        }
+        let requested_generation = input
+            .cas
+            .and_then(|cas| cas.if_host_generation)
+            .unwrap_or(handshake.host_generation);
+        let value = client
+            .stop_host(requested_generation)
+            .map_err(client_error)?;
+        Ok(render_value(value, format, Some("Runtime host stopped")))
     }
 }
 
