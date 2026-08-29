@@ -103,10 +103,7 @@ impl LocalControlClient {
 
         match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
             LocalControlResponse::Operation { result } => Ok(result),
-            LocalControlResponse::Error { error } => Err(ClientError::Transport(format!(
-                "remote {:?}: {}",
-                error.code, error.message
-            ))),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
             LocalControlResponse::Handshake { .. } => Err(ClientError::Transport(
                 "unexpected handshake response after submit".to_owned(),
             )),
@@ -136,12 +133,7 @@ impl LocalControlClient {
             read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)?;
         let handshake = match response {
             LocalControlResponse::Handshake { handshake } => handshake,
-            LocalControlResponse::Error { error } => {
-                return Err(ClientError::Transport(format!(
-                    "handshake rejected {:?}: {}",
-                    error.code, error.message
-                )));
-            }
+            LocalControlResponse::Error { error } => return Err(ClientError::Remote(error)),
             LocalControlResponse::Operation { .. } => {
                 return Err(ClientError::Transport(
                     "operation response received before handshake".to_owned(),
