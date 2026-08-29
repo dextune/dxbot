@@ -20,6 +20,7 @@ workspace = true
 
 [dependencies]
 application-contract = { path = "../application-contract" }
+control-client = { path = "../control-client" }
 dxbot-core = { path = "../dxbot-core" }
 fs2 = "0.4.3"
 serde = { version = "1", features = ["derive"] }
