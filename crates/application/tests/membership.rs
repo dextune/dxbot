@@ -29,12 +29,13 @@ fn membership_set_creates_membership_fact_only() {
         .unwrap();
     assert_eq!(record.role, "admin");
     assert_eq!(record.generation, 1);
+    assert!(record.active);
     let snapshot = manager.snapshot().unwrap();
     assert_eq!(snapshot.memberships.len(), 1);
 }
 
 #[test]
-fn membership_remove_requires_exact_generation() {
+fn membership_remove_requires_exact_generation_and_retains_tombstone() {
     let mut manager = membership_manager();
     let scope = project_scope();
     let alice = bot("bot-alice");
@@ -46,7 +47,12 @@ fn membership_remove_requires_exact_generation() {
         Err(AppError::Conflict(_))
     ));
     manager.remove_membership(&scope, &alice, 1).unwrap();
-    assert!(manager.snapshot().unwrap().memberships.is_empty());
+    let snapshot = manager.snapshot().unwrap();
+    assert_eq!(snapshot.memberships.len(), 1);
+    let tombstone = snapshot.memberships.values().next().unwrap();
+    assert!(!tombstone.active);
+    assert_eq!(tombstone.generation, 2);
+    assert!(manager.list_memberships(&scope, 10, None).unwrap().items.is_empty());
 }
 
 #[test]
