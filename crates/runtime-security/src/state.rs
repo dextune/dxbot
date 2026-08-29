@@ -182,13 +182,16 @@ pub struct SecurityStateStore {
 
 impl SecurityStateStore {
     pub fn open(path: PathBuf) -> Result<(Self, SecurityState), io::Error> {
-        if let Ok(metadata) = fs::symlink_metadata(&path) {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!("security state is not a direct regular file: {}", path.display()),
                 ));
             }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         let store = Self { path };
         let state = match fs::read(&store.path) {
@@ -254,10 +257,21 @@ impl SecurityStateStore {
 }
 
 fn audit_intent_key(intent: &SecurityAuditIntent) -> String {
-    format!(
-        "{}:{}:{}",
-        intent.operation_id.0, intent.action, intent.target
-    )
+    length_prefixed(&[
+        intent.operation_id.0.as_str(),
+        intent.action.as_str(),
+        intent.target.as_str(),
+    ])
+}
+
+fn length_prefixed(parts: &[&str]) -> String {
+    let mut key = String::new();
+    for part in parts {
+        key.push_str(&part.len().to_string());
+        key.push(':');
+        key.push_str(part);
+    }
+    key
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -283,7 +297,11 @@ fn now_secs() -> i64 {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use dxbot_core::types::{BotId, BotSelector, ProjectId, ProjectSelector, ScopeSelector};
+    use dxbot_core::types::{
+        BotId, BotSelector, ProjectId, ProjectSelector, ScopeSelector,
+    };
+
+    use crate::{ApprovalBinding, ApprovalDecision};
 
     use super::*;
 
@@ -301,16 +319,106 @@ mod tests {
             active: true,
         };
         let delta = SecurityDelta {
-            membership: Some(MembershipBindingDelta::Upsert { binding: binding.clone() }),
+            membership: Some(MembershipBindingDelta::Upsert {
+                binding: binding.clone(),
+            }),
             approval: None,
             audit_intent: None,
         };
         state.apply_delta(&delta).expect("first apply");
         state.apply_delta(&delta).expect("replay apply");
-        assert_eq!(state.authority.membership_binding("member-a"), Some(binding));
-        assert!(state
-            .principals
-            .resolve_principal(&PrincipalRef("bot:bot-a".to_owned()))
-            .is_err());
+        assert_eq!(
+            state.authority.membership_binding("member-a"),
+            Some(binding)
+        );
+        assert!(
+            state
+                .principals
+                .resolve_principal(&PrincipalRef("bot:bot-a".to_owned()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn audit_intent_keys_are_unambiguous() {
+        let first = SecurityAuditIntent {
+            operation_id: OperationId("a:b".to_owned()),
+            principal_ref: PrincipalRef("p".to_owned()),
+            action: "c".to_owned(),
+            target: "d".to_owned(),
+            created_at: 1,
+        };
+        let second = SecurityAuditIntent {
+            operation_id: OperationId("a".to_owned()),
+            principal_ref: PrincipalRef("p".to_owned()),
+            action: "b:c".to_owned(),
+            target: "d".to_owned(),
+            created_at: 1,
+        };
+        assert_ne!(audit_intent_key(&first), audit_intent_key(&second));
+    }
+
+    #[test]
+    fn approval_decision_wakeup_and_audit_survive_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "dxbot-security-state-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("temp root");
+        let path = root.join("security-state.json");
+        let (store, mut state) = SecurityStateStore::open(path.clone()).expect("open state");
+        let approver = PrincipalRef("local:i:uid:1000".to_owned());
+        let operation_id = OperationId("operation-a".to_owned());
+        let approval_id = state
+            .approvals
+            .create_bound_approval(
+                operation_id.clone(),
+                ApprovalBinding {
+                    action: "delete".to_owned(),
+                    target: "project:alpha".to_owned(),
+                    policy_generation: 7,
+                },
+                vec![approver.clone()],
+            )
+            .expect("approval");
+        let delta = SecurityDelta {
+            membership: None,
+            approval: Some(ApprovalDecisionDelta {
+                approval_id: approval_id.clone(),
+                expected_revision: 1,
+                decision: ApprovalDecision::Approve,
+                by: approver.clone(),
+            }),
+            audit_intent: Some(SecurityAuditIntent {
+                operation_id: OperationId("decision-operation".to_owned()),
+                principal_ref: approver,
+                action: "approval-approve".to_owned(),
+                target: format!("approval:{}", approval_id.0),
+                created_at: 1,
+            }),
+        };
+        state.apply_delta(&delta).expect("apply");
+        state.apply_delta(&delta).expect("idempotent replay");
+        store.persist(&state).expect("persist");
+
+        let (_reopened_store, reopened) =
+            SecurityStateStore::open(path).expect("reopen persisted state");
+        assert_eq!(
+            reopened
+                .approvals
+                .get_approval(&approval_id)
+                .expect("approval restored")
+                .state,
+            ApprovalState::Approved
+        );
+        assert_eq!(reopened.approval_wakeups().len(), 1);
+        assert_eq!(reopened.approval_wakeups()[0].operation_id, operation_id);
+        assert_eq!(reopened.approval_wakeups()[0].policy_generation, 7);
+        assert_eq!(reopened.audit_intents().len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
