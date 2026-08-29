@@ -81,6 +81,11 @@ fn operator_server(
     server
 }
 
+fn membership_binding_id(scope: &ScopeSelector, member: &BotSelector) -> String {
+    let encoded = serde_json::to_string(&(scope, member)).expect("subject");
+    format!("membership-subject:{encoded}")
+}
+
 #[test]
 fn project_create_commits_membership_and_security_binding_for_bot_subject() {
     let application = Arc::new(ApplicationMutator::new());
@@ -118,13 +123,11 @@ fn project_create_commits_membership_and_security_binding_for_bot_subject() {
     )));
     let member = BotSelector::CanonicalId(BotId("bot-a".to_owned()));
     let snapshot = application.snapshot().expect("application snapshot");
-    assert!(snapshot
-        .memberships
-        .values()
-        .any(|row| row.scope == scope && row.member_bot == member && row.role == "owner"));
+    assert!(snapshot.memberships.values().any(|row| {
+        row.scope == scope && row.member_bot == member && row.role == "owner" && row.active
+    }));
 
-    let encoded = serde_json::to_string(&(scope.clone(), member.clone())).expect("subject");
-    let binding_id = format!("membership-subject:{encoded}");
+    let binding_id = membership_binding_id(&scope, &member);
     let security = security.lock().expect("security");
     let binding = security
         .authority
@@ -133,11 +136,143 @@ fn project_create_commits_membership_and_security_binding_for_bot_subject() {
     assert_eq!(binding.scope, scope);
     assert_eq!(binding.member_bot, member);
     assert_eq!(binding.role, "owner");
+    assert_eq!(binding.generation, 1);
     assert!(binding.active);
     assert!(security
         .principals
         .resolve_principal(&PrincipalRef("bot:bot-a".to_owned()))
         .is_err());
+}
+
+#[test]
+fn membership_remove_and_readd_keep_application_and_security_generations_aligned() {
+    let application = Arc::new(ApplicationMutator::new());
+    let security = Arc::new(Mutex::new(SecurityState::new()));
+    let server = operator_server(security.clone(), application.clone());
+    let instance = CanonicalTarget::Instance(InstanceId("instance-a".to_owned()));
+
+    for name in ["owner", "member"] {
+        server
+            .handle_request(
+                &principal(),
+                &request(
+                    "bot-create",
+                    &format!("bot-{name}"),
+                    instance.clone(),
+                    None,
+                    json!({"name": name}),
+                ),
+            )
+            .expect("bot create");
+    }
+    server
+        .handle_request(
+            &principal(),
+            &request(
+                "project-create",
+                "project-membership",
+                instance,
+                None,
+                json!({"name": "project-a", "owner_bot": "bot:owner"}),
+            ),
+        )
+        .expect("project create");
+
+    let scope = ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
+        "project-a".to_owned(),
+    )));
+    let member = BotSelector::CanonicalId(BotId("member".to_owned()));
+    let target = CanonicalTarget::Membership {
+        scope: scope.clone(),
+        member_bot: member.clone(),
+    };
+    let mut set_cas = empty_cas();
+    set_cas.if_project_revision = Some(1);
+    server
+        .handle_request(
+            &principal(),
+            &request(
+                "project-member-set",
+                "member-set-1",
+                target.clone(),
+                Some(set_cas),
+                json!({"role_ref": "member"}),
+            ),
+        )
+        .expect("member set");
+
+    let mut remove_cas = empty_cas();
+    remove_cas.if_project_revision = Some(2);
+    remove_cas.if_membership_generation = Some(1);
+    server
+        .handle_request(
+            &principal(),
+            &request(
+                "project-member-remove",
+                "member-remove",
+                target.clone(),
+                Some(remove_cas),
+                json!({}),
+            ),
+        )
+        .expect("member remove");
+
+    let tombstone = application
+        .snapshot()
+        .expect("application snapshot")
+        .memberships
+        .values()
+        .find(|row| row.scope == scope && row.member_bot == member)
+        .cloned()
+        .expect("application tombstone");
+    assert!(!tombstone.active);
+    assert_eq!(tombstone.generation, 2);
+    let binding_id = membership_binding_id(&scope, &member);
+    let security_tombstone = security
+        .lock()
+        .expect("security")
+        .authority
+        .membership_binding(&binding_id)
+        .expect("security tombstone");
+    assert!(!security_tombstone.active);
+    assert_eq!(security_tombstone.generation, 2);
+
+    let mut readd_cas = empty_cas();
+    readd_cas.if_project_revision = Some(3);
+    readd_cas.if_membership_generation = Some(2);
+    server
+        .handle_request(
+            &principal(),
+            &request(
+                "project-member-set",
+                "member-set-2",
+                target,
+                Some(readd_cas),
+                json!({"role_ref": "admin"}),
+            ),
+        )
+        .expect("member re-add");
+
+    let restored = application
+        .snapshot()
+        .expect("application snapshot")
+        .memberships
+        .values()
+        .find(|row| row.scope == scope && row.member_bot == member)
+        .cloned()
+        .expect("application membership");
+    assert!(restored.active);
+    assert_eq!(restored.generation, 3);
+    assert_eq!(restored.role, "admin");
+    let security_restored = security
+        .lock()
+        .expect("security")
+        .authority
+        .membership_binding(&binding_id)
+        .expect("security membership");
+    assert!(security_restored.active);
+    assert_eq!(security_restored.generation, 3);
+    assert_eq!(security_restored.role, "admin");
 }
 
 #[test]
