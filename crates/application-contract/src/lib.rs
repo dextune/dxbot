@@ -18,6 +18,7 @@ pub mod local_control;
 /// Golden-file contract test support.
 pub mod golden;
 
+mod field_spec;
 mod registry;
 mod util;
 
@@ -26,7 +27,9 @@ pub use command::{
     CommandMetadata, ResolvedCommand, cli_path_tokens, command_metadata, commands_in_group,
     metadata_for_key, resolve_cli_path,
 };
-pub use contract::{CommandPayload, PreflightPlan, TargetMaterialization};
+pub use contract::{
+    CommandPayload, PreflightPlan, TargetMaterialization, validate_materialized_cas,
+};
 pub use execution::{ExecutionContext, project_for_execution};
 pub use golden::GoldenContract;
 pub use invocation::{MAX_CLI_TOKEN_BYTES, MAX_CLI_TOKENS, parse_bound_input};
