@@ -142,3 +142,103 @@ fn temp_path(path: &Path) -> PathBuf {
         .unwrap_or_default();
     path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), nonce))
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use dxbot_core::types::{
+        CanonicalTarget, CommandId, CommandPayload, IdempotencyKey, InstanceId, OperationId,
+        PrincipalRef, RequestDigest,
+    };
+    use runtime_security::SecurityAuditIntent;
+    use serde_json::json;
+
+    use super::*;
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "dxbot-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    fn record() -> SecurityCoordinationRecord {
+        let principal = PrincipalRef("local:i:uid:1000".to_owned());
+        let operation_id = OperationId("operation-a".to_owned());
+        SecurityCoordinationRecord {
+            request: OperationRequest {
+                command_id: CommandId("command-a".to_owned()),
+                idempotency_key: IdempotencyKey {
+                    principal_ref: principal.clone(),
+                    key_digest: "key-a".to_owned(),
+                    expires_at: 99,
+                },
+                request_digest: RequestDigest("digest-a".to_owned()),
+                new_operation_id: operation_id.clone(),
+                payload: CommandPayload {
+                    command_key: "project-member-set".to_owned(),
+                    principal_ref: principal.clone(),
+                    instance_id: InstanceId("i".to_owned()),
+                    canonical_target: CanonicalTarget::Instance(InstanceId("i".to_owned())),
+                    cas: None,
+                    content: None,
+                    semantic_options: json!({}),
+                },
+            },
+            delta: SecurityDelta::audit_only(SecurityAuditIntent {
+                operation_id,
+                principal_ref: principal,
+                action: "project-member-set".to_owned(),
+                target: "project:a".to_owned(),
+                created_at: 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn marker_roundtrip_is_single_slot_and_clearable() {
+        let root = temp_root("coordination-roundtrip");
+        fs::create_dir_all(&root).expect("temp root");
+        let store = SecurityCoordinationStore::new(root.join("marker.json"));
+        let record = record();
+
+        assert!(store.load().expect("empty load").is_none());
+        store.prepare(&record).expect("prepare");
+        assert_eq!(store.load().expect("load"), Some(record.clone()));
+        assert_eq!(
+            store.prepare(&record).expect_err("second prepare fails").kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        store.clear().expect("clear");
+        assert!(store.load().expect("empty after clear").is_none());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_refuses_symlink_paths() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("coordination-symlink");
+        fs::create_dir_all(&root).expect("temp root");
+        let target = root.join("target.json");
+        fs::write(&target, b"not-a-marker").expect("target");
+        let marker = root.join("marker.json");
+        symlink(&target, &marker).expect("symlink");
+        let store = SecurityCoordinationStore::new(marker);
+        assert_eq!(
+            store.load().expect_err("symlink rejected").kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            store.clear().expect_err("symlink clear rejected").kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+}
