@@ -2,8 +2,9 @@
 //! publication.
 //!
 //! This is the Runtime Host owner for first-Instance bootstrap, generation
-//! fencing, stale endpoint replacement, control-server composition, and
-//! discovery publication. The CLI only spawns/contacts this owner.
+//! fencing, stale endpoint replacement, durable Application composition,
+//! control-server composition, and discovery publication. The CLI only
+//! spawns/contacts this owner.
 
 #![cfg(unix)]
 
@@ -21,6 +22,7 @@ use runtime_bootstrap::bootstrap::Error as BootstrapError;
 use runtime_bootstrap::{DiscoveryEndpoint, DiscoveryState, RuntimeBootstrap};
 
 const HOST_LOCK_FILE: &str = ".runtime-host.lock";
+const APPLICATION_STATE_FILE: &str = "application-state.json";
 const OWNER_DIRECTORY_MODE: u32 = 0o700;
 const OWNER_FILE_MODE: u32 = 0o600;
 
@@ -76,7 +78,12 @@ impl LocalRuntimeHost {
             .map_err(bootstrap_io)?;
         replace_bootstrap_or_stale_endpoint(&endpoint_path)?;
 
-        let application = Arc::new(ApplicationMutator::new());
+        let application = Arc::new(
+            ApplicationMutator::with_persistent_state(runtime_root.join(APPLICATION_STATE_FILE))
+                .map_err(|error| io::Error::other(format!(
+                    "cannot restore Application state: {error:?}"
+                )))?,
+        );
         let security = Arc::new(Mutex::new(SecurityState::new()));
         let control = Arc::new(ControlServer::new(security, application));
         let server = LocalControlServer::bind(
