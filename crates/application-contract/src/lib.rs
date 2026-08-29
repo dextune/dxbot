@@ -9,6 +9,8 @@ pub mod cli_input;
 pub mod contract;
 /// Canonical command metadata and user-facing path resolution.
 pub mod command;
+/// Verified Instance/authenticated Principal projection for production execution.
+pub mod execution;
 /// Golden-file contract test support.
 pub mod golden;
 
@@ -21,4 +23,5 @@ pub use command::{
     metadata_for_key, resolve_cli_path,
 };
 pub use contract::{CommandPayload, PreflightPlan, TargetMaterialization};
+pub use execution::{ExecutionContext, project_for_execution};
 pub use golden::GoldenContract;
