@@ -3,8 +3,8 @@
 //!
 //! CommandId, OperationId, IdempotencyKey, RequestDigest, and InstanceId are a
 //! single replay identity. No component is regenerated or silently replaced
-//! after the Prepared boundary. A missing authenticated transport fails closed;
-//! the client never fabricates a committed result.
+//! after the Prepared boundary. A missing or failed authenticated transport
+//! fails closed; the client never fabricates a committed result.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -19,7 +19,8 @@ use crate::backend::SubmissionJournal;
 use crate::crash::CrashPoint;
 use crate::journal::JournalStore;
 
-pub type Transport = Box<dyn Fn(&OperationRequest) -> OperationResult>;
+/// Fallible authenticated control transport used by production submission.
+pub type Transport = Box<dyn Fn(&OperationRequest) -> Result<OperationResult, ClientError>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientError {
@@ -29,6 +30,7 @@ pub enum ClientError {
     NotCommitted(CommandId),
     RecoveryRequired(CommandId),
     TransportUnavailable,
+    Transport(String),
     IdempotencyKeyConflict(CommandId),
     RequestDigestConflict(CommandId),
     OperationIdConflict(CommandId),
@@ -56,6 +58,7 @@ impl fmt::Display for ClientError {
             Self::TransportUnavailable => {
                 write!(formatter, "authenticated control transport is not configured")
             }
+            Self::Transport(message) => write!(formatter, "control transport error: {message}"),
             Self::IdempotencyKeyConflict(command_id) => write!(
                 formatter,
                 "command id {} is already bound to a different idempotency key",
@@ -134,7 +137,19 @@ impl SubmissionClientBuilder {
         self
     }
 
-    pub fn with_transport(mut self, transport: Transport) -> Self {
+    /// Convenience adapter for deterministic in-process transports used by
+    /// component tests. Production transports should use
+    /// [`Self::with_fallible_transport`] so connect/write/read/decode failures
+    /// remain explicit.
+    pub fn with_transport<F>(mut self, transport: F) -> Self
+    where
+        F: Fn(&OperationRequest) -> OperationResult + 'static,
+    {
+        self.transport = Some(Box::new(move |request| Ok(transport(request))));
+        self
+    }
+
+    pub fn with_fallible_transport(mut self, transport: Transport) -> Self {
         self.transport = Some(transport);
         self
     }
@@ -314,7 +329,7 @@ impl SubmissionClient {
             .transport
             .as_ref()
             .ok_or(ClientError::TransportUnavailable)?;
-        Ok((transport.borrow())(request))
+        (transport.borrow())(request)
     }
 
     fn bind(
