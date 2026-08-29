@@ -3,6 +3,8 @@
 //! Every local operation first authenticates the peer. Client-supplied Principal
 //! fields are consistency bindings only; they never create authority. Application,
 //! Security and Provider owners are routed behind the same authenticated boundary.
+//! Cross-owner Application+Security writes use a durable recovery marker rather
+//! than duplicating either owner's canonical state.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,9 +15,13 @@ use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
 use dxbot_core::types::*;
 use provider_host::{HarnessError, ProviderHost, ProviderInfo};
 use runtime_security::{
-    ApprovalManager, ApprovalRecord, AuthorityManager, PrincipalManager, PrincipalStatus,
+    ApprovalDecision, ApprovalDecisionDelta, ApprovalRecord, ApprovalState,
+    MembershipAuthorityBinding, MembershipBindingDelta, PrincipalStatus, SecurityAuditIntent,
+    SecurityDelta, SecurityState, SecurityStateStore,
 };
 use serde_json::{Value, json};
+
+use crate::coordination::{SecurityCoordinationRecord, SecurityCoordinationStore};
 
 const OPERATION_ROLE: &str = "mutator";
 const LOCAL_OPERATOR_ROLE: &str = "operator";
@@ -29,34 +35,61 @@ pub enum ServerError {
     Conflict(String),
     GapDetected(String),
     Timeout(String),
+    RecoveryRequired(String),
     InternalInvariant(String),
 }
 
 impl ServerError {
     pub fn to_dxbot_error(&self) -> DxbotError {
-        let (code, category, message) = match self {
-            Self::PermissionDenied(message) => {
-                (ErrorCode::PermissionDenied, ErrorCategory::Permission, message.clone())
-            }
-            Self::NotFound(message) => (ErrorCode::NotFound, ErrorCategory::Input, message.clone()),
-            Self::Conflict(message) => (ErrorCode::Conflict, ErrorCategory::Conflict, message.clone()),
+        let (code, category, message, retryable) = match self {
+            Self::PermissionDenied(message) => (
+                ErrorCode::PermissionDenied,
+                ErrorCategory::Permission,
+                message.clone(),
+                false,
+            ),
+            Self::NotFound(message) => (
+                ErrorCode::NotFound,
+                ErrorCategory::Input,
+                message.clone(),
+                false,
+            ),
+            Self::Conflict(message) => (
+                ErrorCode::Conflict,
+                ErrorCategory::Conflict,
+                message.clone(),
+                false,
+            ),
             Self::GapDetected(message) => (
                 ErrorCode::PartialOrResync,
                 ErrorCategory::Recovery,
                 message.clone(),
+                true,
             ),
-            Self::Timeout(message) => (ErrorCode::Timeout, ErrorCategory::Availability, message.clone()),
+            Self::Timeout(message) => (
+                ErrorCode::Timeout,
+                ErrorCategory::Availability,
+                message.clone(),
+                true,
+            ),
+            Self::RecoveryRequired(message) => (
+                ErrorCode::RecoveryRequired,
+                ErrorCategory::Recovery,
+                message.clone(),
+                true,
+            ),
             Self::InternalInvariant(message) => (
                 ErrorCode::InternalInvariant,
                 ErrorCategory::Internal,
                 message.clone(),
+                false,
             ),
         };
         DxbotError {
             code,
             category,
             message,
-            retryable: false,
+            retryable,
             operation_ref: None,
             target_refs: Vec::new(),
             field_violations: Vec::new(),
@@ -76,43 +109,14 @@ impl std::fmt::Display for ServerError {
 
 impl std::error::Error for ServerError {}
 
-#[derive(Debug, Clone, Default)]
-pub struct SecurityState {
-    pub principals: PrincipalManager,
-    pub approvals: ApprovalManager,
-    pub authority: AuthorityManager,
-}
-
-impl SecurityState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn ensure_local_operator(&mut self, principal: &PrincipalRef) -> Result<(), ServerError> {
-        if self.principals.resolve_principal(principal).is_err() {
-            self.principals
-                .register_principal(principal.clone())
-                .map_err(|error| {
-                    ServerError::InternalInvariant(format!(
-                        "cannot register authenticated local principal: {error}"
-                    ))
-                })?;
-        }
-        self.authority
-            .bind_global_authority(principal, LOCAL_OPERATOR_ROLE)
-            .map_err(|error| {
-                ServerError::InternalInvariant(format!(
-                    "cannot grant authenticated local operator role: {error}"
-                ))
-            })
-    }
-}
-
 #[derive(Debug)]
 pub struct ControlServer {
     security: Arc<Mutex<SecurityState>>,
     application: Arc<ApplicationMutator>,
     providers: Mutex<ProviderHost>,
+    security_store: Option<Arc<SecurityStateStore>>,
+    coordination_store: Option<Arc<SecurityCoordinationStore>>,
+    coordination_lock: Mutex<()>,
 }
 
 impl ControlServer {
@@ -120,11 +124,7 @@ impl ControlServer {
         security: Arc<Mutex<SecurityState>>,
         application: Arc<ApplicationMutator>,
     ) -> Self {
-        Self {
-            security,
-            application,
-            providers: Mutex::new(ProviderHost::new()),
-        }
+        Self::with_provider_host(security, application, ProviderHost::new())
     }
 
     pub fn with_provider_host(
@@ -136,16 +136,40 @@ impl ControlServer {
             security,
             application,
             providers: Mutex::new(providers),
+            security_store: None,
+            coordination_store: None,
+            coordination_lock: Mutex::new(()),
         }
     }
 
+    pub fn with_persistence(
+        security: Arc<Mutex<SecurityState>>,
+        application: Arc<ApplicationMutator>,
+        providers: ProviderHost,
+        security_store: Arc<SecurityStateStore>,
+        coordination_store: Arc<SecurityCoordinationStore>,
+    ) -> Result<Self, ServerError> {
+        let server = Self {
+            security,
+            application,
+            providers: Mutex::new(providers),
+            security_store: Some(security_store),
+            coordination_store: Some(coordination_store),
+            coordination_lock: Mutex::new(()),
+        };
+        let _guard = server.coordination_guard()?;
+        server.recover_pending_locked()?;
+        drop(_guard);
+        Ok(server)
+    }
+
     pub fn register_local_operator(&self, principal: &PrincipalRef) -> Result<(), ServerError> {
-        self.security
-            .lock()
-            .map_err(|_| {
-                ServerError::InternalInvariant("security state lock unavailable".to_owned())
-            })?
-            .ensure_local_operator(principal)
+        let _coordination = self.coordination_guard()?;
+        self.recover_pending_locked()?;
+        let current = self.lock_security()?.clone();
+        let mut candidate = current;
+        ensure_local_operator(&mut candidate, principal)?;
+        self.persist_security_candidate(candidate)
     }
 
     pub fn preflight(
@@ -154,6 +178,7 @@ impl ControlServer {
         payload: &CommandPayload,
         raw_selector: Option<&Value>,
     ) -> Result<(CanonicalTarget, CasConditions), ServerError> {
+        self.recover_pending()?;
         self.authorize_payload_identity(authenticated_principal, payload)?;
         self.require_local_operator_or_scope(authenticated_principal, &payload.canonical_target)?;
         match payload.command_key.as_str() {
@@ -173,6 +198,7 @@ impl ControlServer {
         authenticated_principal: &PrincipalRef,
         payload: &CommandPayload,
     ) -> Result<Value, ServerError> {
+        self.recover_pending()?;
         self.authorize_payload_identity(authenticated_principal, payload)?;
         self.require_local_operator_or_scope(authenticated_principal, &payload.canonical_target)?;
         match payload.command_key.as_str() {
@@ -189,6 +215,7 @@ impl ControlServer {
         cursor: Option<&str>,
         timeout: Duration,
     ) -> Result<Value, ServerError> {
+        self.recover_pending()?;
         self.authorize_payload_identity(authenticated_principal, payload)?;
         self.require_local_operator_or_scope(authenticated_principal, &payload.canonical_target)?;
         self.application
@@ -208,7 +235,70 @@ impl ControlServer {
         }
         self.authorize_payload_identity(authenticated_principal, &request.payload)?;
         self.authorize_mutation(authenticated_principal, &request.payload.canonical_target)?;
-        self.application.mutate(request).map_err(map_app_error)
+
+        let _coordination = self.coordination_guard()?;
+        self.recover_pending_locked()?;
+        if let Some(result) = self
+            .application
+            .lookup_binding(&request.command_id, &request.idempotency_key)
+            .map_err(map_app_error)?
+        {
+            return Ok(result);
+        }
+
+        let delta = self.security_delta(authenticated_principal, request)?;
+        if delta.is_empty() {
+            return self.application.mutate(request).map_err(map_app_error);
+        }
+
+        let mut candidate = self.lock_security()?.clone();
+        candidate.apply_delta(&delta).map_err(map_security_error)?;
+
+        match (&self.security_store, &self.coordination_store) {
+            (Some(security_store), Some(coordination_store)) => {
+                coordination_store
+                    .prepare(&SecurityCoordinationRecord {
+                        request: request.clone(),
+                        delta: delta.clone(),
+                    })
+                    .map_err(|error| {
+                        ServerError::RecoveryRequired(format!(
+                            "cannot prepare cross-owner security transaction: {error}"
+                        ))
+                    })?;
+                let result = match self.application.mutate(request) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        coordination_store.clear().map_err(|clear_error| {
+                            ServerError::RecoveryRequired(format!(
+                                "Application rejected coordinated mutation ({error:?}) and marker cleanup failed: {clear_error}"
+                            ))
+                        })?;
+                        return Err(map_app_error(error));
+                    }
+                };
+                if let Err(error) = security_store.persist(&candidate) {
+                    return Err(ServerError::RecoveryRequired(format!(
+                        "Application committed but Security publication failed; recovery marker retained: {error}"
+                    )));
+                }
+                *self.lock_security()? = candidate;
+                coordination_store.clear().map_err(|error| {
+                    ServerError::RecoveryRequired(format!(
+                        "coordinated owners committed but recovery marker cleanup failed: {error}"
+                    ))
+                })?;
+                Ok(result)
+            }
+            (None, None) => {
+                let result = self.application.mutate(request).map_err(map_app_error)?;
+                *self.lock_security()? = candidate;
+                Ok(result)
+            }
+            _ => Err(ServerError::InternalInvariant(
+                "security persistence and coordination store must be configured together".to_owned(),
+            )),
+        }
     }
 
     pub fn lookup_binding(
@@ -222,10 +312,248 @@ impl ControlServer {
                 "binding lookup principal mismatch".to_owned(),
             ));
         }
+        let _coordination = self.coordination_guard()?;
+        self.recover_pending_locked()?;
         self.require_active_principal(authenticated_principal)?;
         self.application
             .lookup_binding(command_id, key)
             .map_err(map_app_error)
+    }
+
+    fn security_delta(
+        &self,
+        authenticated_principal: &PrincipalRef,
+        request: &OperationRequest,
+    ) -> Result<SecurityDelta, ServerError> {
+        let payload = &request.payload;
+        match payload.command_key.as_str() {
+            "approval-approve" | "approval-deny" => {
+                let CanonicalTarget::Approval { id, revision } = &payload.canonical_target else {
+                    return Err(ServerError::Conflict(
+                        "approval decision requires Approval target".to_owned(),
+                    ));
+                };
+                let expected_revision = payload
+                    .cas
+                    .as_ref()
+                    .and_then(|cas| cas.if_revision)
+                    .unwrap_or(*revision);
+                Ok(SecurityDelta {
+                    membership: None,
+                    approval: Some(ApprovalDecisionDelta {
+                        approval_id: id.clone(),
+                        expected_revision,
+                        decision: if payload.command_key == "approval-approve" {
+                            ApprovalDecision::Approve
+                        } else {
+                            ApprovalDecision::Deny
+                        },
+                        by: authenticated_principal.clone(),
+                    }),
+                    audit_intent: Some(SecurityAuditIntent::new(
+                        request.new_operation_id.clone(),
+                        authenticated_principal.clone(),
+                        payload.command_key.clone(),
+                        format!("approval:{}", id.0),
+                    )),
+                })
+            }
+            "project-member-set" | "channel-member-set" => {
+                let CanonicalTarget::Membership { scope, member_bot } = &payload.canonical_target else {
+                    return Err(ServerError::Conflict(
+                        "membership set requires Membership target".to_owned(),
+                    ));
+                };
+                let snapshot = self.application.snapshot().map_err(map_app_error)?;
+                let current = snapshot
+                    .memberships
+                    .values()
+                    .find(|record| record.scope == *scope && record.member_bot == *member_bot);
+                let generation = match current {
+                    Some(record) => record.generation.checked_add(1).ok_or_else(|| {
+                        ServerError::InternalInvariant(
+                            "membership authority generation exhausted".to_owned(),
+                        )
+                    })?,
+                    None => 1,
+                };
+                let role = payload
+                    .semantic_options
+                    .get("role_ref")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ServerError::Conflict("membership set requires role_ref".to_owned()))?;
+                let binding = MembershipAuthorityBinding {
+                    binding_id: membership_subject_id(scope, member_bot)?,
+                    scope: scope.clone(),
+                    member_bot: member_bot.clone(),
+                    role: role.to_owned(),
+                    generation,
+                    active: true,
+                };
+                Ok(SecurityDelta {
+                    membership: Some(MembershipBindingDelta::Upsert { binding }),
+                    approval: None,
+                    audit_intent: Some(SecurityAuditIntent::new(
+                        request.new_operation_id.clone(),
+                        authenticated_principal.clone(),
+                        payload.command_key.clone(),
+                        target_label(&payload.canonical_target),
+                    )),
+                })
+            }
+            "project-member-remove" | "channel-member-remove" => {
+                let CanonicalTarget::Membership { scope, member_bot } = &payload.canonical_target else {
+                    return Err(ServerError::Conflict(
+                        "membership remove requires Membership target".to_owned(),
+                    ));
+                };
+                let snapshot = self.application.snapshot().map_err(map_app_error)?;
+                let current = snapshot
+                    .memberships
+                    .values()
+                    .find(|record| record.scope == *scope && record.member_bot == *member_bot)
+                    .cloned()
+                    .ok_or_else(|| ServerError::NotFound("membership does not exist".to_owned()))?;
+                let expected = payload
+                    .cas
+                    .as_ref()
+                    .and_then(|cas| cas.if_membership_generation)
+                    .ok_or_else(|| {
+                        ServerError::Conflict(
+                            "membership remove requires generation CAS".to_owned(),
+                        )
+                    })?;
+                if current.generation != expected {
+                    return Err(ServerError::Conflict(format!(
+                        "membership generation mismatch: expected {expected}, current {}",
+                        current.generation
+                    )));
+                }
+                let binding = MembershipAuthorityBinding {
+                    binding_id: membership_subject_id(scope, member_bot)?,
+                    scope: scope.clone(),
+                    member_bot: member_bot.clone(),
+                    role: current.role,
+                    generation: current.generation,
+                    active: false,
+                };
+                Ok(SecurityDelta {
+                    membership: Some(MembershipBindingDelta::Upsert { binding }),
+                    approval: None,
+                    audit_intent: Some(SecurityAuditIntent::new(
+                        request.new_operation_id.clone(),
+                        authenticated_principal.clone(),
+                        payload.command_key.clone(),
+                        target_label(&payload.canonical_target),
+                    )),
+                })
+            }
+            "project-create" => {
+                let project = payload
+                    .semantic_options
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ServerError::Conflict("project-create requires name".to_owned()))?;
+                let owner = payload
+                    .semantic_options
+                    .get("owner_bot")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ServerError::Conflict("project-create requires owner_bot".to_owned()))?;
+                let scope = ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
+                    project.to_owned(),
+                )));
+                let member_bot = BotSelector::CanonicalId(BotId(strip_ref(owner, "bot:")));
+                let binding = MembershipAuthorityBinding {
+                    binding_id: membership_subject_id(&scope, &member_bot)?,
+                    scope,
+                    member_bot,
+                    role: "owner".to_owned(),
+                    generation: 1,
+                    active: true,
+                };
+                Ok(SecurityDelta {
+                    membership: Some(MembershipBindingDelta::Upsert { binding }),
+                    approval: None,
+                    audit_intent: Some(SecurityAuditIntent::new(
+                        request.new_operation_id.clone(),
+                        authenticated_principal.clone(),
+                        payload.command_key.clone(),
+                        format!("project:{project}"),
+                    )),
+                })
+            }
+            _ => Ok(SecurityDelta {
+                membership: None,
+                approval: None,
+                audit_intent: None,
+            }),
+        }
+    }
+
+    fn recover_pending(&self) -> Result<(), ServerError> {
+        let _guard = self.coordination_guard()?;
+        self.recover_pending_locked()
+    }
+
+    fn recover_pending_locked(&self) -> Result<(), ServerError> {
+        let (Some(security_store), Some(coordination_store)) =
+            (&self.security_store, &self.coordination_store)
+        else {
+            return Ok(());
+        };
+        let Some(record) = coordination_store.load().map_err(|error| {
+            ServerError::RecoveryRequired(format!(
+                "cannot load security coordination marker: {error}"
+            ))
+        })? else {
+            return Ok(());
+        };
+        let committed = self
+            .application
+            .lookup_binding(&record.request.command_id, &record.request.idempotency_key)
+            .map_err(map_app_error)?
+            .is_some();
+        if committed {
+            let mut candidate = self.lock_security()?.clone();
+            candidate
+                .apply_delta(&record.delta)
+                .map_err(map_security_error)?;
+            security_store.persist(&candidate).map_err(|error| {
+                ServerError::RecoveryRequired(format!(
+                    "cannot recover Security half of committed Application transaction: {error}"
+                ))
+            })?;
+            *self.lock_security()? = candidate;
+        }
+        coordination_store.clear().map_err(|error| {
+            ServerError::RecoveryRequired(format!(
+                "cannot clear recovered security coordination marker: {error}"
+            ))
+        })
+    }
+
+    fn persist_security_candidate(&self, candidate: SecurityState) -> Result<(), ServerError> {
+        if let Some(store) = &self.security_store {
+            store.persist(&candidate).map_err(|error| {
+                ServerError::RecoveryRequired(format!(
+                    "cannot persist canonical Security state: {error}"
+                ))
+            })?;
+        }
+        *self.lock_security()? = candidate;
+        Ok(())
+    }
+
+    fn coordination_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, ServerError> {
+        self.coordination_lock.lock().map_err(|_| {
+            ServerError::InternalInvariant("coordination lock unavailable".to_owned())
+        })
+    }
+
+    fn lock_security(&self) -> Result<std::sync::MutexGuard<'_, SecurityState>, ServerError> {
+        self.security.lock().map_err(|_| {
+            ServerError::InternalInvariant("security state lock unavailable".to_owned())
+        })
     }
 
     fn approval_preflight(
@@ -240,11 +568,19 @@ impl ControlServer {
         let selector = selector.ok_or_else(|| {
             ServerError::Conflict(format!("{} requires an approval selector", payload.command_key))
         })?;
-        let id = ApprovalId(strip_ref(selector, "approval:"));
-        let security = self.security.lock().map_err(|_| {
-            ServerError::InternalInvariant("security state lock unavailable".to_owned())
-        })?;
-        let record = security.approvals.get_approval(&id).map_err(map_security_error)?;
+        let security = self.lock_security()?;
+        let record = if let Some(operation) = selector.strip_prefix("operation:") {
+            security
+                .approvals
+                .find_by_operation(&OperationId(operation.to_owned()))
+                .map_err(map_security_error)?
+        } else {
+            let id = ApprovalId(strip_ref(selector, "approval:"));
+            security
+                .approvals
+                .get_approval(&id)
+                .map_err(map_security_error)?
+        };
         let mut cas = payload.cas.unwrap_or_else(empty_cas);
         if cas.if_revision.is_none() {
             cas.if_revision = Some(record.revision);
@@ -259,18 +595,47 @@ impl ControlServer {
     }
 
     fn approval_query(&self, payload: &CommandPayload) -> Result<Value, ServerError> {
-        let security = self.security.lock().map_err(|_| {
-            ServerError::InternalInvariant("security state lock unavailable".to_owned())
-        })?;
+        let security = self.lock_security()?;
         match payload.command_key.as_str() {
-            "approval-list" => page_approval_records(security.approvals.list_approvals(), payload),
+            "approval-list" => {
+                let state_filter = payload
+                    .semantic_options
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .map(str::to_ascii_lowercase);
+                let scope_filter = payload
+                    .semantic_options
+                    .get("scope")
+                    .and_then(Value::as_str);
+                let records = security
+                    .approvals
+                    .list_approvals()
+                    .into_iter()
+                    .filter(|record| {
+                        state_filter.as_ref().is_none_or(|state| {
+                            approval_state_name(record.state) == state.as_str()
+                        })
+                    })
+                    .filter(|record| {
+                        scope_filter.is_none_or(|scope| {
+                            record.binding.target == scope
+                                || record.binding.target.starts_with(&format!("{scope}/"))
+                                || record.binding.target.contains(scope)
+                        })
+                    })
+                    .collect();
+                page_approval_records(records, payload)
+            }
             "approval-show" => {
                 let CanonicalTarget::Approval { id, .. } = &payload.canonical_target else {
                     return Err(ServerError::Conflict(
                         "approval-show requires Approval target".to_owned(),
                     ));
                 };
-                let record = security.approvals.get_approval(id).map_err(map_security_error)?;
+                let record = security
+                    .approvals
+                    .get_approval(id)
+                    .map_err(map_security_error)?;
                 Ok(approval_value(&record))
             }
             _ => Err(ServerError::InternalInvariant(
@@ -364,24 +729,20 @@ impl ControlServer {
         authenticated_principal: &PrincipalRef,
         target: &CanonicalTarget,
     ) -> Result<(), ServerError> {
-        let security = self.security.lock().map_err(|_| {
-            ServerError::InternalInvariant("security state lock unavailable".to_owned())
-        })?;
+        let security = self.lock_security()?;
         let principal_state = active_principal(&security, authenticated_principal)?;
-        let is_local_operator = security
+        if security
             .authority
             .check_global_authority(&principal_state.ref_, LOCAL_OPERATOR_ROLE)
-            .map_err(|_| ServerError::PermissionDenied("global authority check failed".to_owned()))?;
-        if is_local_operator {
+            .map_err(map_security_error)?
+        {
             return Ok(());
         }
         let scoped_authorized = match scope_for_target(target) {
             Some(scope) => security
                 .authority
                 .check_authority(&principal_state.ref_, &scope, OPERATION_ROLE)
-                .map_err(|_| {
-                    ServerError::PermissionDenied("scope authority check failed".to_owned())
-                })?,
+                .map_err(map_security_error)?,
             None => false,
         };
         if scoped_authorized {
@@ -392,11 +753,25 @@ impl ControlServer {
     }
 
     fn require_active_principal(&self, principal: &PrincipalRef) -> Result<(), ServerError> {
-        let security = self.security.lock().map_err(|_| {
-            ServerError::InternalInvariant("security state lock unavailable".to_owned())
-        })?;
+        let security = self.lock_security()?;
         active_principal(&security, principal).map(|_| ())
     }
+}
+
+fn ensure_local_operator(
+    security: &mut SecurityState,
+    principal: &PrincipalRef,
+) -> Result<(), ServerError> {
+    if security.principals.resolve_principal(principal).is_err() {
+        security
+            .principals
+            .register_principal(principal.clone())
+            .map_err(map_security_error)?;
+    }
+    security
+        .authority
+        .bind_global_authority(principal, LOCAL_OPERATOR_ROLE)
+        .map_err(map_security_error)
 }
 
 fn active_principal(
@@ -415,7 +790,10 @@ fn active_principal(
     Ok(principal_state)
 }
 
-fn page_approval_records(records: Vec<ApprovalRecord>, payload: &CommandPayload) -> Result<Value, ServerError> {
+fn page_approval_records(
+    records: Vec<ApprovalRecord>,
+    payload: &CommandPayload,
+) -> Result<Value, ServerError> {
     let size = page_size(payload)?;
     let cursor = cursor(payload);
     let rows = records
@@ -425,7 +803,10 @@ fn page_approval_records(records: Vec<ApprovalRecord>, payload: &CommandPayload)
     Ok(page_rows(rows, size, cursor.as_deref()))
 }
 
-fn page_provider_records(records: Vec<ProviderInfo>, payload: &CommandPayload) -> Result<Value, ServerError> {
+fn page_provider_records(
+    records: Vec<ProviderInfo>,
+    payload: &CommandPayload,
+) -> Result<Value, ServerError> {
     let size = page_size(payload)?;
     let cursor = cursor(payload);
     let rows = records
@@ -442,11 +823,7 @@ fn page_rows(mut rows: Vec<(String, Value)>, page_size: usize, cursor: Option<&s
     }
     let has_more = rows.len() > page_size;
     let rows = rows.into_iter().take(page_size).collect::<Vec<_>>();
-    let next_cursor = if has_more {
-        rows.last().map(|(key, _)| key.clone())
-    } else {
-        None
-    };
+    let next_cursor = has_more.then(|| rows.last().map(|(key, _)| key.clone())).flatten();
     json!({
         "items": rows.into_iter().map(|(_, value)| value).collect::<Vec<_>>(),
         "next_cursor": next_cursor,
@@ -458,14 +835,27 @@ fn approval_value(record: &ApprovalRecord) -> Value {
     json!({
         "approval_ref": format!("approval:{}", record.id.0),
         "operation_ref": format!("operation:{}", record.operation_id.0),
+        "action": record.binding.action,
+        "target": record.binding.target,
+        "policy_generation": record.binding.policy_generation,
         "revision": record.revision,
-        "state": format!("{:?}", record.state).to_ascii_lowercase(),
+        "state": approval_state_name(record.state),
         "required_approvers": record.required_approvers.iter().map(|principal| principal.0.clone()).collect::<Vec<_>>(),
         "decisions": record.decisions.iter().map(|decision| json!({
             "by": decision.by.0,
             "decision": format!("{:?}", decision.decision).to_ascii_lowercase(),
         })).collect::<Vec<_>>(),
     })
+}
+
+fn approval_state_name(state: ApprovalState) -> &'static str {
+    match state {
+        ApprovalState::Pending => "pending",
+        ApprovalState::Approved => "approved",
+        ApprovalState::Denied => "denied",
+        ApprovalState::Expired => "expired",
+        ApprovalState::Revoked => "revoked",
+    }
 }
 
 fn provider_value(record: &ProviderInfo) -> Value {
@@ -478,19 +868,23 @@ fn provider_value(record: &ProviderInfo) -> Value {
 }
 
 fn page_size(payload: &CommandPayload) -> Result<usize, ServerError> {
-    match payload.semantic_options.get("page_size") {
+    let value = match payload.semantic_options.get("page_size") {
         Some(Value::String(value)) => value
             .parse::<usize>()
-            .map(|value| value.clamp(1, MAX_PAGE_SIZE))
-            .map_err(|_| ServerError::Conflict("page_size must be an integer".to_owned())),
+            .map_err(|_| ServerError::Conflict("page_size must be an integer".to_owned()))?,
         Some(Value::Number(value)) => value
             .as_u64()
             .and_then(|value| usize::try_from(value).ok())
-            .map(|value| value.clamp(1, MAX_PAGE_SIZE))
-            .ok_or_else(|| ServerError::Conflict("page_size is invalid".to_owned())),
-        None => Ok(DEFAULT_PAGE_SIZE),
-        _ => Err(ServerError::Conflict("page_size is invalid".to_owned())),
+            .ok_or_else(|| ServerError::Conflict("page_size is invalid".to_owned()))?,
+        None => return Ok(DEFAULT_PAGE_SIZE),
+        _ => return Err(ServerError::Conflict("page_size is invalid".to_owned())),
+    };
+    if !(1..=MAX_PAGE_SIZE).contains(&value) {
+        return Err(ServerError::Conflict(format!(
+            "page_size must be in 1..={MAX_PAGE_SIZE}"
+        )));
     }
+    Ok(value)
 }
 
 fn cursor(payload: &CommandPayload) -> Option<String> {
@@ -511,12 +905,36 @@ fn strip_ref(value: &str, prefix: &str) -> String {
     value.strip_prefix(prefix).unwrap_or(value).to_owned()
 }
 
+fn membership_subject_id(
+    scope: &ScopeSelector,
+    member_bot: &BotSelector,
+) -> Result<String, ServerError> {
+    serde_json::to_string(&(scope, member_bot))
+        .map(|encoded| format!("membership-subject:{encoded}"))
+        .map_err(|error| {
+            ServerError::InternalInvariant(format!(
+                "cannot encode membership authority subject: {error}"
+            ))
+        })
+}
+
+fn target_label(target: &CanonicalTarget) -> String {
+    match target {
+        CanonicalTarget::Membership { scope, member_bot } => {
+            format!("membership:{scope:?}:{member_bot:?}")
+        }
+        CanonicalTarget::Approval { id, .. } => format!("approval:{}", id.0),
+        other => format!("{other:?}"),
+    }
+}
+
 fn map_security_error(error: runtime_security::Error) -> ServerError {
     match error {
         runtime_security::Error::UnknownApproval(id) => {
             ServerError::NotFound(format!("approval {} not found", id.0))
         }
-        runtime_security::Error::ApprovalAlreadyDecided(id) => {
+        runtime_security::Error::ApprovalAlreadyDecided(id)
+        | runtime_security::Error::ApprovalRevisionExhausted(id) => {
             ServerError::Conflict(format!("approval {} is stale or already decided", id.0))
         }
         runtime_security::Error::InvalidApprover(principal) => {
@@ -525,6 +943,21 @@ fn map_security_error(error: runtime_security::Error) -> ServerError {
         runtime_security::Error::DuplicatePrincipal(principal)
         | runtime_security::Error::UnknownPrincipal(principal) => {
             ServerError::PermissionDenied(format!("principal unavailable: {}", principal.0))
+        }
+        runtime_security::Error::UnknownAuthorityBinding(binding) => {
+            ServerError::NotFound(format!("authority binding not found: {binding}"))
+        }
+        runtime_security::Error::StaleAuthorityBinding(binding) => {
+            ServerError::Conflict(format!("stale authority binding: {binding}"))
+        }
+        runtime_security::Error::InvalidApprovalBinding => {
+            ServerError::Conflict("approval binding is invalid".to_owned())
+        }
+        runtime_security::Error::ApprovalIdSpaceExhausted => {
+            ServerError::InternalInvariant("approval id space exhausted".to_owned())
+        }
+        runtime_security::Error::AuditIntentConflict(key) => {
+            ServerError::Conflict(format!("audit intent conflict: {key}"))
         }
     }
 }
