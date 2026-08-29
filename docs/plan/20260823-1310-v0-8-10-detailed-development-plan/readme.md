@@ -5,8 +5,8 @@ version: "0.8.10"
 status: "Accepted"
 normative: true
 priority: "P0"
-last_updated: "2026-08-23"
-depends_on: ["DXB-BASE-000", "DXB-GOV-005", "DXB-IFC-043", "DXB-DEL-060", "DXB-DEL-061", "DXB-DEL-062", "DXB-DEL-063"]
+last_updated: "2026-08-29"
+depends_on: ["DXB-BASE-000", "DXB-GOV-005", "DXB-IFC-043", "DXB-DEL-060", "DXB-DEL-061", "DXB-DEL-062", "DXB-DEL-063", "DXB-DEL-066"]
 package_path: "docs/plan/20260823-1310-v0-8-10-detailed-development-plan"
 review_revision: 10
 adversarial_review_rounds: 5
@@ -37,3 +37,9 @@ v0.8.10은 기능 확장이 아니라 v0.8.9를 실제 사용자 관점에서 �
 위 GO는 문서 계약 완결 판정이다. Rust/Runtime/CLI 실행 Acceptance는 구현 전까지 `Blocked`이며 실제 제품 사용성 PASS를 주장하지 않는다.
 
 새 CLI command, wizard, auto-start, auto mutation retry, generic RPC/IDL/Workflow engine, DB/Harness 제품 고정, TUI/Web/Plugin/distributed scope는 추가하지 않는다.
+
+## CLI 개발 종료 Gate
+
+기존 Acceptance의 component/projection PASS와 실제 `dxb` 제품 완료를 구분한다. 기능 확장 없이 CLI를 종료하기 위한 blocking finding, execution spine, 63-operation executability, binary user journey, crash/recovery 및 최종 2회 재검수 기준은 [CLI 개발 완료 적대적 종료 플랜](60-delivery/66-cli-completion-adversarial-plan.md)을 따른다.
+
+`CLI Complete`는 해당 closeout 문서의 Binary/Journey Gate가 executable evidence로 모두 닫힌 뒤에만 선언한다.

@@ -5,8 +5,8 @@ version: "0.8.10"
 status: "Accepted"
 normative: true
 priority: "P0"
-last_updated: "2026-08-23 (added DXB-ARC-019, DXB-PRV-001 provider infra plan)"
-depends_on: ["DXB-BASE-000", "DXB-GOV-005", "DXB-IFC-043", "DXB-DEL-061", "DXB-DEL-062", "DXB-DEL-065", "DXB-ARC-019", "DXB-PRV-001", "DXB-ENG-052", "DXB-ENG-054"]
+last_updated: "2026-08-29"
+depends_on: ["DXB-BASE-000", "DXB-GOV-005", "DXB-IFC-043", "DXB-DEL-061", "DXB-DEL-062", "DXB-DEL-065", "DXB-DEL-066", "DXB-ARC-019", "DXB-PRV-001", "DXB-ENG-052", "DXB-ENG-054"]
 review_revision: 12
 adversarial_review_rounds: 5
 final_rechecks: 2
@@ -19,7 +19,7 @@ plan_version: 0.8.10
 review_revision: 10
 adversarial_review_rounds: 5
 final_rechecks: 2
-markdown_count: 54
+markdown_count: 55
 parent_plan_commit: 4f42cfa9e413aa306dc9bcfc7538f00e6763b3e6
 source_baseline_commit: 5b55b67fbaaf0f3192c126865e8b665ff26fc5aa
 <!-- manifest-machine:end -->
@@ -35,8 +35,12 @@ source_baseline_commit: 5b55b67fbaaf0f3192c126865e8b665ff26fc5aa
 <!-- review-evidence:end -->
 
 <!-- final-recheck:start -->
-- `RC1-STRUCTURAL` | package path, 51 documents, frontmatter, ID/DAG, owner, registry, manifest, naming | PASS
+- `RC1-STRUCTURAL` | package path, 55 documents, frontmatter, ID/DAG, owner, registry, manifest, naming | PASS
 - `RC2-CROSS-LAYER` | user selector→preflight→CommandPayload→journal→binding→Receipt/Domain→recovery→human/machine projection | PASS
 <!-- final-recheck:end -->
 
 `PASS`는 사용자 관점 문서 관계성 검수 결과다. 실제 CLI 실행 사용성은 Rust/Runtime/CLI fixture가 `Passed`가 되기 전까지 주장하지 않는다.
+
+## CLI closeout 실행 계획
+
+기능 확장 없이 실제 `dxb` binary의 production wiring과 63-operation executability를 닫는 후속 종료 기준은 [DXB-DEL-066](60-delivery/66-cli-completion-adversarial-plan.md)이 소유한다. 기존 review evidence와 Acceptance status를 소급 변경하지 않으며, `CLI Complete`는 해당 문서의 Binary/Journey Gate가 모두 executable evidence로 닫힌 뒤에만 선언한다.
