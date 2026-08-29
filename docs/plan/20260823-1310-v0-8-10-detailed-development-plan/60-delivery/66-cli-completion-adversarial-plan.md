@@ -445,7 +445,7 @@ L4/L5 executable evidence까지 통과해야 Recheck 2를 최종 완료로 기�
 - [x] Recheck 1 완료 + 발견 사항 재확인 — PASS, defect 0 (§13 완료 기록)
 - [x] Recheck 2 완료 + 발견 사항 재확인 — PASS, defect 0 (§14 완료 기록)
 - [x] final branch audit: unclassified ahead product branch = 0 — 2026-08-29 확인(로컬 `main` 단일, origin/main 대비 ahead 0, 작업은 uncommitted)
-- [ ] final head SHA와 evidence artifact/log를 기록 — 사용자 승인 commit 시 확정 (pre-work baseline `d8476b7`)
+- [x] final head SHA와 evidence artifact/log를 기록 — main commit `ef511a4` (134 files, +6455/-1411); pre-work baseline `d8476b7`
 
 이 gate가 모두 닫힌 뒤에만 `CLI Complete`를 선언하고 `main`에 반영한다.
 
@@ -480,3 +480,5 @@ L4/L5 executable evidence까지 통과해야 Recheck 2를 최종 완료로 기�
 | 2026-08-29 | 3차 재점검 (사용자 요청) | 실제 `dxb` 바이너리 에러 경로 직접 실행: `--color bad`→exit 2, `bot show`(no runtime)→exit 10, `task submit`(unborn owner)→exit 4, `bot activate`(no provider)→exit 16 ProviderUnavailable, `--format json --color always` ANSI 0. `open_bootstrap_lock` 무한루프 불가(디렉터리/심링크→CorruptState, AlreadyExists→최대 1회 재진입 후 종료) 재확인. ETXTBSY 재시도 bound 확인. branch audit: ahead 0. BF-CLI-012 Resolved 갱신. 신규 correctness defect 0. | 확인 완료 |
 
 최종 ledger에는 사용자 승인 commit 시 final head SHA를 추가한다.
+
+| 2026-08-29 | 사용자 승인 main commit | `ef511a4` (`feat(cli): complete v0.8.10 CLI closeout per DXB-DEL-066`, 134 files, +6455/-1411), pre-work baseline `d8476b7`. commit 후 working tree clean. | Committed |
