@@ -7,6 +7,8 @@
 pub mod cli_input;
 /// Generated command payload and target materialization.
 pub mod contract;
+/// Canonical command metadata and user-facing path resolution.
+pub mod command;
 /// Golden-file contract test support.
 pub mod golden;
 
@@ -14,5 +16,9 @@ mod registry;
 mod util;
 
 pub use cli_input::CliInput;
+pub use command::{
+    CommandMetadata, ResolvedCommand, cli_path_tokens, command_metadata, commands_in_group,
+    metadata_for_key, resolve_cli_path,
+};
 pub use contract::{CommandPayload, PreflightPlan, TargetMaterialization};
 pub use golden::GoldenContract;
