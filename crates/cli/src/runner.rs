@@ -3,26 +3,28 @@
 //! The binary delegates here so every invocation follows one reusable path:
 //! registry path resolution -> typed argv binding -> local content materialize ->
 //! verified Instance discovery -> authenticated local Principal handshake ->
-//! bounded remote preflight -> query, host action or durable submission/recovery -> render.
+//! bounded remote preflight -> query, stream, host action or durable
+//! submission/recovery -> render. Local-only options never cross the Prepared
+//! boundary.
 
 use std::collections::HashSet;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use application_contract::{
-    ExecutionContext, TargetMaterialization, cli_path_tokens, commands_in_group, metadata_for_key,
-    parse_bound_input, project_for_execution, resolve_cli_path,
+    CliInput, ExecutionContext, TargetMaterialization, cli_path_tokens, commands_in_group,
+    metadata_for_key, parse_bound_input, project_for_execution, resolve_cli_path,
 };
 use control_client::{ClientError, LocalControlClient};
 use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
-use dxbot_core::types::{CommandPayload, OperationResult, OutputFormat};
-use serde_json::{Value, json};
+use dxbot_core::types::{ColorMode, CommandPayload, OperationResult, OutputFormat};
+use serde_json::{Map, Value, json};
 
 use crate::{
-    Confirmation, Discovery, MachineRenderer, StreamEvent, SubmissionFlowError,
+    Confirmation, Discovery, MachineRenderer, SafeWriter, StreamEvent, SubmissionFlowError,
     materialize_content, submit_or_recover,
 };
 
@@ -30,6 +32,10 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const START_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+const WATCH_POLL_MAX: Duration = Duration::from_secs(1);
+const MAX_ALL_PAGES: usize = 10_000;
+const MAX_ALL_ITEMS: usize = 100_000;
+const MAX_ACCUMULATED_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliOutput {
@@ -56,6 +62,16 @@ struct NormalizedInvocation {
     root_version: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum PreparedInvocation {
+    Offline(CliOutput),
+    Command {
+        input: CliInput,
+        command_key: String,
+        kind: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalPaths {
     discovery_root: PathBuf,
@@ -79,24 +95,75 @@ impl LocalPaths {
     }
 }
 
+/// Deterministic buffered execution surface used by tests and embedders.
+/// Streaming commands require [`run_process`] because buffering an unbounded
+/// stream would violate the CLI contract.
 pub fn execute(args: &[String]) -> CliOutput {
     let format_hint = requested_format(args);
-    match execute_inner(args) {
-        Ok(output) => output,
-        Err(error) => render_error(error, format_hint),
+    let color_hint = requested_color(args);
+    match prepare_invocation(args).and_then(execute_prepared_buffered) {
+        Ok(output) => decorate_output(output, color_hint == ColorMode::Always),
+        Err(error) => decorate_output(
+            render_error(error, format_hint),
+            color_hint == ColorMode::Always,
+        ),
     }
 }
 
-fn execute_inner(args: &[String]) -> Result<CliOutput, DxbotError> {
+/// Production process entrypoint. Bounded commands reuse the exact buffered
+/// path; S-kind commands write and flush each observation directly to stdout.
+pub fn run_process(args: &[String]) -> i32 {
+    let format_hint = requested_format(args);
+    let color_hint = requested_color(args);
+    let stdout_is_terminal = std::io::stdout().is_terminal();
+    let color_enabled = match color_hint {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => stdout_is_terminal,
+    };
+
+    match prepare_invocation(args) {
+        Ok(PreparedInvocation::Command {
+            mut input,
+            command_key,
+            kind,
+        }) if kind == "S" => match stream_command(&mut input, &command_key, color_enabled) {
+            Ok(()) => 0,
+            Err(error) => {
+                let output = decorate_output(render_error(error, format_hint), color_enabled);
+                emit_cli_output(&output)
+            }
+        },
+        Ok(prepared) => match execute_prepared_buffered(prepared) {
+            Ok(output) => emit_cli_output(&decorate_output(output, color_enabled)),
+            Err(error) => emit_cli_output(&decorate_output(
+                render_error(error, format_hint),
+                color_enabled,
+            )),
+        },
+        Err(error) => emit_cli_output(&decorate_output(
+            render_error(error, format_hint),
+            color_enabled,
+        )),
+    }
+}
+
+fn prepare_invocation(args: &[String]) -> Result<PreparedInvocation, DxbotError> {
     if args.is_empty() {
-        return Ok(CliOutput::success(Discovery::show_help()));
+        return Ok(PreparedInvocation::Offline(CliOutput::success(
+            Discovery::show_help(),
+        )));
     }
     let normalized = normalize_invocation(args)?;
     if normalized.root_help && normalized.command_tokens.is_empty() {
-        return Ok(CliOutput::success(Discovery::show_help()));
+        return Ok(PreparedInvocation::Offline(CliOutput::success(
+            Discovery::show_help(),
+        )));
     }
     if normalized.root_version && normalized.command_tokens.is_empty() {
-        return Ok(render_version(format_from_tokens(&normalized.global_tokens)?));
+        return Ok(PreparedInvocation::Offline(render_version(format_from_tokens(
+            &normalized.global_tokens,
+        )?)));
     }
     if normalized.command_tokens.is_empty() {
         return Err(usage_error("missing command"));
@@ -104,20 +171,24 @@ fn execute_inner(args: &[String]) -> Result<CliOutput, DxbotError> {
     let group = &normalized.command_tokens[0];
     if !commands_in_group(group).is_empty()
         && (normalized.command_tokens.len() == 1
-            || normalized.command_tokens.get(1).is_some_and(|token| is_help(token)))
+            || normalized
+                .command_tokens
+                .get(1)
+                .is_some_and(|token| is_help(token)))
     {
-        return Ok(CliOutput::success(render_group_help(group)));
+        return Ok(PreparedInvocation::Offline(CliOutput::success(
+            render_group_help(group),
+        )));
     }
-    resolve_command(normalized)
-}
 
-fn resolve_command(normalized: NormalizedInvocation) -> Result<CliOutput, DxbotError> {
     let resolved = resolve_cli_path(&normalized.command_tokens)?;
     let metadata = metadata_for_key(resolved.command_key)
         .ok_or_else(|| internal_error("resolved command has no registry metadata"))?;
     let command_args = &normalized.command_tokens[resolved.consumed_path_tokens..];
     if command_args.iter().any(|token| is_help(token)) {
-        return Ok(CliOutput::success(render_command_help(metadata.command_key)));
+        return Ok(PreparedInvocation::Offline(CliOutput::success(
+            render_command_help(metadata.command_key),
+        )));
     }
 
     let mut canonical_args =
@@ -125,25 +196,41 @@ fn resolve_command(normalized: NormalizedInvocation) -> Result<CliOutput, DxbotE
     canonical_args.push(metadata.command_key.to_owned());
     canonical_args.extend(normalized.global_tokens);
     canonical_args.extend_from_slice(command_args);
-    let mut input = parse_bound_input(&canonical_args)?;
-    let format = input.global_options.format;
+    let input = parse_bound_input(&canonical_args)?;
+    Ok(PreparedInvocation::Command {
+        input,
+        command_key: metadata.command_key.to_owned(),
+        kind: metadata.kind.to_owned(),
+    })
+}
 
-    match metadata.command_key {
-        "version" => Ok(render_version(format)),
-        "runtime-start" => start_runtime(&input, format),
-        "runtime-status" => runtime_status(&input, format),
-        "runtime-stop-host" => stop_runtime_host(&input, format),
-        "runtime-doctor" => runtime_doctor(&input, format),
-        _ if metadata.kind == "C" => submit_command(&mut input, metadata.command_key, format),
-        _ if metadata.kind == "Q" => query_command(&mut input, metadata.command_key, format),
-        _ => Err(owner_unavailable(metadata.command_key, metadata.kind)),
+fn execute_prepared_buffered(prepared: PreparedInvocation) -> Result<CliOutput, DxbotError> {
+    match prepared {
+        PreparedInvocation::Offline(output) => Ok(output),
+        PreparedInvocation::Command {
+            mut input,
+            command_key,
+            kind,
+        } => {
+            let format = input.global_options.format;
+            match command_key.as_str() {
+                "version" => Ok(render_version(format)),
+                "runtime-start" => start_runtime(&input, format),
+                "runtime-status" => runtime_status(&input, format),
+                "runtime-stop-host" => stop_runtime_host(&input, format),
+                "runtime-doctor" => runtime_doctor(&input, format),
+                _ if kind == "C" => submit_command(&mut input, &command_key, format),
+                _ if kind == "Q" => query_command(&mut input, &command_key, format),
+                _ if kind == "S" => Err(input_error(
+                    "streaming commands require the production process entrypoint",
+                )),
+                _ => Err(owner_unavailable(&command_key, &kind)),
+            }
+        }
     }
 }
 
-fn start_runtime(
-    input: &application_contract::CliInput,
-    format: OutputFormat,
-) -> Result<CliOutput, DxbotError> {
+fn start_runtime(input: &CliInput, format: OutputFormat) -> Result<CliOutput, DxbotError> {
     #[cfg(not(unix))]
     {
         let _ = (input, format);
@@ -221,26 +308,24 @@ fn start_runtime(
                     }
                 }
             }
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|error| local_error(format!("cannot inspect Runtime Host process: {error}")))?
-            {
+            if let Some(status) = child.try_wait().map_err(|error| {
+                local_error(format!("cannot inspect Runtime Host process: {error}"))
+            })? {
                 return Err(runtime_unavailable(format!(
                     "Runtime Host exited before control readiness: {status}"
                 )));
             }
             if Instant::now() >= deadline {
-                return Err(timeout_error("Runtime Host did not reach control readiness"));
+                return Err(timeout_error(
+                    "Runtime Host did not reach control readiness",
+                ));
             }
             thread::sleep(START_POLL_INTERVAL);
         }
     }
 }
 
-fn runtime_status(
-    input: &application_contract::CliInput,
-    format: OutputFormat,
-) -> Result<CliOutput, DxbotError> {
+fn runtime_status(input: &CliInput, format: OutputFormat) -> Result<CliOutput, DxbotError> {
     #[cfg(not(unix))]
     {
         let _ = (input, format);
@@ -268,10 +353,7 @@ fn runtime_status(
     }
 }
 
-fn stop_runtime_host(
-    input: &application_contract::CliInput,
-    format: OutputFormat,
-) -> Result<CliOutput, DxbotError> {
+fn stop_runtime_host(input: &CliInput, format: OutputFormat) -> Result<CliOutput, DxbotError> {
     #[cfg(not(unix))]
     {
         let _ = (input, format);
@@ -296,17 +378,16 @@ fn stop_runtime_host(
             .cas
             .and_then(|cas| cas.if_host_generation)
             .unwrap_or(handshake.host_generation);
-        let value = client
-            .stop_host(requested_generation)
-            .map_err(client_error)?;
-        Ok(render_value(value, format, Some("Runtime host stopped")))
+        let value = client.stop_host(requested_generation).map_err(client_error)?;
+        Ok(render_value(
+            value,
+            format,
+            Some("Runtime host stopped"),
+        ))
     }
 }
 
-fn runtime_doctor(
-    input: &application_contract::CliInput,
-    format: OutputFormat,
-) -> Result<CliOutput, DxbotError> {
+fn runtime_doctor(input: &CliInput, format: OutputFormat) -> Result<CliOutput, DxbotError> {
     #[cfg(not(unix))]
     {
         let _ = (input, format);
@@ -342,7 +423,7 @@ fn runtime_doctor(
 }
 
 fn query_command(
-    input: &mut application_contract::CliInput,
+    input: &mut CliInput,
     command_key: &str,
     format: OutputFormat,
 ) -> Result<CliOutput, DxbotError> {
@@ -356,14 +437,154 @@ fn query_command(
     #[cfg(unix)]
     {
         let (_selected, client, handshake) = authenticated_client(input)?;
-        let payload = prepare_remote_payload(input, &client, &handshake)?;
-        let value = client.query(&payload).map_err(client_error)?;
+        let mut payload = prepare_remote_payload(input, &client, &handshake)?;
+        let value = if local_bool(input, "all")? {
+            if payload.semantic_options.get("cursor").is_some() {
+                return Err(input_error("--all cannot be combined with --cursor"));
+            }
+            query_all_pages(&client, &mut payload)?
+        } else {
+            client.query(&payload).map_err(client_error)?
+        };
+
+        if let Some(path) = local_string(input, "output")? {
+            return write_output_artifact(&path, &value, format, command_key);
+        }
         Ok(render_value(value, format, Some(command_key)))
     }
 }
 
+#[cfg(unix)]
+fn query_all_pages(
+    client: &LocalControlClient,
+    payload: &mut CommandPayload,
+) -> Result<Value, DxbotError> {
+    let mut items = Vec::new();
+    let mut pages = 0usize;
+    let mut bytes = 0usize;
+    let mut cursor: Option<String> = None;
+
+    loop {
+        pages = pages
+            .checked_add(1)
+            .ok_or_else(|| internal_error("query page counter exhausted"))?;
+        if pages > MAX_ALL_PAGES {
+            return Err(partial_error(
+                "--all exceeded the maximum page count",
+                cursor,
+            ));
+        }
+        set_payload_cursor(payload, cursor.as_deref());
+        let page = client.query(payload).map_err(client_error)?;
+        bytes = bytes
+            .checked_add(page.to_string().len())
+            .ok_or_else(|| internal_error("query byte counter exhausted"))?;
+        if bytes > MAX_ACCUMULATED_BYTES {
+            return Err(partial_error(
+                "--all exceeded the maximum accumulated response size",
+                page.get("next_cursor")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or(cursor),
+            ));
+        }
+        let object = page
+            .as_object()
+            .ok_or_else(|| internal_error("paged query did not return an object"))?;
+        let page_items = object
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| internal_error("paged query omitted items array"))?;
+        if items.len().saturating_add(page_items.len()) > MAX_ALL_ITEMS {
+            return Err(partial_error(
+                "--all exceeded the maximum item count",
+                object
+                    .get("next_cursor")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or(cursor),
+            ));
+        }
+        items.extend(page_items.iter().cloned());
+
+        let has_more = object
+            .get("has_more")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| internal_error("paged query omitted has_more"))?;
+        if !has_more {
+            break;
+        }
+        let next = object
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .ok_or_else(|| internal_error("paged query has_more without next_cursor"))?
+            .to_owned();
+        if cursor.as_deref() == Some(next.as_str()) {
+            return Err(internal_error("paged query cursor made no progress"));
+        }
+        cursor = Some(next);
+    }
+
+    Ok(json!({
+        "items": items,
+        "next_cursor": Value::Null,
+        "has_more": false,
+        "pages_read": pages,
+    }))
+}
+
+#[cfg(unix)]
+fn set_payload_cursor(payload: &mut CommandPayload, cursor: Option<&str>) {
+    let object = payload
+        .semantic_options
+        .as_object_mut()
+        .expect("project_for_execution always returns object semantic_options");
+    match cursor {
+        Some(cursor) => {
+            object.insert("cursor".to_owned(), Value::String(cursor.to_owned()));
+        }
+        None => {
+            object.remove("cursor");
+        }
+    }
+}
+
+fn write_output_artifact(
+    path: &str,
+    value: &Value,
+    format: OutputFormat,
+    command_key: &str,
+) -> Result<CliOutput, DxbotError> {
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| internal_error(format!("cannot serialize query output: {error}")))?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_ACCUMULATED_BYTES {
+        return Err(error_with(
+            ErrorCode::ResourceExhausted,
+            ErrorCategory::Resource,
+            format!(
+                "output is {} bytes, exceeding the {} byte local ceiling",
+                bytes.len(),
+                MAX_ACCUMULATED_BYTES
+            ),
+        ));
+    }
+    SafeWriter::new()
+        .write_to_path(Path::new(path), &bytes, true)
+        .map_err(|error| error.to_dxbot_error())?;
+    Ok(render_value(
+        json!({
+            "command": command_key,
+            "output": path,
+            "bytes_written": bytes.len(),
+        }),
+        format,
+        Some("Output written"),
+    ))
+}
+
 fn submit_command(
-    input: &mut application_contract::CliInput,
+    input: &mut CliInput,
     command_key: &str,
     format: OutputFormat,
 ) -> Result<CliOutput, DxbotError> {
@@ -401,13 +622,134 @@ fn submit_command(
         let payload = prepare_remote_payload(input, &client, &handshake)?;
         let result = submit_or_recover(input, payload, &paths.journal_root, client)
             .map_err(submission_flow_error)?;
+        ensure_wait_satisfied(input, &result)?;
         Ok(render_operation(&result, command_key, format))
+    }
+}
+
+fn ensure_wait_satisfied(input: &CliInput, result: &OperationResult) -> Result<(), DxbotError> {
+    let wait = input.global_options.wait.as_deref().unwrap_or("committed");
+    match wait {
+        "none" | "accepted" | "committed" => Ok(()),
+        "applied" if result.committed_payload.is_some() && !result.operation_may_continue => Ok(()),
+        "applied" => Err(error_with(
+            ErrorCode::PartialOrResync,
+            ErrorCategory::Recovery,
+            "operation committed but the requested applied wait point was not observed",
+        )),
+        other => Err(input_error(format!("unsupported wait point: {other}"))),
+    }
+}
+
+fn stream_command(
+    input: &mut CliInput,
+    command_key: &str,
+    color_enabled: bool,
+) -> Result<(), DxbotError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (input, command_key, color_enabled);
+        Err(incompatible_error(
+            "P0 stream observation requires a Unix-domain control endpoint",
+        ))
+    }
+    #[cfg(unix)]
+    {
+        if input.global_options.format == OutputFormat::Json {
+            return Err(input_error(
+                "streaming commands cannot use --format json; use human or jsonl",
+            ));
+        }
+        let (_selected, client, handshake) = authenticated_client(input)?;
+        let payload = prepare_remote_payload(input, &client, &handshake)?;
+        let mut cursor = local_string(input, "cursor")?;
+        let transport_timeout = parse_timeout(input.global_options.timeout.as_deref())?;
+        let watch_timeout = watch_poll_timeout(transport_timeout);
+        let deadline = input
+            .global_options
+            .timeout
+            .as_ref()
+            .map(|_| Instant::now() + transport_timeout);
+        let mut stdout = std::io::stdout().lock();
+
+        loop {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(timeout_error(
+                    "watch observation timed out locally; the runtime target was not cancelled",
+                ));
+            }
+            let value = match client.watch_next(&payload, cursor.clone(), watch_timeout) {
+                Ok(value) => value,
+                Err(ClientError::Remote(error)) if error.code == ErrorCode::Timeout => continue,
+                Err(error) => return Err(client_error(error)),
+            };
+            let next_cursor = value
+                .get("cursor")
+                .and_then(Value::as_str)
+                .ok_or_else(|| internal_error("watch observation omitted cursor"))?
+                .to_owned();
+            if cursor.as_deref().is_some_and(|current| current > next_cursor.as_str()) {
+                return Err(internal_error("watch cursor regressed"));
+            }
+            let terminal = value
+                .get("terminal")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| internal_error("watch observation omitted terminal flag"))?;
+            let line = render_stream_value(&value, input.global_options.format, command_key, color_enabled)?;
+            stdout
+                .write_all(line.as_bytes())
+                .and_then(|_| stdout.flush())
+                .map_err(|error| {
+                    interrupted_error(format!(
+                        "stream output closed; runtime observation stopped without cancelling target: {error}"
+                    ))
+                })?;
+            cursor = Some(next_cursor);
+            if terminal {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn watch_poll_timeout(transport_timeout: Duration) -> Duration {
+    let half_ms = (transport_timeout.as_millis() / 2).max(1);
+    let bounded_ms = half_ms.min(WATCH_POLL_MAX.as_millis());
+    Duration::from_millis(u64::try_from(bounded_ms).unwrap_or(1))
+}
+
+fn render_stream_value(
+    value: &Value,
+    format: OutputFormat,
+    command_key: &str,
+    color_enabled: bool,
+) -> Result<String, DxbotError> {
+    match format {
+        OutputFormat::Json => Err(input_error(
+            "streaming commands cannot render a bounded JSON document",
+        )),
+        OutputFormat::Jsonl => Ok(format!("{}\n", value)),
+        OutputFormat::Human => {
+            let event = value
+                .get("event")
+                .and_then(Value::as_str)
+                .unwrap_or(command_key);
+            let state = value.get("state").and_then(Value::as_str).unwrap_or("unknown");
+            let cursor = value.get("cursor").and_then(Value::as_str).unwrap_or("?");
+            let headline = format!("{event}: state={state} cursor={cursor}");
+            let headline = if color_enabled {
+                format!("\x1b[36m{headline}\x1b[0m")
+            } else {
+                headline
+            };
+            Ok(format!("{headline}\n"))
+        }
     }
 }
 
 #[cfg(unix)]
 fn authenticated_client(
-    input: &application_contract::CliInput,
+    input: &CliInput,
 ) -> Result<(
     crate::discovery::SelectedEndpoint,
     LocalControlClient,
@@ -429,7 +771,7 @@ fn authenticated_client(
 
 #[cfg(unix)]
 fn prepare_remote_payload(
-    input: &mut application_contract::CliInput,
+    input: &mut CliInput,
     client: &LocalControlClient,
     handshake: &application_contract::LocalControlHandshake,
 ) -> Result<CommandPayload, DxbotError> {
@@ -551,6 +893,40 @@ fn render_error(error: DxbotError, format: OutputFormat) -> CliOutput {
     }
 }
 
+fn decorate_output(mut output: CliOutput, enabled: bool) -> CliOutput {
+    if !enabled {
+        return output;
+    }
+    if !output.stdout.is_empty() {
+        output.stdout = color_first_line(&output.stdout, "32");
+    }
+    if !output.stderr.is_empty() {
+        output.stderr = color_first_line(&output.stderr, "31");
+    }
+    output
+}
+
+fn color_first_line(value: &str, ansi_code: &str) -> String {
+    match value.split_once('\n') {
+        Some((first, rest)) => format!("\x1b[{ansi_code}m{first}\x1b[0m\n{rest}"),
+        None => format!("\x1b[{ansi_code}m{value}\x1b[0m"),
+    }
+}
+
+fn emit_cli_output(output: &CliOutput) -> i32 {
+    if !output.stdout.is_empty() {
+        if std::io::stdout().write_all(output.stdout.as_bytes()).is_err() {
+            return ErrorCode::Interrupted.exit_code();
+        }
+    }
+    if !output.stderr.is_empty() {
+        if std::io::stderr().write_all(output.stderr.as_bytes()).is_err() {
+            return ErrorCode::Interrupted.exit_code();
+        }
+    }
+    output.exit_code
+}
+
 fn normalize_invocation(args: &[String]) -> Result<NormalizedInvocation, DxbotError> {
     let mut global_tokens = Vec::new();
     let mut command_tokens = Vec::new();
@@ -631,6 +1007,23 @@ fn requested_format(args: &[String]) -> OutputFormat {
         .unwrap_or(OutputFormat::Human)
 }
 
+fn requested_color(args: &[String]) -> ColorMode {
+    args.windows(2)
+        .find_map(|window| {
+            if window[0] == "--color" {
+                match window[1].as_str() {
+                    "auto" => Some(ColorMode::Auto),
+                    "always" => Some(ColorMode::Always),
+                    "never" => Some(ColorMode::Never),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+        .unwrap_or(ColorMode::Auto)
+}
+
 fn format_from_tokens(tokens: &[String]) -> Result<OutputFormat, DxbotError> {
     let args = std::iter::once("version".to_owned())
         .chain(tokens.iter().cloned())
@@ -667,6 +1060,24 @@ fn parse_timeout(value: Option<&str>) -> Result<Duration, DxbotError> {
         )));
     }
     Ok(duration)
+}
+
+fn local_bool(input: &CliInput, key: &str) -> Result<bool, DxbotError> {
+    match input.fields.get(key) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(Value::String(value)) if value == "true" => Ok(true),
+        Some(Value::String(value)) if value == "false" => Ok(false),
+        Some(_) => Err(input_error(format!("--{key} expects a boolean flag"))),
+    }
+}
+
+fn local_string(input: &CliInput, key: &str) -> Result<Option<String>, DxbotError> {
+    match input.fields.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(input_error(format!("--{key} expects one value"))),
+    }
 }
 
 fn render_group_help(group: &str) -> String {
@@ -779,6 +1190,18 @@ fn owner_unavailable(command_key: &str, kind: &str) -> DxbotError {
         format!("registry command {command_key} ({kind}) has no connected production owner"),
     )
 }
+
+fn partial_error(message: impl Into<String>, resume_cursor: Option<String>) -> DxbotError {
+    let mut error = error_with(
+        ErrorCode::PartialOrResync,
+        ErrorCategory::Recovery,
+        message,
+    );
+    error.resume_cursor = resume_cursor;
+    error.retryable = true;
+    error
+}
+
 fn usage_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::Usage, ErrorCategory::Input, message)
 }
@@ -789,7 +1212,11 @@ fn local_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::StorageOrCorruption, ErrorCategory::Local, message)
 }
 fn storage_error(message: impl Into<String>) -> DxbotError {
-    error_with(ErrorCode::StorageOrCorruption, ErrorCategory::Integrity, message)
+    error_with(
+        ErrorCode::StorageOrCorruption,
+        ErrorCategory::Integrity,
+        message,
+    )
 }
 fn runtime_unavailable(message: impl Into<String>) -> DxbotError {
     error_with(
@@ -802,7 +1229,9 @@ fn incompatible_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::Incompatible, ErrorCategory::Conflict, message)
 }
 fn timeout_error(message: impl Into<String>) -> DxbotError {
-    error_with(ErrorCode::Timeout, ErrorCategory::Availability, message)
+    let mut error = error_with(ErrorCode::Timeout, ErrorCategory::Availability, message);
+    error.retryable = true;
+    error
 }
 fn interrupted_error(message: impl Into<String>) -> DxbotError {
     error_with(ErrorCode::Interrupted, ErrorCategory::Local, message)
@@ -887,5 +1316,30 @@ mod tests {
         );
         assert!(parse_timeout(Some("11m")).is_err());
         assert!(parse_timeout(Some("0s")).is_err());
+    }
+
+    #[test]
+    fn stream_json_is_rejected_before_any_unbounded_buffering() {
+        let prepared = prepare_invocation(&args(&[
+            "task", "watch", "--task", "task-a", "--format", "json",
+        ]))
+        .expect("invocation parses");
+        let PreparedInvocation::Command { input, kind, .. } = prepared else {
+            panic!("expected command");
+        };
+        assert_eq!(kind, "S");
+        assert_eq!(input.global_options.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn watch_poll_is_strictly_inside_transport_timeout() {
+        assert!(watch_poll_timeout(Duration::from_secs(30)) <= WATCH_POLL_MAX);
+        assert!(watch_poll_timeout(Duration::from_millis(10)) < Duration::from_millis(10));
+    }
+
+    #[test]
+    fn color_always_is_explicit_even_for_buffered_execution() {
+        let output = execute(&args(&["--color", "always", "--version"]));
+        assert!(output.stdout.starts_with("\u{1b}[32m"));
     }
 }
