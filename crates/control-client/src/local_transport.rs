@@ -2,7 +2,7 @@
 //!
 //! Endpoint metadata is validated before every connection. Runtime identity,
 //! HostGeneration and the server-derived local Principal are then bound by the
-//! versioned handshake before preflight, query, submit or recovery lookup.
+//! versioned handshake before preflight, query, host action, submit or recovery lookup.
 
 #![cfg(unix)]
 
@@ -114,6 +114,28 @@ impl LocalControlClient {
             LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
             _ => Err(ClientError::Transport(
                 "unexpected response after query".to_owned(),
+            )),
+        }
+    }
+
+    pub fn stop_host(&self, host_generation: i64) -> Result<Value, ClientError> {
+        let (mut stream, handshake) = self.connect_and_handshake()?;
+        if host_generation != handshake.host_generation {
+            return Err(ClientError::Transport(format!(
+                "host generation mismatch: expected {}, got {host_generation}",
+                handshake.host_generation
+            )));
+        }
+        write_local_control_frame(
+            &mut stream,
+            &LocalControlRequest::StopHost { host_generation },
+        )
+        .map_err(codec_error)?;
+        match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
+            LocalControlResponse::Data { value } => Ok(value),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
+            _ => Err(ClientError::Transport(
+                "unexpected response after host stop".to_owned(),
             )),
         }
     }
