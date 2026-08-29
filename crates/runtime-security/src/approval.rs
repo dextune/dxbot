@@ -210,7 +210,7 @@ impl ApprovalManager {
             return Err(Error::UnknownApproval(ApprovalId(operation_id.0.clone())));
         };
         if matches.next().is_some() {
-            return Err(Error::AmbiguousApprovalOperation(operation_id.clone()));
+            return Err(Error::InvalidApprovalBinding);
         }
         Ok(first.clone())
     }
@@ -298,7 +298,7 @@ mod tests {
             .expect("second");
         assert_eq!(
             manager.find_by_operation(&operation),
-            Err(Error::AmbiguousApprovalOperation(operation))
+            Err(Error::InvalidApprovalBinding)
         );
     }
 }
