@@ -840,7 +840,8 @@ fn reject_unowned_semantics(payload: &CommandPayload) -> Result<(), ServerError>
     };
     if let Some(field) = unsupported
         .iter()
-        .find(|field| payload.semantic_options.get(**field).is_some())
+        .copied()
+        .find(|field| payload.semantic_options.get(field).is_some())
     {
         return Err(ServerError::Conflict(format!(
             "{} field '{field}' requires canonical owner semantics that are not yet available; refusing to ignore it",
