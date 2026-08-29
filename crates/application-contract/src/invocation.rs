@@ -21,10 +21,12 @@ struct FieldSpec {
     type_name: String,
     source: String,
     required: bool,
+    multiple: bool,
 }
 
-/// Parse canonical command-key argv and then bind remaining user positionals to
-/// the registry's typed field order.
+/// Parse canonical command-key argv and bind remaining user positionals to the
+/// registry's typed field order. Unknown fields, illegal duplicates and an
+/// unsupported wait policy fail before any target preflight or durable journal.
 pub fn parse_bound_input(args: &[String]) -> Result<CliInput, DxbotError> {
     validate_argv_bounds(args)?;
     let mut input = CliInput::parse(args)?;
@@ -35,7 +37,8 @@ pub fn parse_bound_input(args: &[String]) -> Result<CliInput, DxbotError> {
         ))
     })?;
     bind_positionals(&mut input, metadata)?;
-    validate_required_fields(&input, metadata)?;
+    validate_fields(&input, metadata)?;
+    validate_wait(&input, metadata)?;
     Ok(input)
 }
 
@@ -83,7 +86,9 @@ fn bind_positionals(input: &mut CliInput, metadata: CommandMetadata) -> Result<(
             )));
         };
         bind_one(input, spec, primary_selector.as_deref(), value)?;
-        next += 1;
+        if !spec.multiple {
+            next += 1;
+        }
     }
     Ok(())
 }
@@ -102,7 +107,7 @@ fn can_bind_positional(
     if is_content_type(&spec.type_name) {
         return input.content.is_none();
     }
-    !field_present(&input.fields, &spec.name)
+    spec.multiple || !field_present(&input.fields, &spec.name)
 }
 
 fn bind_one(
@@ -125,21 +130,57 @@ fn bind_one(
     let fields = input.fields.as_object_mut().ok_or_else(|| {
         util::invariant("CliInput fields must be an object before positional binding")
     })?;
-    fields.insert(spec.name.clone(), Value::String(value));
+    if spec.multiple {
+        match fields.entry(spec.name.clone()).or_insert_with(|| Value::Array(Vec::new())) {
+            Value::Array(values) => values.push(Value::String(value)),
+            _ => {
+                return Err(util::input_error(format!(
+                    "field '{}' mixes singular and repeated values",
+                    spec.name
+                )));
+            }
+        }
+    } else {
+        if fields.contains_key(&spec.name) {
+            return Err(util::input_error(format!(
+                "field '{}' was provided more than once",
+                spec.name
+            )));
+        }
+        fields.insert(spec.name.clone(), Value::String(value));
+    }
     Ok(())
 }
 
-fn validate_required_fields(
-    input: &CliInput,
-    metadata: CommandMetadata,
-) -> Result<(), DxbotError> {
+fn validate_fields(input: &CliInput, metadata: CommandMetadata) -> Result<(), DxbotError> {
     let specs = parse_field_specs(metadata.typed_fields);
     let primary_selector = primary_selector_name(&specs);
-    for spec in specs {
+    let object = input
+        .fields
+        .as_object()
+        .ok_or_else(|| util::invariant("CliInput fields must be a JSON object"))?;
+
+    for (name, value) in object {
+        let Some(spec) = specs.iter().find(|spec| spec.name == *name) else {
+            return Err(util::input_error(format!(
+                "unknown option/field '{}' for {}",
+                name.replace('_', "-"),
+                input.command_key
+            )));
+        };
+        if !spec.multiple && value.is_array() {
+            return Err(util::input_error(format!(
+                "field '{}' was provided more than once",
+                spec.name
+            )));
+        }
+    }
+
+    for spec in &specs {
         if !spec.required || !is_user_source(&spec.source) {
             continue;
         }
-        let present = if is_primary_selector(&spec, primary_selector.as_deref()) {
+        let present = if is_primary_selector(spec, primary_selector.as_deref()) {
             input.selector.is_some()
         } else if is_content_type(&spec.type_name) {
             input.content.is_some()
@@ -156,6 +197,20 @@ fn validate_required_fields(
         }
     }
     Ok(())
+}
+
+fn validate_wait(input: &CliInput, metadata: CommandMetadata) -> Result<(), DxbotError> {
+    let Some(wait) = input.global_options.wait.as_deref() else {
+        return Ok(());
+    };
+    if metadata.wait_allowed.split(',').any(|allowed| allowed == wait) {
+        Ok(())
+    } else {
+        Err(util::input_error(format!(
+            "wait policy '{wait}' is not allowed for {}; allowed={}",
+            input.command_key, metadata.wait_allowed
+        )))
+    }
 }
 
 fn normalize_field_names(fields: &mut Value) -> Result<(), DxbotError> {
@@ -287,7 +342,9 @@ fn parse_field_spec(raw: &str) -> Option<FieldSpec> {
     }
     let (name, rest) = raw.split_once(':')?;
     let (typed, source) = rest.rsplit_once('@').unwrap_or((rest, "argv"));
-    let required = typed.trim_end().ends_with('!') || typed.trim_end().ends_with('+');
+    let cardinality = typed.trim().chars().last();
+    let required = matches!(cardinality, Some('!' | '+'));
+    let multiple = matches!(cardinality, Some('*' | '+'));
     let type_name = typed
         .trim()
         .trim_end_matches(['!', '?', '*', '+'])
@@ -303,6 +360,7 @@ fn parse_field_spec(raw: &str) -> Option<FieldSpec> {
         type_name,
         source,
         required,
+        multiple,
     })
 }
 
@@ -389,6 +447,38 @@ mod tests {
             .expect("bot-list page arguments must skip local all flag");
         assert_eq!(input.fields["page_size"], "50");
         assert_eq!(input.fields["cursor"], "cursor-a");
+    }
+
+    #[test]
+    fn unknown_named_option_is_rejected() {
+        let error = parse_bound_input(&args(&["bot-create", "alpha", "--wat", "x"]))
+            .expect_err("unknown field must fail closed");
+        assert!(error.message.contains("unknown option/field"));
+    }
+
+    #[test]
+    fn singular_duplicate_is_rejected() {
+        let error = parse_bound_input(&args(&[
+            "bot-create", "--name", "alpha", "--name", "beta",
+        ]))
+        .expect_err("duplicate singular field must fail closed");
+        assert!(error.message.contains("more than once"));
+    }
+
+    #[test]
+    fn repeated_field_remains_bounded_typed_array() {
+        let input = parse_bound_input(&args(&[
+            "memory-propose", "scope-a", "statement", "--evidence", "a", "--evidence", "b",
+        ]))
+        .expect("repeatable evidence is allowed");
+        assert_eq!(input.fields["evidence"], json!(["a", "b"]));
+    }
+
+    #[test]
+    fn illegal_wait_policy_is_rejected() {
+        let error = parse_bound_input(&args(&["bot-list", "--wait", "committed"]))
+            .expect_err("query cannot use committed wait");
+        assert!(error.message.contains("wait policy"));
     }
 
     #[test]
