@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod delegation;
+pub mod execution;
 pub mod interface;
 pub mod membership;
 pub mod mutation;
@@ -12,6 +13,10 @@ pub mod subscription;
 pub mod watch;
 
 pub use delegation::{DelegationManager, DelegationRecord, DelegationStatus, DelegationSummary};
+pub use execution::{
+    ExecutionCandidate, ExecutionEvidenceInput, ExecutionResultInput, ExecutionRunFence,
+    ExecutionWork,
+};
 pub use interface::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
 pub use membership::{MembershipManager, MembershipRecord, MembershipSummary};
 pub use mutation::{AppError, ApplicationMutator};
@@ -22,12 +27,13 @@ pub use query::{
     ThreadSummary, all_loop, resync,
 };
 pub use state::{
-    BotPolicyBindings, BotState, ChannelState, ConversationOwner, ConversationState,
-    DeclassificationRecord, DomainState, IdempotencyBindingState, LifecycleState,
-    MemoryAssertionStatus, MemoryRevisionState, MemoryState, MessageState, ProcessLifecycle,
-    ProcessState, ProjectLifecycle, ProjectState, SideEffectResolveError, SideEffectState,
-    SideEffectStatus, TaskControlDirective, TaskExecutionConstraints, TaskState, TaskStatus,
-    ThreadState,
+    BotPolicyBindings, BotState, ChannelState, ContextMemoryRef, ContextPlan, ConversationOwner,
+    ConversationState, DeclassificationRecord, DomainState, ExecutionAuditIntent,
+    ExecutionAuditPhase, ExecutionEvidence, ExecutionState, ExecutionStatus,
+    IdempotencyBindingState, LifecycleState, MemoryAssertionStatus, MemoryRevisionState,
+    MemoryState, MessageState, ProcessLifecycle, ProcessState, ProjectLifecycle, ProjectState,
+    ProviderBinding, SideEffectResolveError, SideEffectState, SideEffectStatus,
+    TaskControlDirective, TaskExecutionConstraints, TaskState, TaskStatus, ThreadState,
 };
 pub use subscription::{
     MAX_EVENTS_PER_STREAM, StreamEvent, Subscription, SubscriptionManager, TaskResult,

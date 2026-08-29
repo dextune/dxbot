@@ -142,7 +142,18 @@ impl MachineRenderer {
                 s.push('\n');
                 s
             }
-            OutputFormat::Human => format!("error {:?}: {}", projected.code, projected.message),
+            OutputFormat::Human => {
+                let mut rendered = format!("error {:?}: {}", projected.code, projected.message);
+                for action in &projected.next_actions {
+                    let args =
+                        serde_json::to_string(&action.args).unwrap_or_else(|_| "{}".to_owned());
+                    rendered.push_str(&format!(
+                        "\nnext action: {} {} ({})",
+                        action.command_key, args, action.action_code
+                    ));
+                }
+                rendered
+            }
         }
     }
 
@@ -318,5 +329,29 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&rendered).expect("json");
         assert_eq!(value["next_actions"].as_array().expect("array").len(), 1);
         assert_eq!(value["next_actions"][0]["action_code"], "custom");
+    }
+
+    #[test]
+    fn human_failures_include_typed_next_actions() {
+        let renderer = MachineRenderer::new();
+        for (code, expected_command) in [
+            (ErrorCode::RuntimeUnavailable, "runtime-status"),
+            (ErrorCode::ProviderUnavailable, "runtime-doctor"),
+            (ErrorCode::RecoveryRequired, "runtime-doctor"),
+        ] {
+            let rendered = renderer.render_error(&error(code), OutputFormat::Human);
+            assert!(rendered.contains("next action:"));
+            assert!(rendered.contains(expected_command));
+            assert!(
+                !rendered.contains("dxb "),
+                "human action is not a stable shell string"
+            );
+        }
+
+        let mut approval = error(ErrorCode::ApprovalRequired);
+        approval.target_refs.push("approval:approval-1".to_owned());
+        let rendered = renderer.render_error(&approval, OutputFormat::Human);
+        assert!(rendered.contains("approval-show"));
+        assert!(rendered.contains("approval:approval-1"));
     }
 }

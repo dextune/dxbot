@@ -53,6 +53,7 @@ impl SelectedEndpoint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderDiagnostic {
     pub provider_id: String,
+    pub generation: i64,
     pub status: String,
     pub required_capabilities: Vec<String>,
     pub available: bool,
@@ -329,6 +330,7 @@ Runtime bootstrap:
         };
         Ok(ProviderDiagnostic {
             provider_id: descriptor.provider_id.clone(),
+            generation: descriptor.provider_generation,
             status: status.to_string(),
             required_capabilities: REQUIRED_PROVIDER_CAPABILITIES
                 .iter()
@@ -356,6 +358,16 @@ fn validate_descriptor(descriptor: &DiscoveryEndpoint) -> Result<(), DiscoveryEr
             message: format!(
                 "discovery descriptor has invalid HostGeneration {}",
                 descriptor.host_generation
+            ),
+        });
+    }
+    if descriptor.provider_generation < 0
+        || (descriptor.provider_ready && descriptor.provider_generation == 0)
+    {
+        return Err(DiscoveryError::InvalidEndpoint {
+            message: format!(
+                "discovery descriptor has invalid ProviderGeneration {}",
+                descriptor.provider_generation
             ),
         });
     }

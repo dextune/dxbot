@@ -16,14 +16,21 @@ pub fn run_runtime_host_process(args: &[OsString]) -> Result<(), String> {
     #[cfg(unix)]
     {
         let parsed = HostArgs::parse(args)?;
-        let host = runtime_host::LocalRuntimeHost::start(
+        let mut host = runtime_host::LocalRuntimeHost::start(
             parsed.runtime_root,
             parsed.discovery_root,
             parsed.profile,
         )
         .map_err(|error| format!("cannot start local Runtime Host: {error}"))?;
-        host.serve()
-            .map_err(|error| format!("local Runtime Host serve loop failed: {error}"))
+        let serve_result = host
+            .serve()
+            .map_err(|error| format!("local Runtime Host serve loop failed: {error}"));
+        let shutdown_result = host
+            .shutdown()
+            .map_err(|error| format!("local Runtime Host graceful shutdown failed: {error}"));
+        serve_result?;
+        shutdown_result?;
+        Ok(())
     }
 }
 

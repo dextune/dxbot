@@ -10,6 +10,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -22,13 +24,15 @@ use crate::delegation::{DelegationRecord, DelegationStatus};
 use crate::membership::MembershipRecord;
 use crate::mutation::AppError;
 use crate::state::{
-    BotState, ChannelState, ConversationState, DomainState, IdempotencyBindingState, MemoryState,
-    MessageState, ProcessState, ProjectState, SideEffectState, TaskState, ThreadState,
+    BotState, ChannelState, ConversationState, DomainState, ExecutionAuditIntent, ExecutionState,
+    IdempotencyBindingState, MemoryState, MessageState, ProcessState, ProjectState,
+    SideEffectState, TaskState, ThreadState,
 };
 
 // ProcessState is an additive v2 field. Keep the version stable and rely on
 // serde(default) so existing v2 snapshots load with an empty process set.
 const SNAPSHOT_VERSION: u32 = 2;
+const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const OWNER_DIRECTORY_MODE: u32 = 0o700;
 const OWNER_FILE_MODE: u32 = 0o600;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -47,6 +51,11 @@ impl ApplicationStateStore {
         let state = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 validate_snapshot_file(&path, &metadata)?;
+                if metadata.len() > MAX_SNAPSHOT_BYTES as u64 {
+                    return Err(AppError::ResourceExhausted(
+                        "application snapshot exceeds 64 MiB capacity".to_owned(),
+                    ));
+                }
                 let bytes = fs::read(&path).map_err(io_error)?;
                 let snapshot: SnapshotV2 = serde_json::from_slice(&bytes).map_err(|error| {
                     AppError::Internal(format!("application snapshot is corrupt: {error}"))
@@ -69,6 +78,11 @@ impl ApplicationStateStore {
         let bytes = serde_json::to_vec(&SnapshotV2::from_state(state)).map_err(|error| {
             AppError::Internal(format!("cannot serialize application snapshot: {error}"))
         })?;
+        if bytes.len() > MAX_SNAPSHOT_BYTES {
+            return Err(AppError::ResourceExhausted(
+                "application snapshot exceeds 64 MiB capacity".to_owned(),
+            ));
+        }
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temp = parent.join(format!(
             ".application-state.{}.{}.tmp",
@@ -81,7 +95,9 @@ impl ApplicationStateStore {
             .open(&temp)
             .map_err(io_error)?;
         harden_file(&temp)?;
-        if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        if let Err(error) =
+            write_snapshot_bytes(&mut file, &bytes, &self.path).and_then(|()| file.sync_all())
+        {
             let _ = fs::remove_file(&temp);
             return Err(io_error(error));
         }
@@ -111,11 +127,15 @@ struct SnapshotV2 {
     threads: Vec<ThreadState>,
     tasks: Vec<TaskState>,
     #[serde(default)]
+    executions: Vec<ExecutionState>,
+    #[serde(default)]
     processes: Vec<ProcessState>,
     projects: Vec<ProjectState>,
     channels: Vec<ChannelState>,
     memories: Vec<MemoryState>,
     side_effects: Vec<SideEffectState>,
+    #[serde(default)]
+    execution_audit_intents: Vec<ExecutionAuditIntent>,
     receipts: Vec<(OperationId, ReceiptRecord)>,
     results: Vec<(OperationId, OperationResult)>,
     command_bindings: Vec<(CommandId, OperationId)>,
@@ -137,6 +157,8 @@ impl SnapshotV2 {
         threads.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         let mut tasks: Vec<_> = state.tasks.values().cloned().collect();
         tasks.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        let mut executions: Vec<_> = state.executions.values().cloned().collect();
+        executions.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         let mut processes: Vec<_> = state.processes.values().cloned().collect();
         processes.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         let mut projects: Vec<_> = state.projects.values().cloned().collect();
@@ -147,6 +169,9 @@ impl SnapshotV2 {
         memories.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         let mut side_effects: Vec<_> = state.side_effects.values().cloned().collect();
         side_effects.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut execution_audit_intents: Vec<_> =
+            state.execution_audit_intents.values().cloned().collect();
+        execution_audit_intents.sort_by(|left, right| left.key.cmp(&right.key));
 
         let mut receipts: Vec<_> = state
             .receipts
@@ -204,11 +229,13 @@ impl SnapshotV2 {
             messages,
             threads,
             tasks,
+            executions,
             processes,
             projects,
             channels,
             memories,
             side_effects,
+            execution_audit_intents,
             receipts,
             results,
             command_bindings,
@@ -242,6 +269,9 @@ impl SnapshotV2 {
         for row in self.tasks {
             state.tasks.insert(row.id.clone(), row);
         }
+        for row in self.executions {
+            state.executions.insert(row.id.clone(), row);
+        }
         for row in self.processes {
             state.processes.insert(row.id.clone(), row);
         }
@@ -256,6 +286,9 @@ impl SnapshotV2 {
         }
         for row in self.side_effects {
             state.side_effects.insert(row.id.clone(), row);
+        }
+        for row in self.execution_audit_intents {
+            state.execution_audit_intents.insert(row.key.clone(), row);
         }
         state.receipts.extend(self.receipts);
         state.results.extend(self.results);
@@ -340,6 +373,28 @@ fn delegation_status_name(value: DelegationStatus) -> &'static str {
         DelegationStatus::Rejected => "rejected",
         DelegationStatus::Expired => "expired",
     }
+}
+
+fn write_snapshot_bytes(file: &mut File, bytes: &[u8], _target: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if test_storage_full_path()
+        .lock()
+        .is_ok_and(|path| path.as_ref() == Some(&_target.to_path_buf()))
+    {
+        let partial = bytes.len().min(32);
+        file.write_all(&bytes[..partial])?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "injected production snapshot storage-full fault",
+        ));
+    }
+    file.write_all(bytes)
+}
+
+#[cfg(test)]
+fn test_storage_full_path() -> &'static Mutex<Option<PathBuf>> {
+    static PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    PATH.get_or_init(|| Mutex::new(None))
 }
 
 fn parse_delegation_status(value: &str) -> Result<DelegationStatus, AppError> {
@@ -457,6 +512,8 @@ mod tests {
                 status: crate::state::SideEffectStatus::Dispatched,
                 evidence: Vec::new(),
                 operation_ref: Some(OperationId("operation-a".to_owned())),
+                execution_ref: None,
+                process_ref: None,
             },
         );
         store.persist(&state).expect("snapshot persists");
@@ -499,6 +556,48 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(OWNER_FILE_MODE)).expect("mode sets");
         let (_, restored) = ApplicationStateStore::open(path.clone()).expect("legacy loads");
         assert!(restored.processes.is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn snapshot_capacity_failure_preserves_prior_durable_state() {
+        let path = path();
+        let (store, state) = ApplicationStateStore::open(path.clone()).expect("store opens");
+        store.persist(&state).expect("baseline persists");
+        let baseline = fs::read(&path).expect("baseline bytes");
+
+        let mut oversized = state;
+        oversized.command_request_digests.insert(
+            CommandId("oversized-command".to_owned()),
+            RequestDigest("x".repeat(MAX_SNAPSHOT_BYTES + 1)),
+        );
+        assert!(matches!(
+            store.persist(&oversized),
+            Err(AppError::ResourceExhausted(_))
+        ));
+        assert_eq!(fs::read(&path).expect("durable state"), baseline);
+        let (_, restored) = ApplicationStateStore::open(path.clone()).expect("baseline restores");
+        assert!(restored.command_request_digests.is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn storage_full_during_temp_write_preserves_prior_snapshot() {
+        let path = path();
+        let (store, mut state) = ApplicationStateStore::open(path.clone()).expect("store opens");
+        store.persist(&state).expect("baseline persists");
+        let baseline = fs::read(&path).expect("baseline bytes");
+        state.command_request_digests.insert(
+            CommandId("new-command".to_owned()),
+            RequestDigest("new-digest".to_owned()),
+        );
+        *test_storage_full_path().lock().expect("fault lock") = Some(path.clone());
+        let error = store.persist(&state).expect_err("storage full");
+        *test_storage_full_path().lock().expect("fault lock") = None;
+        assert!(matches!(error, AppError::Internal(message) if message.contains("storage-full")));
+        assert_eq!(fs::read(&path).expect("durable state"), baseline);
+        let (_, restored) = ApplicationStateStore::open(path.clone()).expect("baseline restores");
+        assert!(restored.command_request_digests.is_empty());
         cleanup(&path);
     }
 }

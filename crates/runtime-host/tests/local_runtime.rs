@@ -36,13 +36,46 @@ fn temp_layout(name: &str) -> Layout {
 fn host_registers_owner_principal_from_manifest() {
     let layout = temp_layout("owner-principal");
 
-    let host = LocalRuntimeHost::start(
+    let mut host = LocalRuntimeHost::start(
         layout.runtime_root.clone(),
         layout.discovery_root.clone(),
         None,
     )
     .expect("host start");
     let instance_id = host.instance_id().clone();
+    assert!(host.audit_healthy());
+    assert_eq!(host.audit_record_count().expect("audit count"), 0);
+    let pid_path = layout.runtime_root.join(".runtime-host.pid");
+    assert_eq!(
+        fs::read_to_string(&pid_path).expect("pid artifact").trim(),
+        std::process::id().to_string()
+    );
+    let endpoint_path = PathBuf::from(
+        host.endpoint_uri()
+            .strip_prefix("unix://")
+            .expect("unix endpoint URI"),
+    );
+    let report = host.shutdown().expect("graceful shutdown");
+    assert_eq!(
+        report.steps,
+        [
+            "admission-stopped",
+            "activity-drained",
+            "audit-checkpointed",
+            "endpoint-unpublished",
+            "discovery-unpublished",
+            "pid-removed",
+        ]
+    );
+    assert!(!endpoint_path.exists(), "endpoint is unpublished last");
+    assert!(
+        !pid_path.exists(),
+        "normal shutdown removes owned PID artifact"
+    );
+    assert_eq!(
+        host.shutdown().expect("idempotent shutdown").steps,
+        report.steps
+    );
     drop(host);
 
     // The first-init manifest decided the owner principal; the host must have
@@ -108,4 +141,62 @@ fn host_restart_preserves_instance_identity_and_advances_generation() {
             .resolve_principal(&manifest.owner.principal_ref)
             .is_ok()
     );
+}
+
+#[test]
+fn host_start_fails_closed_for_corrupt_audit_outbox() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let layout = temp_layout("corrupt-audit");
+    fs::create_dir_all(&layout.runtime_root).expect("runtime root");
+    fs::set_permissions(&layout.runtime_root, fs::Permissions::from_mode(0o700))
+        .expect("runtime permissions");
+    let audit_path = layout.runtime_root.join("audit-outbox.json");
+    fs::write(
+        &audit_path,
+        br#"{"schema_version":1,"records":[{"tampered":true}]}"#,
+    )
+    .expect("corrupt audit fixture");
+    fs::set_permissions(&audit_path, fs::Permissions::from_mode(0o600)).expect("audit permissions");
+
+    let error = LocalRuntimeHost::start(
+        layout.runtime_root.clone(),
+        layout.discovery_root.clone(),
+        None,
+    )
+    .expect_err("corrupt audit must prevent Runtime readiness");
+    let message = error.to_string();
+    assert!(
+        message.contains("cannot restore Runtime Audit outbox"),
+        "{message}"
+    );
+    assert!(message.contains("audit log is corrupt"), "{message}");
+    assert!(
+        !layout.runtime_root.join(".runtime-host.pid").exists(),
+        "failed startup must not publish a live PID artifact"
+    );
+}
+
+#[test]
+fn offline_storage_lock_excludes_live_runtime_host() {
+    let layout = temp_layout("offline-lock-fence");
+    let host = LocalRuntimeHost::start(
+        layout.runtime_root.clone(),
+        layout.discovery_root.clone(),
+        None,
+    )
+    .expect("host start");
+
+    let error = runtime_host::OfflineStorage::open_offline(layout.runtime_root.clone())
+        .expect_err("live Runtime must fence offline storage");
+    assert!(
+        error
+            .to_string()
+            .contains("offline storage lock unavailable")
+    );
+    drop(host);
+
+    let offline = runtime_host::OfflineStorage::open_offline(layout.runtime_root.clone())
+        .expect("offline lock after host shutdown");
+    assert_eq!(offline.runtime_root(), layout.runtime_root.as_path());
 }

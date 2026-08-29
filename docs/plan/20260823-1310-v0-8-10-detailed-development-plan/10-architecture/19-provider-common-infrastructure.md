@@ -27,7 +27,7 @@ depends_on: ["DXB-ARC-012", "DXB-ARC-013", "DXB-ARC-017", "DXB-ARC-018"]
 ### 비범위
 
 - 여러 transport protocol (gRPC, WebSocket) — P0는 HTTP/SSE만
-- Provider registry, credential vault, quota management — 후속 작업
+- multi-provider registry, persistent credential vault, quota management — 후속 작업. P0 단일 production Provider의 owner-only config/credential-reference composition은 `ADR-0138`과 `DXB-RUN-035`가 소유한다.
 - Plugin package/isolation boundary — `DXB-ARC-016` 영역
 - Model-specific prompting 전략 — Extension 책임
 
@@ -296,7 +296,7 @@ execute_task(task)
 
 - 범용 RPC/IDL framework ❌
 - 여러 transport protocol (gRPC, WebSocket) ❌
-- Provider registry, credential vault, quota ❌
+- multi-provider registry / persistent credential vault / quota ❌ (P0 owner-only 단일 Provider config와 ephemeral credential reference는 `ADR-0138`/`DXB-RUN-035`)
 - Plugin package/isolation ❌
 - `ReferenceProvider`의 production fallback ❌
 - Provider-specific SDK 의존성 ❌

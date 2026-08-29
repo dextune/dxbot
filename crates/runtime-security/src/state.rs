@@ -21,6 +21,7 @@ use crate::{
 };
 
 const SECURITY_SCHEMA_VERSION: u32 = 1;
+const MAX_SECURITY_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityAuditIntent {
@@ -259,7 +260,14 @@ impl SecurityStateStore {
                     ),
                 ));
             }
-            Ok(_) => {}
+            Ok(metadata) => {
+                if metadata.len() > MAX_SECURITY_SNAPSHOT_BYTES as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "security state exceeds 16 MiB capacity",
+                    ));
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -299,6 +307,12 @@ impl SecurityStateStore {
         };
         let bytes = serde_json::to_vec(&snapshot)
             .map_err(|error| io::Error::other(format!("cannot encode security state: {error}")))?;
+        if bytes.len() > MAX_SECURITY_SNAPSHOT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "security state exceeds 16 MiB capacity",
+            ));
+        }
         let temp = temp_path(&self.path);
         let write_result = (|| {
             let mut file = OpenOptions::new()
@@ -525,6 +539,41 @@ mod tests {
         assert_eq!(reopened.approval_wakeups()[0].operation_id, operation_id);
         assert_eq!(reopened.approval_wakeups()[0].policy_generation, 7);
         assert_eq!(reopened.audit_intents().len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn security_snapshot_capacity_failure_preserves_prior_durable_state() {
+        let root = std::env::temp_dir().join(format!(
+            "dxbot-security-pressure-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("temp root");
+        let path = root.join("security-state.json");
+        let (store, state) = SecurityStateStore::open(path.clone()).expect("open");
+        store.persist(&state).expect("baseline");
+        let baseline = fs::read(&path).expect("baseline bytes");
+
+        let mut oversized = state;
+        oversized.audit_intents.insert(
+            "oversized".to_owned(),
+            SecurityAuditIntent {
+                operation_id: OperationId("operation-pressure".to_owned()),
+                principal_ref: PrincipalRef("principal-pressure".to_owned()),
+                action: "x".repeat(MAX_SECURITY_SNAPSHOT_BYTES + 1),
+                target: "runtime".to_owned(),
+                created_at: 1,
+            },
+        );
+        let error = store.persist(&oversized).expect_err("capacity failure");
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(fs::read(&path).expect("durable state"), baseline);
+        let (_, restored) = SecurityStateStore::open(path).expect("baseline restores");
+        assert!(restored.audit_intents().is_empty());
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

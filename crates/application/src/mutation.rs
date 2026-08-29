@@ -11,23 +11,28 @@ use std::sync::{Arc, Mutex};
 use dxbot_core::receipt::{ReceiptDisposition, ReceiptRecord};
 use dxbot_core::types::*;
 
-use crate::membership::{MembershipRecord, membership_key};
+use crate::delegation::{DelegationRecord, DelegationStatus};
+use crate::execution::{AuditIntentInput, record_execution_audit};
+use crate::membership::{MembershipManager, MembershipRecord, membership_key};
 use crate::outcome::{DomainOutcome, resolve_outcome};
 use crate::persistence::ApplicationStateStore;
 use crate::query::scope_owner;
 use crate::state::{
-    BotPolicyBindings, BotState, ChannelState, ConversationOwner, ConversationState,
-    DeclassificationRecord, DomainState, IdempotencyBindingState, LifecycleState,
-    MemoryAssertionStatus, MemoryRevisionState, MemoryState, MessageState, ProcessLifecycle,
-    ProcessState, ProjectLifecycle, ProjectState, SideEffectStatus, TaskControlDirective,
+    BotPolicyBindings, BotState, ChannelState, ContextMemoryRef, ContextPlan, ConversationOwner,
+    ConversationState, DeclassificationRecord, DomainState, ExecutionAuditPhase, ExecutionState,
+    ExecutionStatus, IdempotencyBindingState, LifecycleState, MemoryAssertionStatus,
+    MemoryRevisionState, MemoryState, MessageState, ProcessLifecycle, ProcessState,
+    ProjectLifecycle, ProjectState, ProviderBinding, SideEffectStatus, TaskControlDirective,
     TaskExecutionConstraints, TaskState, TaskStatus, ThreadState,
 };
 
+const MAX_NONTERMINAL_EXECUTIONS: usize = 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppError {
     NotFound(String),
     Conflict(String),
     PermissionDenied(String),
+    ResourceExhausted(String),
     Internal(String),
     GapDetected(String),
     Timeout(String),
@@ -45,8 +50,8 @@ type CommitHook<'a> = dyn FnMut(&CommandPayload, &DomainState) -> Result<(), App
 
 #[derive(Debug)]
 pub struct ApplicationMutator {
-    state: Arc<Mutex<DomainState>>,
-    persistence: Option<Arc<ApplicationStateStore>>,
+    pub(crate) state: Arc<Mutex<DomainState>>,
+    pub(crate) persistence: Option<Arc<ApplicationStateStore>>,
 }
 
 impl Default for ApplicationMutator {
@@ -82,7 +87,23 @@ impl ApplicationMutator {
     }
 
     pub fn mutate(&self, request: &OperationRequest) -> Result<OperationResult, AppError> {
-        self.mutate_internal(request, None)
+        self.mutate_internal(request, None, None)
+    }
+
+    pub fn mutate_with_provider_binding(
+        &self,
+        request: &OperationRequest,
+        provider_binding: &ProviderBinding,
+    ) -> Result<OperationResult, AppError> {
+        if !matches!(
+            request.payload.command_key.as_str(),
+            "task-submit" | "task-resume"
+        ) {
+            return Err(AppError::Conflict(
+                "Provider binding is only valid for task-submit or task-resume".to_owned(),
+            ));
+        }
+        self.mutate_internal(request, None, Some(provider_binding))
     }
 
     pub fn mutate_with_commit_hook<F>(
@@ -93,13 +114,14 @@ impl ApplicationMutator {
     where
         F: FnMut(&CommandPayload, &DomainState) -> Result<(), AppError>,
     {
-        self.mutate_internal(request, Some(&mut hook))
+        self.mutate_internal(request, Some(&mut hook), None)
     }
 
     fn mutate_internal(
         &self,
         request: &OperationRequest,
         mut hook: Option<&mut CommitHook<'_>>,
+        provider_binding: Option<&ProviderBinding>,
     ) -> Result<OperationResult, AppError> {
         validate_request_identity(request)?;
         let payload = &request.payload;
@@ -147,13 +169,14 @@ impl ApplicationMutator {
             instance_id: payload.instance_id.clone(),
             request_digest: request.request_digest.clone(),
         };
-        let committed_payload = match apply_command(&mut guard, payload, &identity) {
-            Ok(payload) => payload,
-            Err(error) => {
-                *guard = rollback;
-                return Err(error);
-            }
-        };
+        let committed_payload =
+            match apply_command(&mut guard, payload, &identity, provider_binding) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    *guard = rollback;
+                    return Err(error);
+                }
+            };
         let receipt = ReceiptRecord {
             operation_id: identity.operation_id.0.clone(),
             disposition: ReceiptDisposition::Committed,
@@ -265,6 +288,7 @@ fn apply_command(
     state: &mut DomainState,
     payload: &CommandPayload,
     identity: &OperationIdentity,
+    provider_binding: Option<&ProviderBinding>,
 ) -> Result<Option<serde_json::Value>, AppError> {
     match payload.command_key.as_str() {
         "runtime-stop-graceful" => Ok(Some(serde_json::json!({"shutdown": "requested"}))),
@@ -281,9 +305,9 @@ fn apply_command(
         "thread-create" => create_thread(state, payload, identity),
         "thread-send" => send_thread(state, payload, identity),
         "thread-branch" => branch_thread(state, payload, identity),
-        "task-submit" => submit_task(state, payload, identity),
+        "task-submit" => submit_task(state, payload, identity, provider_binding),
         "task-cancel" | "task-suspend" | "task-resume" | "task-redirect" => {
-            control_task(state, payload)
+            control_task(state, payload, provider_binding)
         }
         "memory-propose" => propose_memory(state, payload, identity),
         "memory-promote" => promote_memory(state, payload),
@@ -541,10 +565,102 @@ fn branch_thread(
     })))
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedDelegation {
+    from_bot: BotId,
+    to_bot: BotId,
+    role: String,
+}
+
+fn resolve_delegation(
+    state: &DomainState,
+    scope: &ScopeSelector,
+    constraints: &TaskExecutionConstraints,
+) -> Result<Option<ResolvedDelegation>, AppError> {
+    let Some(recipient_ref) = constraints.delegate_to_bot.as_deref() else {
+        return Ok(None);
+    };
+    if recipient_ref.len() > 256 {
+        return Err(AppError::ResourceExhausted(
+            "delegation recipient reference exceeds 256 bytes".to_owned(),
+        ));
+    }
+    if matches!(scope, ScopeSelector::Bot(_)) {
+        return Err(AppError::Conflict(
+            "cross-Bot delegation requires a shared Project or Channel scope".to_owned(),
+        ));
+    }
+    let sender_ref = constraints.requested_sender_bot.as_deref().ok_or_else(|| {
+        AppError::PermissionDenied(
+            "operator-issued delegation requires server-authorized requested_sender_bot".to_owned(),
+        )
+    })?;
+    if sender_ref.len() > 256 {
+        return Err(AppError::ResourceExhausted(
+            "delegation sender reference exceeds 256 bytes".to_owned(),
+        ));
+    }
+    let from_bot = resolve_bot_id(state, sender_ref)?;
+    let to_bot = resolve_bot_id(state, recipient_ref)?;
+    if from_bot == to_bot {
+        return Err(AppError::Conflict(
+            "delegation sender and recipient must be distinct".to_owned(),
+        ));
+    }
+    let sender = state
+        .memberships
+        .get(&membership_key(
+            scope,
+            &BotSelector::CanonicalId(from_bot.clone()),
+        ))
+        .filter(|membership| membership.active)
+        .ok_or_else(|| {
+            AppError::PermissionDenied("delegation sender is not an active scope member".to_owned())
+        })?;
+    if !MembershipManager::can_delegate(&sender.role) {
+        return Err(AppError::PermissionDenied(format!(
+            "membership role {} cannot delegate",
+            sender.role
+        )));
+    }
+    state
+        .memberships
+        .get(&membership_key(
+            scope,
+            &BotSelector::CanonicalId(to_bot.clone()),
+        ))
+        .filter(|membership| membership.active)
+        .ok_or_else(|| {
+            AppError::PermissionDenied(
+                "delegation recipient is not an active member of the same scope".to_owned(),
+            )
+        })?;
+    Ok(Some(ResolvedDelegation {
+        from_bot,
+        to_bot,
+        role: sender.role.clone(),
+    }))
+}
+
+fn resolve_bot_id(state: &DomainState, reference: &str) -> Result<BotId, AppError> {
+    let candidate = strip_prefix(reference, "bot:");
+    let direct = BotId(candidate.clone());
+    if state.bots.contains_key(&direct) {
+        return Ok(direct);
+    }
+    state
+        .bots
+        .values()
+        .find(|bot| bot.name == candidate)
+        .map(|bot| bot.id.clone())
+        .ok_or_else(|| AppError::NotFound(format!("unknown Bot reference: {reference}")))
+}
+
 fn submit_task(
     state: &mut DomainState,
     payload: &CommandPayload,
     identity: &OperationIdentity,
+    provider_binding: Option<&ProviderBinding>,
 ) -> Result<Option<serde_json::Value>, AppError> {
     let scope = scope_from_target(&payload.canonical_target)?;
     ensure_scope_exists(state, &scope)?;
@@ -559,9 +675,6 @@ fn submit_task(
         deadline: optional_field(payload, "deadline").map(str::to_owned),
         budget: optional_field(payload, "budget").map(str::to_owned),
     };
-    // Explicit delegation/sender refs must resolve so neither field can become
-    // a dangling, silently stored binding. Authority policy remains owned by
-    // Control/Security; Application validates canonical referents.
     for (field, reference) in [
         ("delegate_to_bot", constraints.delegate_to_bot.as_deref()),
         (
@@ -580,30 +693,120 @@ fn submit_task(
             )));
         }
     }
+    let delegation = resolve_delegation(state, &scope, &constraints)?;
+    if let Some(binding) = provider_binding {
+        if binding.provider_id.0.trim().is_empty()
+            || binding.capability.trim().is_empty()
+            || binding.generation <= 0
+        {
+            return Err(AppError::Conflict(
+                "task admission requires a valid Provider binding".to_owned(),
+            ));
+        }
+        let nonterminal = state
+            .executions
+            .values()
+            .filter(|execution| {
+                matches!(
+                    execution.status,
+                    ExecutionStatus::Admitted | ExecutionStatus::Running
+                )
+            })
+            .count();
+        if nonterminal >= MAX_NONTERMINAL_EXECUTIONS {
+            return Err(AppError::ResourceExhausted(format!(
+                "Execution admission capacity {MAX_NONTERMINAL_EXECUTIONS} is exhausted"
+            )));
+        }
+    }
+
     let id = TaskId(format!("task:{}", identity.operation_id.0));
-    // Create the durable orchestration Process aggregate. The Process is the
-    // internal producer tied to task submission; it owns only refs/progress and
-    // never copies task lifecycle. Its identity is derived deterministically
-    // from the committing operation so exact retry and restart converge on the
-    // same ProcessId without a second create command.
     let process_id = ProcessId(format!("process:{}", identity.operation_id.0));
+    let execution_id =
+        provider_binding.map(|_| ExecutionId(format!("execution:{}:1", identity.operation_id.0)));
     let task_ref = format!("task:{}", id.0);
     let process_ref = format!("process:{}", process_id.0);
+    let execution_ref = execution_id
+        .as_ref()
+        .map(|id| format!("execution:{}", id.0));
+    let scope_ref = scope_owner(&scope);
+    let owner = delegation
+        .as_ref()
+        .map(|delegation| format!("bot:{}", delegation.to_bot.0))
+        .unwrap_or_else(|| scope_ref.clone());
+    let context_bot = delegation
+        .as_ref()
+        .map(|delegation| delegation.to_bot.clone());
+    let context_plan = match (execution_id.as_ref(), provider_binding) {
+        (Some(execution_id), Some(binding)) => Some(build_context_plan(
+            state,
+            ContextPlanBuild {
+                task_id: &id,
+                execution_id,
+                scope_ref: &scope_ref,
+                context_bot: context_bot.as_ref(),
+                task_revision: 1,
+                constraints: &constraints,
+                provider_binding: binding,
+            },
+        )?),
+        _ => None,
+    };
+
     state.tasks.insert(
         id.clone(),
         TaskState {
             id: id.clone(),
-            owner: scope_owner(&scope),
+            owner: owner.clone(),
             revision: 1,
             execution_generation: 1,
-            status: TaskStatus::Pending,
+            status: if provider_binding.is_some() {
+                TaskStatus::Admitted
+            } else {
+                TaskStatus::Pending
+            },
             intent: payload.content.clone(),
             result: None,
             constraints: constraints.clone(),
             control_history: Vec::new(),
             process_ref: Some(process_ref.clone()),
+            execution_refs: execution_id.iter().cloned().collect(),
         },
     );
+    if let (Some(execution_id), Some(context_plan)) = (execution_id.as_ref(), context_plan) {
+        state.executions.insert(
+            execution_id.clone(),
+            ExecutionState {
+                id: execution_id.clone(),
+                task_id: id.clone(),
+                generation: 1,
+                attempt: 1,
+                status: ExecutionStatus::Admitted,
+                context_plan,
+                scheduler_generation: None,
+                result: None,
+                evidence: Vec::new(),
+                terminal_reason: None,
+            },
+        );
+    }
+    let mut child_refs = vec![task_ref.clone()];
+    if let Some(execution_ref) = &execution_ref {
+        child_refs.push(execution_ref.clone());
+    }
+    if let Some(delegation) = &delegation {
+        state.delegations.push(DelegationRecord {
+            id: format!("delegation:{}", identity.operation_id.0),
+            task_id: id.clone(),
+            from_bot: BotSelector::CanonicalId(delegation.from_bot.clone()),
+            to_bot: BotSelector::CanonicalId(delegation.to_bot.clone()),
+            scope: scope.clone(),
+            role: delegation.role.clone(),
+            status: DelegationStatus::Accepted,
+            created_at: now_secs().saturating_mul(1_000),
+            resolved_at: Some(now_secs().saturating_mul(1_000)),
+        });
+    }
     state.processes.insert(
         process_id.clone(),
         ProcessState {
@@ -611,30 +814,269 @@ fn submit_task(
             definition_id: "task-execution".to_owned(),
             definition_version: "1".to_owned(),
             revision: 1,
-            scope_ref: scope_owner(&scope),
-            initiator_ref: payload.principal_ref.0.clone(),
+            scope_ref: scope_ref.clone(),
+            initiator_ref: delegation
+                .as_ref()
+                .map(|delegation| format!("bot:{}", delegation.from_bot.0))
+                .unwrap_or_else(|| payload.principal_ref.0.clone()),
             lifecycle: ProcessLifecycle::Running,
-            current_step_ref: Some(task_ref.clone()),
+            current_step_ref: Some(if execution_ref.is_some() {
+                "provider-execution".to_owned()
+            } else {
+                task_ref.clone()
+            }),
+            current_activity_ref: execution_ref.clone(),
             waiting_condition_ref: None,
-            child_refs: vec![task_ref.clone()],
+            continuation_ref: execution_ref
+                .as_ref()
+                .map(|reference| format!("continue:{reference}")),
+            child_refs,
+            outcome_refs: Vec::new(),
             progress: 0,
             terminal_reason: None,
         },
     );
+    if let (Some(execution_id), Some(binding)) = (execution_id.as_ref(), provider_binding) {
+        record_execution_audit(
+            state,
+            AuditIntentInput {
+                execution_id,
+                execution_generation: 1,
+                task_id: &id,
+                process_id: &process_id,
+                provider_id: &binding.provider_id,
+                provider_generation: binding.generation,
+                phase: ExecutionAuditPhase::Admitted,
+                detail: "Task, Execution, Context Plan, and Process admitted atomically",
+            },
+        )?;
+    }
     Ok(Some(serde_json::json!({
         "task_ref": task_ref,
         "task_revision": 1,
+        "execution_ref": execution_ref,
         "execution_generation": 1,
-        "state": "pending",
+        "context_plan_ref": execution_id.as_ref().map(|id| format!("context-plan:{}", id.0)),
+        "state": if provider_binding.is_some() { "admitted" } else { "pending" },
         "process_ref": process_ref,
         "process_revision": 1,
+        "delegation_ref": delegation.as_ref().map(|_| format!("delegation:{}", identity.operation_id.0)),
+        "sender_bot_ref": delegation.as_ref().map(|value| format!("bot:{}", value.from_bot.0)),
+        "recipient_bot_ref": delegation.as_ref().map(|value| format!("bot:{}", value.to_bot.0)),
         "constraints": constraints_value(&constraints),
     })))
+}
+
+struct ContextPlanBuild<'a> {
+    task_id: &'a TaskId,
+    execution_id: &'a ExecutionId,
+    scope_ref: &'a str,
+    context_bot: Option<&'a BotId>,
+    task_revision: i64,
+    constraints: &'a TaskExecutionConstraints,
+    provider_binding: &'a ProviderBinding,
+}
+
+fn build_context_plan(
+    state: &DomainState,
+    input: ContextPlanBuild<'_>,
+) -> Result<ContextPlan, AppError> {
+    let ContextPlanBuild {
+        task_id,
+        execution_id,
+        scope_ref,
+        context_bot,
+        task_revision,
+        constraints,
+        provider_binding,
+    } = input;
+    const MAX_MEMORY_ITEMS: usize = 32;
+    const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+    const MAX_CONVERSATIONS: usize = 8;
+
+    let bot_id = context_bot.cloned().or_else(|| {
+        scope_ref
+            .strip_prefix("bot:")
+            .map(|value| BotId(value.to_owned()))
+    });
+    let bot = bot_id.as_ref().and_then(|id| state.bots.get(id));
+    let mut conversation_refs = bot_id
+        .as_ref()
+        .map(|id| {
+            state
+                .conversations
+                .values()
+                .filter(|conversation| {
+                    matches!(&conversation.owner, ConversationOwner::Bot { bot_id } if bot_id == id)
+                })
+                .map(|conversation| format!("conversation:{}", conversation.id.0))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    conversation_refs.sort();
+    conversation_refs.truncate(MAX_CONVERSATIONS);
+
+    let mut memories = state
+        .memories
+        .values()
+        .filter(|memory| {
+            memory.scope_key == scope_ref && memory.status == MemoryAssertionStatus::Accepted
+        })
+        .collect::<Vec<_>>();
+    memories.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+    let mut memory_refs = Vec::new();
+    let mut bounded_context = String::new();
+    for memory in memories.into_iter().take(MAX_MEMORY_ITEMS) {
+        let ContentSource::Text { value } = &memory.statement else {
+            continue;
+        };
+        let line = format!("[memory:{}@{}] {}\n", memory.id.0, memory.revision, value);
+        if bounded_context.len().saturating_add(line.len()) > MAX_CONTEXT_BYTES {
+            break;
+        }
+        bounded_context.push_str(&line);
+        memory_refs.push(ContextMemoryRef {
+            memory_id: memory.id.clone(),
+            revision: memory.revision,
+        });
+    }
+    let permission_refs = bot
+        .and_then(|bot| bot.policy_bindings.permission_policy.clone())
+        .into_iter()
+        .collect();
+
+    let max_output_tokens = parse_budget(constraints.budget.as_deref())?;
+    let deadline_unix_seconds = parse_deadline(constraints.deadline.as_deref())?;
+    Ok(ContextPlan {
+        plan_ref: format!("context-plan:{}", execution_id.0),
+        schema_version: "context-plan-v1".to_owned(),
+        task_id: task_id.clone(),
+        task_revision,
+        scope_ref: scope_ref.to_owned(),
+        bot_ref: bot_id.map(|id| format!("bot:{}", id.0)),
+        identity_revision: bot.map(|bot| bot.revision),
+        conversation_refs,
+        memory_refs,
+        capability_requirements: vec![provider_binding.capability.clone()],
+        provider_binding: provider_binding.clone(),
+        permission_refs,
+        resource_budget: constraints.budget.clone(),
+        max_output_tokens,
+        deadline: constraints.deadline.clone(),
+        deadline_unix_seconds,
+        bounded_context,
+    })
+}
+
+fn parse_budget(value: Option<&str>) -> Result<Option<u32>, AppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let parsed = value.parse::<u64>().map_err(|_| {
+        AppError::Conflict(
+            "task budget must be a positive numeric token ceiling until BudgetRef policy resolution is implemented"
+                .to_owned(),
+        )
+    })?;
+    let parsed = u32::try_from(parsed).map_err(|_| {
+        AppError::Conflict("task budget exceeds the Provider token ceiling".to_owned())
+    })?;
+    if parsed == 0 {
+        return Err(AppError::Conflict(
+            "task budget must be greater than zero".to_owned(),
+        ));
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_deadline(value: Option<&str>) -> Result<Option<i64>, AppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if let Ok(epoch) = value.parse::<i64>() {
+        if epoch <= 0 {
+            return Err(AppError::Conflict(
+                "task deadline epoch must be positive".to_owned(),
+            ));
+        }
+        return Ok(Some(epoch));
+    }
+    parse_rfc3339_utc(value).map(Some).ok_or_else(|| {
+        AppError::Conflict(
+            "task deadline must be Unix epoch seconds or RFC3339 UTC (YYYY-MM-DDTHH:MM:SSZ)"
+                .to_owned(),
+        )
+    })
+}
+
+fn parse_rfc3339_utc(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    let number = |start: usize, end: usize| -> Option<i64> {
+        std::str::from_utf8(&bytes[start..end]).ok()?.parse().ok()
+    };
+    let year = number(0, 4)?;
+    let month = number(5, 7)?;
+    let day = number(8, 10)?;
+    let hour = number(11, 13)?;
+    let minute = number(14, 16)?;
+    let second = number(17, 19)?;
+    if !(1..=12).contains(&month)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+    {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let month_index = usize::try_from(month.checked_sub(1)?).ok()?;
+    if day < 1 || day > i64::from(month_days[month_index]) {
+        return None;
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year / 400
+    } else {
+        (adjusted_year - 399) / 400
+    };
+    let year_of_era = adjusted_year - era * 400;
+    let adjusted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    days.checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)
 }
 
 fn control_task(
     state: &mut DomainState,
     payload: &CommandPayload,
+    provider_binding: Option<&ProviderBinding>,
 ) -> Result<Option<serde_json::Value>, AppError> {
     validate_target_against(state, &payload.canonical_target, &payload.cas)?;
     let CanonicalTarget::Task {
@@ -651,6 +1093,80 @@ fn control_task(
         None
     };
     let reason = optional_field(payload, "reason").map(str::to_owned);
+    let resume_attempt = if payload.command_key == "task-resume" {
+        let current = state
+            .tasks
+            .get(id)
+            .ok_or_else(|| AppError::NotFound(format!("task {} does not exist", id.0)))?;
+        validate_task_control_transition(current.status, payload.command_key.as_str())?;
+        match provider_binding {
+            Some(binding) => {
+                if binding.provider_id.0.trim().is_empty()
+                    || binding.capability.trim().is_empty()
+                    || binding.generation <= 0
+                {
+                    return Err(AppError::Conflict(
+                        "task resume requires a valid fresh Provider binding".to_owned(),
+                    ));
+                }
+                let nonterminal = state
+                    .executions
+                    .values()
+                    .filter(|execution| {
+                        matches!(
+                            execution.status,
+                            ExecutionStatus::Admitted | ExecutionStatus::Running
+                        )
+                    })
+                    .count();
+                if nonterminal >= MAX_NONTERMINAL_EXECUTIONS {
+                    return Err(AppError::ResourceExhausted(format!(
+                        "Execution admission capacity {MAX_NONTERMINAL_EXECUTIONS} is exhausted"
+                    )));
+                }
+                let generation =
+                    next_revision(current.execution_generation, "execution generation")?;
+                let task_revision = next_revision(current.revision, "task")?;
+                let execution_id = ExecutionId(format!("execution:{}:{generation}", id.0));
+                let resume_scope = current
+                    .process_ref
+                    .as_deref()
+                    .and_then(|reference| {
+                        state
+                            .processes
+                            .get(&ProcessId(strip_prefix(reference, "process:")))
+                    })
+                    .map(|process| process.scope_ref.clone())
+                    .unwrap_or_else(|| current.owner.clone());
+                let resume_bot = current
+                    .owner
+                    .strip_prefix("bot:")
+                    .map(|value| BotId(value.to_owned()));
+                let context_plan = build_context_plan(
+                    state,
+                    ContextPlanBuild {
+                        task_id: id,
+                        execution_id: &execution_id,
+                        scope_ref: &resume_scope,
+                        context_bot: resume_bot.as_ref(),
+                        task_revision,
+                        constraints: &current.constraints,
+                        provider_binding: binding,
+                    },
+                )?;
+                Some((execution_id, generation, task_revision, context_plan))
+            }
+            None if current.execution_refs.is_empty() => None,
+            None => {
+                return Err(AppError::Conflict(
+                    "task resume requires a fresh Ready Provider binding and immutable Execution attempt"
+                        .to_owned(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let task = state
         .tasks
         .get_mut(id)
@@ -678,9 +1194,14 @@ fn control_task(
         "task-cancel" => task.status = TaskStatus::Cancelled,
         "task-suspend" => task.status = TaskStatus::Suspended,
         "task-resume" => {
-            task.status = TaskStatus::Running;
-            task.execution_generation =
-                next_revision(task.execution_generation, "execution generation")?;
+            if let Some((_, generation, _, _)) = &resume_attempt {
+                task.status = TaskStatus::Admitted;
+                task.execution_generation = *generation;
+            } else {
+                task.status = TaskStatus::Running;
+                task.execution_generation =
+                    next_revision(task.execution_generation, "execution generation")?;
+            }
         }
         "task-redirect" => {
             task.intent = replacement;
@@ -702,9 +1223,13 @@ fn control_task(
         execution_generation: task.execution_generation,
         reason: reason.clone(),
     });
+    if let Some((execution_id, _, _, _)) = &resume_attempt {
+        task.execution_refs.push(execution_id.clone());
+    }
     let task_status = task.status;
     let task_revision = task.revision;
     let process_ref = task.process_ref.clone();
+    let execution_refs = task.execution_refs.clone();
 
     // Transition the linked orchestration Process by reference. Legacy tasks
     // have no process_ref and remain controllable; a present but unresolved ref
@@ -717,10 +1242,120 @@ fn control_task(
             reason.as_deref(),
         )?;
     }
+    let execution_ref =
+        if let Some((execution_id, generation, planned_task_revision, context_plan)) =
+            resume_attempt
+        {
+            let reference = format!("execution:{}", execution_id.0);
+            state.executions.insert(
+                execution_id.clone(),
+                ExecutionState {
+                    id: execution_id.clone(),
+                    task_id: id.clone(),
+                    generation,
+                    attempt: generation,
+                    status: ExecutionStatus::Admitted,
+                    context_plan,
+                    scheduler_generation: None,
+                    result: None,
+                    evidence: Vec::new(),
+                    terminal_reason: None,
+                },
+            );
+            if planned_task_revision != task_revision {
+                return Err(AppError::Internal(
+                    "resume Context Plan task revision drifted during atomic mutation".to_owned(),
+                ));
+            }
+            let process_id = process_ref
+                .as_deref()
+                .map(|process_ref| ProcessId(strip_prefix(process_ref, "process:")))
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "fresh Execution attempt requires an orchestration Process".to_owned(),
+                    )
+                })?;
+            let process = state.processes.get_mut(&process_id).ok_or_else(|| {
+                AppError::Internal(format!(
+                    "task references missing orchestration process: {}",
+                    process_ref.as_deref().unwrap_or_default()
+                ))
+            })?;
+            process.current_step_ref = Some("provider-execution".to_owned());
+            process.current_activity_ref = Some(reference.clone());
+            process.continuation_ref = Some(format!("continue:{reference}"));
+            process.child_refs.push(reference.clone());
+            let binding = provider_binding.ok_or_else(|| {
+                AppError::Internal("fresh Execution attempt lost Provider binding".to_owned())
+            })?;
+            record_execution_audit(
+                state,
+                AuditIntentInput {
+                    execution_id: &execution_id,
+                    execution_generation: generation,
+                    task_id: id,
+                    process_id: &process_id,
+                    provider_id: &binding.provider_id,
+                    provider_generation: binding.generation,
+                    phase: ExecutionAuditPhase::Admitted,
+                    detail: "fresh resume Execution and Context Plan admitted atomically",
+                },
+            )?;
+            Some(reference)
+        } else {
+            None
+        };
+    if matches!(payload.command_key.as_str(), "task-cancel" | "task-suspend") {
+        let mut cancelled = Vec::new();
+        for execution_id in execution_refs {
+            if let Some(execution) = state.executions.get_mut(&execution_id) {
+                if execution.status == ExecutionStatus::Admitted {
+                    execution.status = ExecutionStatus::Cancelled;
+                    execution.terminal_reason =
+                        Some(format!("{} before Provider activity", payload.command_key));
+                    cancelled.push((
+                        execution.id.clone(),
+                        execution.generation,
+                        execution.context_plan.provider_binding.provider_id.clone(),
+                        execution.context_plan.provider_binding.generation,
+                    ));
+                }
+            }
+        }
+        if !cancelled.is_empty() {
+            let process_id = process_ref
+                .as_deref()
+                .map(|reference| ProcessId(strip_prefix(reference, "process:")))
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "cancelled Execution requires an orchestration Process".to_owned(),
+                    )
+                })?;
+            for (execution_id, generation, provider_id, provider_generation) in cancelled {
+                record_execution_audit(
+                    state,
+                    AuditIntentInput {
+                        execution_id: &execution_id,
+                        execution_generation: generation,
+                        task_id: id,
+                        process_id: &process_id,
+                        provider_id: &provider_id,
+                        provider_generation,
+                        phase: ExecutionAuditPhase::Cancelled,
+                        detail: "Execution cancelled before Provider activity",
+                    },
+                )?;
+            }
+        }
+    }
     Ok(Some(serde_json::json!({
         "task_ref": format!("task:{}", id.0),
         "task_revision": task_revision,
         "execution_generation": execution_generation_of(state, id),
+        "execution_ref": execution_ref.clone(),
+        "context_plan_ref": execution_ref
+            .as_ref()
+            .map(|reference| format!("context-plan:{}", strip_prefix(reference, "execution:"))),
         "state": task_status_name(task_status),
         "process_ref": process_ref,
     })))
@@ -1390,15 +2025,23 @@ fn validate_task_control_transition(
         "task-cancel" => matches!(
             current,
             TaskStatus::Pending
+                | TaskStatus::Admitted
                 | TaskStatus::Running
                 | TaskStatus::Suspended
                 | TaskStatus::Deferred
         ),
-        "task-suspend" => matches!(current, TaskStatus::Pending | TaskStatus::Running),
-        "task-resume" => current == TaskStatus::Suspended,
+        "task-suspend" => matches!(
+            current,
+            TaskStatus::Pending | TaskStatus::Admitted | TaskStatus::Running
+        ),
+        "task-resume" => matches!(
+            current,
+            TaskStatus::Suspended | TaskStatus::RecoveryRequired
+        ),
         "task-redirect" => matches!(
             current,
             TaskStatus::Pending
+                | TaskStatus::Admitted
                 | TaskStatus::Running
                 | TaskStatus::Suspended
                 | TaskStatus::Deferred
@@ -1446,13 +2089,17 @@ fn advance_process_for_task_control(
     // A terminal Process can never be resurrected or advanced by another
     // control operation. Exact retries are intercepted by operation identity
     // before this function is reached.
-    if matches!(
-        process.lifecycle,
-        ProcessLifecycle::Completed
-            | ProcessLifecycle::Cancelled
-            | ProcessLifecycle::Failed
-            | ProcessLifecycle::RecoveryRequired
-    ) {
+    let recovery_resume =
+        process.lifecycle == ProcessLifecycle::RecoveryRequired && command_key == "task-resume";
+    if !recovery_resume
+        && matches!(
+            process.lifecycle,
+            ProcessLifecycle::Completed
+                | ProcessLifecycle::Cancelled
+                | ProcessLifecycle::Failed
+                | ProcessLifecycle::RecoveryRequired
+        )
+    {
         return Err(AppError::Conflict(format!(
             "process {} is already terminal",
             process.id.0
@@ -1494,6 +2141,7 @@ fn project_lifecycle_name(value: ProjectLifecycle) -> &'static str {
 fn task_status_name(value: TaskStatus) -> &'static str {
     match value {
         TaskStatus::Pending => "pending",
+        TaskStatus::Admitted => "admitted",
         TaskStatus::Running => "running",
         TaskStatus::Suspended => "suspended",
         TaskStatus::Succeeded => "succeeded",

@@ -10,9 +10,9 @@ use std::collections::HashMap;
 
 use dxbot_core::receipt::ReceiptRecord;
 use dxbot_core::types::{
-    BotId, ChannelId, CommandId, ContentSource, ConversationId, MemoryId, MessageId, OperationId,
-    OperationResult, OperationSelector, ProcessId, ProjectId, RequestDigest, ScopeSelector,
-    SideEffectSelector, TaskId, ThreadId,
+    BotId, ChannelId, CommandId, ContentSource, ConversationId, ExecutionId, MemoryId, MessageId,
+    OperationId, OperationResult, OperationSelector, ProcessId, ProjectId, ProviderId,
+    RequestDigest, ScopeSelector, SideEffectSelector, TaskId, ThreadId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +39,7 @@ pub enum ProjectLifecycle {
 #[serde(rename_all = "kebab-case")]
 pub enum TaskStatus {
     Pending,
+    Admitted,
     Running,
     Suspended,
     Succeeded,
@@ -207,6 +208,102 @@ pub struct TaskControlDirective {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionStatus {
+    Admitted,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderBinding {
+    pub provider_id: ProviderId,
+    pub capability: String,
+    pub generation: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionAuditPhase {
+    Admitted,
+    Running,
+    Dispatched,
+    Succeeded,
+    Failed,
+    Cancelled,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionAuditIntent {
+    pub key: String,
+    pub execution_id: ExecutionId,
+    pub execution_generation: i64,
+    pub task_id: TaskId,
+    pub process_id: ProcessId,
+    pub provider_id: ProviderId,
+    pub provider_generation: i64,
+    pub phase: ExecutionAuditPhase,
+    pub detail: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextMemoryRef {
+    pub memory_id: MemoryId,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPlan {
+    pub plan_ref: String,
+    pub schema_version: String,
+    pub task_id: TaskId,
+    pub task_revision: i64,
+    pub scope_ref: String,
+    pub bot_ref: Option<String>,
+    pub identity_revision: Option<i64>,
+    pub conversation_refs: Vec<String>,
+    pub memory_refs: Vec<ContextMemoryRef>,
+    pub capability_requirements: Vec<String>,
+    pub provider_binding: ProviderBinding,
+    pub permission_refs: Vec<String>,
+    pub resource_budget: Option<String>,
+    pub max_output_tokens: Option<u32>,
+    pub deadline: Option<String>,
+    pub deadline_unix_seconds: Option<i64>,
+    /// Immutable, bounded materialization consumed by ProviderHost.
+    pub bounded_context: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionEvidence {
+    pub provider_id: ProviderId,
+    pub observation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionState {
+    pub id: ExecutionId,
+    pub task_id: TaskId,
+    pub generation: i64,
+    pub attempt: i64,
+    pub status: ExecutionStatus,
+    pub context_plan: ContextPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<ExecutionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskState {
     pub id: TaskId,
@@ -226,6 +323,9 @@ pub struct TaskState {
     /// This is a *reference*, not a copy of Process state. Backward-compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_ref: Option<String>,
+    /// Immutable Execution attempt refs in creation order.
+    #[serde(default)]
+    pub execution_refs: Vec<ExecutionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,8 +338,14 @@ pub struct ProcessState {
     pub initiator_ref: String,
     pub lifecycle: ProcessLifecycle,
     pub current_step_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_activity_ref: Option<String>,
     pub waiting_condition_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_ref: Option<String>,
     pub child_refs: Vec<String>,
+    #[serde(default)]
+    pub outcome_refs: Vec<String>,
     pub progress: i64,
     pub terminal_reason: Option<String>,
 }
@@ -307,6 +413,10 @@ pub struct SideEffectState {
     /// `side-effect reconcile` selection by Operation. Backward-compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_ref: Option<OperationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_ref: Option<ExecutionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_ref: Option<ProcessId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,11 +432,13 @@ pub struct DomainState {
     pub messages: HashMap<MessageId, MessageState>,
     pub threads: HashMap<ThreadId, ThreadState>,
     pub tasks: HashMap<TaskId, TaskState>,
+    pub executions: HashMap<ExecutionId, ExecutionState>,
     pub processes: HashMap<ProcessId, ProcessState>,
     pub projects: HashMap<ProjectId, ProjectState>,
     pub channels: HashMap<ChannelId, ChannelState>,
     pub memories: HashMap<MemoryId, MemoryState>,
     pub side_effects: HashMap<String, SideEffectState>,
+    pub execution_audit_intents: HashMap<String, ExecutionAuditIntent>,
     pub receipts: HashMap<OperationId, ReceiptRecord>,
     pub results: HashMap<OperationId, OperationResult>,
     pub command_bindings: HashMap<CommandId, OperationId>,

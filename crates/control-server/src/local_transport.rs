@@ -5,6 +5,7 @@
 //! its owner/type/generation, but pathname permissions are not treated as peer
 //! identity. Same-UID process isolation is intentionally not claimed.
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -27,7 +28,8 @@ const SOCKET_MODE: u32 = 0o600;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WATCH_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 
-#[derive(Debug)]
+pub type RuntimeDiagnostics = dyn Fn() -> serde_json::Value + Send + Sync;
+
 pub struct LocalControlServer {
     listener: UnixListener,
     endpoint_path: PathBuf,
@@ -38,6 +40,18 @@ pub struct LocalControlServer {
     owner_principal_ref: PrincipalRef,
     shutdown_requested: Arc<AtomicBool>,
     control: Arc<ControlServer>,
+    diagnostics: Arc<RuntimeDiagnostics>,
+}
+
+impl fmt::Debug for LocalControlServer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalControlServer")
+            .field("endpoint_path", &self.endpoint_path)
+            .field("instance_id", &self.instance_id)
+            .field("host_generation", &self.host_generation)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LocalControlServer {
@@ -46,6 +60,27 @@ impl LocalControlServer {
         instance_id: InstanceId,
         host_generation: i64,
         control: Arc<ControlServer>,
+    ) -> Result<Self, io::Error> {
+        Self::bind_with_diagnostics(
+            endpoint_path,
+            instance_id,
+            host_generation,
+            control,
+            Arc::new(|| {
+                serde_json::json!({
+                    "sections": [],
+                    "status": "diagnostics-not-composed"
+                })
+            }),
+        )
+    }
+
+    pub fn bind_with_diagnostics(
+        endpoint_path: PathBuf,
+        instance_id: InstanceId,
+        host_generation: i64,
+        control: Arc<ControlServer>,
+        diagnostics: Arc<RuntimeDiagnostics>,
     ) -> Result<Self, io::Error> {
         if host_generation <= 0 {
             return Err(io::Error::new(
@@ -89,6 +124,7 @@ impl LocalControlServer {
             owner_principal_ref,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             control,
+            diagnostics,
         })
     }
 
@@ -98,6 +134,29 @@ impl LocalControlServer {
 
     pub fn endpoint_path(&self) -> &Path {
         &self.endpoint_path
+    }
+
+    /// Stop accepting new control admission. Existing in-flight handler work is
+    /// allowed to finish before the Runtime owner drains execution activity.
+    pub fn stop_admission(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+    }
+
+    /// Unpublish the owned endpoint only after Runtime checkpoint/audit drain.
+    /// Inode fencing prevents deleting a replacement endpoint.
+    pub fn unpublish_endpoint(&self) -> Result<(), io::Error> {
+        let metadata = match fs::symlink_metadata(&self.endpoint_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_socket()
+            && metadata.dev() == self.endpoint_dev
+            && metadata.ino() == self.endpoint_ino
+        {
+            fs::remove_file(&self.endpoint_path)?;
+        }
+        Ok(())
     }
 
     pub fn serve(&self) -> Result<(), io::Error> {
@@ -264,6 +323,13 @@ impl LocalControlServer {
                 .map_err(codec_io),
                 Err(error) => write_error(&mut stream, error.to_dxbot_error()),
             },
+            LocalControlRequest::RuntimeDiagnostics => write_local_control_frame(
+                &mut stream,
+                &LocalControlResponse::Data {
+                    value: (self.diagnostics)(),
+                },
+            )
+            .map_err(codec_io),
             LocalControlRequest::StopHost { host_generation } => {
                 if authenticated_principal != self.owner_principal_ref {
                     return write_error(

@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use application::ApplicationMutator;
 use control_server::{ControlServer, SecurityState, ServerError};
 use dxbot_core::types::{
-    BotId, CanonicalTarget, CasConditions, CommandId, CommandPayload, IdempotencyKey, InstanceId,
-    OperationId, OperationRequest, PrincipalRef, RequestDigest,
+    BotId, BotSelector, CanonicalTarget, CasConditions, CommandId, CommandPayload, ContentSource,
+    IdempotencyKey, InstanceId, OperationId, OperationRequest, PrincipalRef, ProjectId,
+    ProjectSelector, RequestDigest, ScopeSelector,
 };
 use provider_host::{ProviderHost, ReferenceProvider};
 use serde_json::json;
@@ -62,6 +63,19 @@ fn revision_cas(revision: i64) -> CasConditions {
     }
 }
 
+fn project_revision_cas(revision: i64) -> CasConditions {
+    let mut cas = revision_cas(0);
+    cas.if_revision = None;
+    cas.if_project_revision = Some(revision);
+    cas
+}
+
+fn scope_revision_cas(revision: i64) -> CasConditions {
+    let mut cas = revision_cas(0);
+    cas.if_revision = None;
+    cas.if_scope_revision = Some(revision);
+    cas
+}
 fn register_operator(server: &ControlServer) {
     server
         .register_local_operator(&principal())
@@ -150,4 +164,88 @@ fn ready_llm_provider_allows_activation_owner_path() {
         )
         .expect("ready provider admits activation");
     assert_eq!(result.status, "committed");
+}
+
+#[test]
+fn operator_delegation_is_authorized_server_side_and_creates_recipient_execution() {
+    let application = Arc::new(ApplicationMutator::new());
+    for (sequence, name) in [("create-alpha", "alpha"), ("create-beta", "beta")] {
+        application
+            .mutate(&request(
+                "bot-create",
+                sequence,
+                CanonicalTarget::Instance(InstanceId("instance-a".to_owned())),
+                None,
+                json!({"name": name}),
+            ))
+            .expect("bot create");
+    }
+    application
+        .mutate(&request(
+            "project-create",
+            "project",
+            CanonicalTarget::Instance(InstanceId("instance-a".to_owned())),
+            None,
+            json!({"name": "collaboration", "owner_bot": "bot:alpha"}),
+        ))
+        .expect("project create");
+    let scope = ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
+        "collaboration".to_owned(),
+    )));
+    application
+        .mutate(&request(
+            "project-member-set",
+            "member-beta",
+            CanonicalTarget::Membership {
+                scope: scope.clone(),
+                member_bot: BotSelector::CanonicalId(BotId("beta".to_owned())),
+            },
+            Some(project_revision_cas(1)),
+            json!({"role_ref": "member"}),
+        ))
+        .expect("recipient membership");
+
+    let security = Arc::new(Mutex::new(SecurityState::new()));
+    let mut providers = ProviderHost::new();
+    providers
+        .register_reference_provider(ReferenceProvider::new(
+            dxbot_core::types::ProviderId("reference".to_owned()),
+            "llm-chat",
+            4,
+        ))
+        .expect("test provider registration");
+    let server = ControlServer::with_provider_host(security, Arc::clone(&application), providers);
+    register_operator(&server);
+    let mut delegated = request(
+        "task-submit",
+        "delegate-beta",
+        CanonicalTarget::Project {
+            id: ProjectId("collaboration".to_owned()),
+            revision: 2,
+        },
+        Some(scope_revision_cas(2)),
+        json!({
+            "delegate_to_bot": "bot:beta",
+            "requested_sender_bot": "bot:alpha",
+            "budget": "32"
+        }),
+    );
+    delegated.payload.content = Some(ContentSource::Text {
+        value: "delegated work".to_owned(),
+    });
+    let result = server
+        .handle_request(&principal(), &delegated)
+        .expect("server-authorized delegation");
+    assert_eq!(result.status, "committed");
+
+    let state = application.snapshot().expect("snapshot");
+    assert_eq!(state.delegations.len(), 1);
+    assert_eq!(state.tasks.len(), 1);
+    assert_eq!(state.executions.len(), 1);
+    let task = state.tasks.values().next().expect("recipient task");
+    assert_eq!(task.owner, "bot:beta");
+    let execution = state.executions.values().next().expect("execution");
+    assert_eq!(execution.context_plan.bot_ref.as_deref(), Some("bot:beta"));
+    assert_eq!(execution.context_plan.scope_ref, "project:collaboration");
+    assert_eq!(execution.context_plan.provider_binding.generation, 4);
 }

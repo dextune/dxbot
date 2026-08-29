@@ -149,3 +149,126 @@ fn harness_list_providers_filters_by_capability() {
         Err(HarnessError::ProviderNotFound { .. })
     ));
 }
+
+#[cfg(unix)]
+fn real_host(endpoint: &str) -> ProviderHost {
+    let mut host = ProviderHost::new();
+    host.set_transport(provider_host::HttpTransport::new(
+        endpoint,
+        std::time::Duration::from_secs(2),
+    ));
+    host.register_real_provider(Box::new(provider_host::DeepSeekFlashAdapter::configured(
+        ProviderId("real-1".to_owned()),
+        "llm-chat",
+        1,
+        "test-model",
+    )))
+    .unwrap();
+    host
+}
+
+#[cfg(unix)]
+fn execute_against_response(status: &str, headers: &str, body: String) -> HarnessError {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let status = status.to_owned();
+    let headers = headers.to_owned();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\ncontent-length: {}\r\n{headers}\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    });
+    let error = match real_host(&endpoint).execute_task(&task("typed failure")) {
+        Err(error) => error,
+        Ok(result) => panic!("fixture unexpectedly succeeded: {result:?}"),
+    };
+    server.join().unwrap();
+    error
+}
+
+#[cfg(unix)]
+#[test]
+fn real_provider_preserves_typed_failure_matrix_without_detail_leak() {
+    assert_eq!(
+        execute_against_response(
+            "429 Too Many Requests",
+            "retry-after: 7\r\n",
+            "credential=secret-upstream".to_owned(),
+        ),
+        HarnessError::RateLimited {
+            id: ProviderId("real-1".to_owned()),
+            retry_after_seconds: Some(7),
+        }
+    );
+    assert_eq!(
+        execute_against_response(
+            "503 Service Unavailable",
+            "",
+            "credential=secret-upstream".to_owned(),
+        ),
+        HarnessError::UpstreamUnavailable {
+            id: ProviderId("real-1".to_owned()),
+            status: 503,
+        }
+    );
+    assert_eq!(
+        execute_against_response(
+            "200 OK",
+            "content-type: application/json\r\n",
+            "not-json".to_owned()
+        ),
+        HarnessError::ProtocolViolation {
+            id: ProviderId("real-1".to_owned()),
+        }
+    );
+
+    let oversized = serde_json::json!({
+        "choices": [{"message": {"content": "x".repeat(1024 * 1024 + 1), "reasoning_content": null}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "reasoning_tokens": 0}
+    })
+    .to_string();
+    assert_eq!(
+        execute_against_response("200 OK", "content-type: application/json\r\n", oversized),
+        HarnessError::OutputExceeded {
+            id: ProviderId("real-1".to_owned()),
+        }
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_provider_transport_and_deadline_are_typed_without_fallback_masking() {
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    assert_eq!(
+        real_host(&endpoint).execute_task(&task("transport")),
+        Err(HarnessError::TransportUnavailable {
+            id: ProviderId("real-1".to_owned()),
+        })
+    );
+
+    let expired = TaskDescription {
+        intent: "deadline".to_owned(),
+        context: "bounded".to_owned(),
+        budget: Some(1),
+        deadline: Some(1),
+    };
+    assert_eq!(
+        real_host("http://127.0.0.1:9").execute_task(&expired),
+        Err(HarnessError::DeadlineExceeded)
+    );
+}

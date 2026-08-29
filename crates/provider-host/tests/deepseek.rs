@@ -10,6 +10,11 @@ use provider_host::{
 };
 use std::time::Duration;
 
+fn proxy_endpoint() -> String {
+    std::env::var("DXBOT_TEST_OPENAI_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:10000".to_owned())
+}
+
 fn task(intent: &str) -> TaskDescription {
     TaskDescription {
         intent: intent.to_string(),
@@ -41,11 +46,11 @@ fn deepseek_001_implements_real_provider_trait() {
 }
 
 #[test]
-#[ignore = "requires local OpenAI-compatible proxy on localhost:10000"]
+#[ignore = "requires OpenAI-compatible proxy via DXBOT_TEST_OPENAI_ENDPOINT (default localhost:10000)"]
 fn deepseek_002_real_proxy_produces_output() {
     let mut host = ProviderHost::new();
     host.set_transport(HttpTransport::new(
-        "http://localhost:10000",
+        &proxy_endpoint(),
         Duration::from_secs(30),
     ));
     host.register_real_provider(Box::new(DeepSeekFlashAdapter::new(
@@ -67,9 +72,9 @@ fn deepseek_002_real_proxy_produces_output() {
 }
 
 #[test]
-#[ignore = "requires local OpenAI-compatible proxy on localhost:10000"]
+#[ignore = "requires OpenAI-compatible proxy via DXBOT_TEST_OPENAI_ENDPOINT (default localhost:10000)"]
 fn deepseek_003_reasoning_tokens_in_stream() {
-    let transport = HttpTransport::new("http://localhost:10000", Duration::from_secs(30));
+    let transport = HttpTransport::new(&proxy_endpoint(), Duration::from_secs(30));
     let protocol = ChatCompletionProtocol::new(transport, 1024 * 1024, 1000);
     let request = ProviderRequest {
         model: "alibaba/deepseek-v4-flash-0731".to_string(),
@@ -107,11 +112,11 @@ fn deepseek_003_reasoning_tokens_in_stream() {
 }
 
 #[test]
-#[ignore = "requires local OpenAI-compatible proxy on localhost:10000"]
+#[ignore = "requires OpenAI-compatible proxy via DXBOT_TEST_OPENAI_ENDPOINT (default localhost:10000)"]
 fn deepseek_004_chain_real_adapter_preferred() {
     let mut host = ProviderHost::new();
     host.set_transport(HttpTransport::new(
-        "http://localhost:10000",
+        &proxy_endpoint(),
         Duration::from_secs(30),
     ));
     host.register_real_provider(Box::new(DeepSeekFlashAdapter::new(
@@ -134,11 +139,11 @@ fn deepseek_004_chain_real_adapter_preferred() {
 }
 
 #[test]
-#[ignore = "requires local OpenAI-compatible proxy on localhost:10000"]
+#[ignore = "requires OpenAI-compatible proxy via DXBOT_TEST_OPENAI_ENDPOINT (default localhost:10000)"]
 fn deepseek_005_temperature_zero_is_deterministic() {
     let mut host = ProviderHost::new();
     host.set_transport(HttpTransport::new(
-        "http://localhost:10000",
+        &proxy_endpoint(),
         Duration::from_secs(30),
     ));
     host.register_real_provider(Box::new(DeepSeekFlashAdapter::new(

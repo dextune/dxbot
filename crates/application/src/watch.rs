@@ -220,6 +220,7 @@ mod tests {
                 constraints: Default::default(),
                 control_history: Vec::new(),
                 process_ref: None,
+                execution_refs: Vec::new(),
             },
         );
         let app = ApplicationMutator::with_state(state);
@@ -256,8 +257,11 @@ mod tests {
                 initiator_ref: "principal:a".to_owned(),
                 lifecycle: ProcessLifecycle::Running,
                 current_step_ref: None,
+                current_activity_ref: None,
                 waiting_condition_ref: None,
+                continuation_ref: None,
                 child_refs: Vec::new(),
+                outcome_refs: Vec::new(),
                 progress: 1,
                 terminal_reason: None,
             },

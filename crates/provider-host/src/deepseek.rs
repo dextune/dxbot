@@ -18,11 +18,15 @@ pub struct DeepSeekFlashAdapter {
 
 impl DeepSeekFlashAdapter {
     pub fn new(id: ProviderId, capability: &str, generation: i64) -> Self {
+        Self::configured(id, capability, generation, "alibaba/deepseek-v4-flash-0731")
+    }
+
+    pub fn configured(id: ProviderId, capability: &str, generation: i64, model: &str) -> Self {
         Self {
             id,
             capability: capability.to_string(),
             generation,
-            model: "alibaba/deepseek-v4-flash-0731".to_string(),
+            model: model.to_string(),
         }
     }
 }

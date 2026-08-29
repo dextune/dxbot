@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use dxbot_core::types::{OperationId, PrincipalRef};
+use serde::{Deserialize, Serialize};
 
 const SECRET_HINTS: [&str; 5] = ["secret", "password", "credential", "token", "key"];
 const REDACTED: &str = "[REDACTED]";
@@ -19,6 +20,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     CorruptLog,
     InvalidInput(String),
+    Io(String),
+    CapacityExceeded,
 }
 
 impl fmt::Display for Error {
@@ -26,13 +29,16 @@ impl fmt::Display for Error {
         match self {
             Self::CorruptLog => write!(formatter, "audit log is corrupt"),
             Self::InvalidInput(message) => write!(formatter, "invalid audit input: {message}"),
+            Self::Io(message) => write!(formatter, "audit storage I/O error: {message}"),
+            Self::CapacityExceeded => write!(formatter, "audit storage capacity exceeded"),
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RedactionLevel {
     None,
     Partial,
@@ -235,6 +241,7 @@ fn matches_filter(record: &AuditRecord, filter: &AuditFilter) -> bool {
             return false;
         }
     }
+
     if let Some(event_type) = filter.event_type {
         if record.event_type != event_type {
             return false;
@@ -251,6 +258,11 @@ fn matches_filter(record: &AuditRecord, filter: &AuditFilter) -> bool {
         }
     }
     true
+}
+
+pub(crate) fn redact_for_storage(payload: &str) -> (String, RedactionLevel) {
+    let level = classify(payload);
+    (redact_payload(payload, level), level)
 }
 
 fn redacted_projection(record: &AuditRecord) -> RedactedAuditRecord {

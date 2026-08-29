@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use application::ApplicationMutator;
 use application::mutation::AppError;
+use application::{ApplicationMutator, ProviderBinding};
 use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode, TypedNextAction};
 use dxbot_core::types::*;
 use provider_host::{HarnessError, ProviderHost, ProviderInfo, ProviderStatus};
@@ -39,6 +39,7 @@ pub enum ServerError {
     Conflict(String),
     ApprovalRequired(ApprovalRequired),
     ProviderUnavailable(String),
+    ResourceExhausted(String),
     GapDetected(String),
     Timeout(String),
     RecoveryRequired(String),
@@ -116,6 +117,12 @@ impl ServerError {
                 message.clone(),
                 true,
             ),
+            Self::ResourceExhausted(message) => (
+                ErrorCode::ResourceExhausted,
+                ErrorCategory::Resource,
+                message.clone(),
+                true,
+            ),
             Self::GapDetected(message) => (
                 ErrorCode::PartialOrResync,
                 ErrorCategory::Recovery,
@@ -170,7 +177,7 @@ impl std::error::Error for ServerError {}
 pub struct ControlServer {
     security: Arc<Mutex<SecurityState>>,
     application: Arc<ApplicationMutator>,
-    providers: Mutex<ProviderHost>,
+    providers: Arc<ProviderHost>,
     security_store: Option<Arc<SecurityStateStore>>,
     coordination_store: Option<Arc<SecurityCoordinationStore>>,
     parked_store: Option<Arc<ParkedOperationStore>>,
@@ -188,10 +195,18 @@ impl ControlServer {
         application: Arc<ApplicationMutator>,
         providers: ProviderHost,
     ) -> Self {
+        Self::with_shared_provider_host(security, application, Arc::new(providers))
+    }
+
+    pub fn with_shared_provider_host(
+        security: Arc<Mutex<SecurityState>>,
+        application: Arc<ApplicationMutator>,
+        providers: Arc<ProviderHost>,
+    ) -> Self {
         Self {
             security,
             application,
-            providers: Mutex::new(providers),
+            providers,
             security_store: None,
             coordination_store: None,
             parked_store: None,
@@ -207,6 +222,22 @@ impl ControlServer {
         security_store: Arc<SecurityStateStore>,
         coordination_store: Arc<SecurityCoordinationStore>,
     ) -> Result<Self, ServerError> {
+        Self::with_persistence_shared(
+            security,
+            application,
+            Arc::new(providers),
+            security_store,
+            coordination_store,
+        )
+    }
+
+    pub fn with_persistence_shared(
+        security: Arc<Mutex<SecurityState>>,
+        application: Arc<ApplicationMutator>,
+        providers: Arc<ProviderHost>,
+        security_store: Arc<SecurityStateStore>,
+        coordination_store: Arc<SecurityCoordinationStore>,
+    ) -> Result<Self, ServerError> {
         let parked_store = Arc::new(ParkedOperationStore::new(
             security_store
                 .path()
@@ -215,7 +246,7 @@ impl ControlServer {
         let server = Self {
             security,
             application,
-            providers: Mutex::new(providers),
+            providers,
             security_store: Some(security_store),
             coordination_store: Some(coordination_store),
             parked_store: Some(parked_store),
@@ -317,7 +348,7 @@ impl ControlServer {
 
         application_contract::validate_materialized_cas(&request.payload)
             .map_err(|error| ServerError::Conflict(error.message))?;
-        self.require_provider_admission(&request.payload)?;
+        let provider_binding = self.provider_admission(&request.payload)?;
 
         if is_high_risk(&request.payload.command_key)? {
             return self.park_high_risk_locked(authenticated_principal, request);
@@ -325,7 +356,13 @@ impl ControlServer {
 
         let delta = self.security_delta(authenticated_principal, request)?;
         if delta.is_empty() {
-            return self.application.mutate(request).map_err(map_app_error);
+            return match provider_binding.as_ref() {
+                Some(binding) => self
+                    .application
+                    .mutate_with_provider_binding(request, binding)
+                    .map_err(map_app_error),
+                None => self.application.mutate(request).map_err(map_app_error),
+            };
         }
 
         let mut candidate = self.lock_security()?.clone();
@@ -640,7 +677,7 @@ impl ControlServer {
         self.authorize_sender_override(principal, &request.payload)?;
         application_contract::validate_materialized_cas(&request.payload)
             .map_err(|error| ServerError::Conflict(error.message))?;
-        self.require_provider_admission(&request.payload)
+        self.provider_admission(&request.payload).map(|_| ())
     }
 
     fn mark_continued_without_application_locked(
@@ -767,25 +804,42 @@ impl ControlServer {
             .map_err(map_app_error)
     }
 
-    fn require_provider_admission(&self, payload: &CommandPayload) -> Result<(), ServerError> {
-        if !matches!(payload.command_key.as_str(), "bot-activate" | "task-submit") {
-            return Ok(());
+    fn provider_admission(
+        &self,
+        payload: &CommandPayload,
+    ) -> Result<Option<ProviderBinding>, ServerError> {
+        if !matches!(
+            payload.command_key.as_str(),
+            "bot-activate" | "task-submit" | "task-resume"
+        ) {
+            return Ok(None);
         }
-        let providers = self.providers.lock().map_err(|_| {
-            ServerError::InternalInvariant("provider host lock unavailable".to_owned())
-        })?;
-        let ready = providers
+        let mut ready = self
+            .providers
             .list_providers(Some(TASK_PROVIDER_CAPABILITY))
             .into_iter()
-            .any(|provider| provider.status == ProviderStatus::Ready);
-        if ready {
-            Ok(())
-        } else {
-            Err(ServerError::ProviderUnavailable(format!(
+            .filter(|provider| provider.status == ProviderStatus::Ready)
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            return Err(ServerError::ProviderUnavailable(format!(
                 "{} requires a Ready provider with capability {TASK_PROVIDER_CAPABILITY}",
                 payload.command_key
-            )))
+            )));
         }
+        if payload.command_key == "bot-activate" {
+            return Ok(None);
+        }
+        if ready.len() != 1 {
+            return Err(ServerError::Conflict(
+                "P0 task admission requires exactly one Ready llm-chat Provider".to_owned(),
+            ));
+        }
+        let provider = ready.remove(0);
+        Ok(Some(ProviderBinding {
+            provider_id: provider.id,
+            capability: provider.capability,
+            generation: provider.generation,
+        }))
     }
 
     fn security_delta(
@@ -1173,10 +1227,10 @@ impl ControlServer {
             ))
         })?;
         let id = ProviderId(strip_ref(selector, "provider:"));
-        let providers = self.providers.lock().map_err(|_| {
-            ServerError::InternalInvariant("provider host lock unavailable".to_owned())
-        })?;
-        let info = providers.get_provider(&id).map_err(map_provider_error)?;
+        let info = self
+            .providers
+            .get_provider(&id)
+            .map_err(map_provider_error)?;
         let mut cas = payload.cas.unwrap_or_else(empty_cas);
         if cas.if_generation.is_none() {
             cas.if_generation = Some(info.generation);
@@ -1191,16 +1245,13 @@ impl ControlServer {
     }
 
     fn provider_query(&self, payload: &CommandPayload) -> Result<Value, ServerError> {
-        let providers = self.providers.lock().map_err(|_| {
-            ServerError::InternalInvariant("provider host lock unavailable".to_owned())
-        })?;
         match payload.command_key.as_str() {
             "provider-list" => {
                 let capability = payload
                     .semantic_options
                     .get("capability")
                     .and_then(Value::as_str);
-                page_provider_records(providers.list_providers(capability), payload)
+                page_provider_records(self.providers.list_providers(capability), payload)
             }
             "provider-show" => {
                 let CanonicalTarget::Provider { id, .. } = &payload.canonical_target else {
@@ -1208,7 +1259,7 @@ impl ControlServer {
                         "provider-show requires Provider target".to_owned(),
                     ));
                 };
-                providers
+                self.providers
                     .get_provider(id)
                     .map(|info| provider_value(&info))
                     .map_err(map_provider_error)
@@ -1622,6 +1673,7 @@ fn map_app_error(error: AppError) -> ServerError {
         AppError::PermissionDenied(message) => ServerError::PermissionDenied(message),
         AppError::NotFound(message) => ServerError::NotFound(message),
         AppError::Conflict(message) => ServerError::Conflict(message),
+        AppError::ResourceExhausted(message) => ServerError::ResourceExhausted(message),
         AppError::GapDetected(message) => ServerError::GapDetected(message),
         AppError::Timeout(message) => ServerError::Timeout(message),
         AppError::Internal(message) => ServerError::InternalInvariant(message),

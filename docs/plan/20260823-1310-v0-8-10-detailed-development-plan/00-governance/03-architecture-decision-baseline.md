@@ -56,6 +56,9 @@ depends_on: ["DXB-BASE-000", "DXB-GOV-002"]
 - `ADR-0135` | Diagnostic Event는 Durable Audit과 분리한다. Diagnostic/Health는 bounded derived path, Recovery Backstop은 canonical storage owner의 consistent snapshot path이며 silent restore를 금지한다.
 - `ADR-0136` | Provider conformance는 HTTP streaming과 subprocess streaming 두 Reference Adapter가 동일 suite를 통과해 증명하며 Application/CLI provider-specific branch를 금지한다.
 - `ADR-0137` | Sandbox는 Docker 비종속 contract로 정의하고 local subprocess prototype에서 ownership/generation/artifact/cancel/cleanup을 먼저 증명한다. Docker는 A4의 선행 조건이 아니다.
+- `ADR-0138` | P0 production Provider config는 Runtime Host의 owner-only `provider-config.json`이 generation/capability/endpoint/model/credential reference를 소유하고, credential material은 Runtime Host process 환경에서 reference로만 resolve해 Common transport에 일시 전달한다. Provider registration/lifecycle은 동일 `ProviderHost`가 소유하며 secret 원문은 config/discovery/Application/journal/audit에 저장하지 않고 ReferenceProvider production fallback을 금지한다.
+- `ADR-0139` | required `AuditIntent`는 security/Application producer UoW에서 대상 transition과 원자적으로 durable commit하며, `runtime-audit`의 owner-only bounded outbox가 redaction 후 `AuditSequence + previous digest + RecordDigest` canonical audit record를 소유한다. Intent→record projection은 deterministic key로 exactly-once 재구성 가능하고 projection integrity/capacity failure 시 새 Provider dispatch를 fail closed한다.
+- `ADR-0140` | Linux P0 supported service profile은 packaged systemd user unit이 foreground Runtime Host packaging entrypoint를 소유하고 authenticated generation-fenced `ExecStop`으로 graceful drain을 시작한다. public 63-command CLI registry는 확장하지 않으며 admission stop → activity drain/Core Lease 0 → audit checkpoint → endpoint/discovery/PID unpublish → bounded single-writer lock handoff 순서를 강제한다.
 <!-- architecture-decision-registry:end -->
 
 ## Grok adoption A0 decision lock

@@ -44,6 +44,7 @@ fn endpoint(name: &str, profile: &str) -> (InstanceId, DiscoveryEndpoint) {
         endpoint: format!("unix:///tmp/{name}.sock"),
         host_generation: 1,
         provider_id: format!("provider-{name}"),
+        provider_generation: 1,
         provider_ready: true,
     };
     (id, descriptor)

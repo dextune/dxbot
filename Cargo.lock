@@ -914,6 +914,7 @@ dependencies = [
  "dxbot-core",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -940,6 +941,7 @@ dependencies = [
  "runtime-security",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

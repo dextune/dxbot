@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dxbot_core::types::ProviderId;
 
-use crate::protocol::{ProviderError, ProviderEvent, ProviderExecuteConfig};
+use crate::protocol::{CancellationToken, ProviderError, ProviderEvent, ProviderExecuteConfig};
 use crate::real_provider::RealProvider;
 use crate::transport::HttpTransport;
 
@@ -73,14 +73,49 @@ pub struct ProviderInfo {
 /// Errors produced by the provider-host harness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HarnessError {
-    AlreadyRegistered { id: ProviderId },
-    InvalidProvider { reason: String },
+    AlreadyRegistered {
+        id: ProviderId,
+    },
+    InvalidProvider {
+        reason: String,
+    },
     NoReferenceProvider,
     NoHarnessAdapter,
-    ProviderUnavailable { id: ProviderId },
-    ProviderNotFound { id: ProviderId },
+    ProviderUnavailable {
+        id: ProviderId,
+    },
+    ProviderNotFound {
+        id: ProviderId,
+    },
     DeadlineExceeded,
-    ExecutionFailed { id: ProviderId, reason: String },
+    RateLimited {
+        id: ProviderId,
+        retry_after_seconds: Option<u64>,
+    },
+    UpstreamUnavailable {
+        id: ProviderId,
+        status: u16,
+    },
+    TransportUnavailable {
+        id: ProviderId,
+    },
+    InvalidRequest {
+        id: ProviderId,
+        status: u16,
+    },
+    ProtocolViolation {
+        id: ProviderId,
+    },
+    OutputExceeded {
+        id: ProviderId,
+    },
+    Cancelled {
+        id: ProviderId,
+    },
+    ExecutionFailed {
+        id: ProviderId,
+        reason: String,
+    },
 }
 
 /// The deterministic Reference Provider used by explicit test/canary policy.
@@ -236,7 +271,8 @@ impl ProviderHost {
             adapter: None,
             protocol: None,
             real_providers: Vec::new(),
-            rt: tokio::runtime::Builder::new_current_thread()
+            rt: tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
                 .enable_io()
                 .enable_time()
                 .build()
@@ -298,8 +334,24 @@ impl ProviderHost {
     /// Executes through real providers first, then the explicit canary adapter,
     /// then the explicitly registered Reference Provider test fallback.
     pub fn execute_task(&self, task: &TaskDescription) -> Result<TaskResult, HarnessError> {
-        let deadline = deadline_instant(task.deadline)?;
+        self.execute_task_with_cancel(task, CancellationToken::new())
+    }
 
+    pub fn execute_task_with_cancel(
+        &self,
+        task: &TaskDescription,
+        cancellation: CancellationToken,
+    ) -> Result<TaskResult, HarnessError> {
+        let deadline = deadline_instant(task.deadline)?;
+        if cancellation.is_cancelled() {
+            return Ok(TaskResult {
+                output: String::new(),
+                evidence: Vec::new(),
+                status: TaskStatus::Cancelled,
+            });
+        }
+
+        let mut last_unavailable = None;
         for provider in &self.real_providers {
             let protocol = self
                 .protocol
@@ -311,25 +363,64 @@ impl ProviderHost {
             let request = provider.build_request(task);
             let config = ProviderExecuteConfig {
                 deadline,
-                cancel_token: None,
+                cancel_token: Some(cancellation.clone()),
                 max_output_bytes: protocol.max_output_bytes,
                 max_output_items: protocol.max_output_items,
             };
 
             match self.rt.block_on(protocol.execute(&request, &config)) {
                 Ok(events) => return real_provider_result(provider.as_ref(), events),
-                Err(ProviderError::TransportUnavailable { .. })
-                | Err(ProviderError::UpstreamUnavailable { .. }) => continue,
-                Err(ProviderError::DeadlineExceeded) => return Err(HarnessError::DeadlineExceeded),
-                Err(error) => {
-                    return Err(HarnessError::ExecutionFailed {
+                Err(ProviderError::TransportUnavailable { .. }) => {
+                    last_unavailable = Some(HarnessError::TransportUnavailable {
                         id: provider.id().clone(),
-                        reason: format!("{error:?}"),
+                    });
+                }
+                Err(ProviderError::UpstreamUnavailable { status, .. }) => {
+                    last_unavailable = Some(HarnessError::UpstreamUnavailable {
+                        id: provider.id().clone(),
+                        status,
+                    });
+                }
+                Err(ProviderError::RateLimited { retry_after }) => {
+                    return Err(HarnessError::RateLimited {
+                        id: provider.id().clone(),
+                        retry_after_seconds: retry_after.map(|duration| duration.as_secs()),
+                    });
+                }
+                Err(ProviderError::DeadlineExceeded) => return Err(HarnessError::DeadlineExceeded),
+                Err(ProviderError::InvalidRequest { status, .. }) => {
+                    return Err(HarnessError::InvalidRequest {
+                        id: provider.id().clone(),
+                        status,
+                    });
+                }
+                Err(ProviderError::ProtocolViolation { .. }) => {
+                    return Err(HarnessError::ProtocolViolation {
+                        id: provider.id().clone(),
+                    });
+                }
+                Err(ProviderError::OutputExceeded) => {
+                    return Err(HarnessError::OutputExceeded {
+                        id: provider.id().clone(),
+                    });
+                }
+                Err(ProviderError::Cancelled) => {
+                    return Ok(TaskResult {
+                        output: String::new(),
+                        evidence: Vec::new(),
+                        status: TaskStatus::Cancelled,
                     });
                 }
             }
         }
 
+        if cancellation.is_cancelled() {
+            return Ok(TaskResult {
+                output: String::new(),
+                evidence: Vec::new(),
+                status: TaskStatus::Cancelled,
+            });
+        }
         if let Some(adapter) = &self.adapter {
             match adapter.execute(task) {
                 Ok(result) => return Ok(result),
@@ -338,10 +429,10 @@ impl ProviderHost {
             }
         }
 
-        self.reference
-            .as_ref()
-            .ok_or(HarnessError::NoReferenceProvider)?
-            .execute(task)
+        match &self.reference {
+            Some(reference) => reference.execute(task),
+            None => Err(last_unavailable.unwrap_or(HarnessError::NoReferenceProvider)),
+        }
     }
 
     pub fn list_providers(&self, capability: Option<&str>) -> Vec<ProviderInfo> {

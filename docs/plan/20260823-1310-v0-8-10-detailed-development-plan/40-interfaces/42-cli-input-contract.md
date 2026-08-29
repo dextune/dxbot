@@ -111,6 +111,8 @@ create namespace는 global Instance revision 대신 uniqueness/idempotency를 �
 
 `ready_at`, local timeout, list/history의 `all`, file destination의 `output`, destructive confirmation은 CLI 관찰·UX field다. 이 값의 변경은 동일 CommandPayload/RequestDigest를 변경하지 않는다.
 
+`task-submit deadline:Deadline`은 양의 Unix epoch seconds 또는 UTC `YYYY-MM-DDTHH:MM:SSZ`를 허용하고 Application Context Plan commit에서 Unix seconds로 정규화한다. 다른 timezone/자연어/invalid calendar 값은 fail closed한다. P0 `budget:BudgetRef` 실행 경로는 양의 `u32` token ceiling만 materialize하며, 비숫자 policy reference는 Resource Policy resolver가 도입되기 전 성공으로 무시하지 않고 admission conflict로 거부한다. 원 입력은 durable constraint/provenance로 보존하되 Runtime/Provider는 정규화된 Context Plan 값만 소비한다.
+
 ## Freeze Gate
 
 각 milestone subset은 해당 command Acceptance, milestone platform Acceptance, 모든 선행 Gate, generated Rust metadata exact diff가 PASS한 뒤에만 freeze한다. full 63-operation freeze는 M6 전 금지다.

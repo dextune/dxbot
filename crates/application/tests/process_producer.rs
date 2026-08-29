@@ -21,8 +21,9 @@ use std::time::Duration;
 use application::state::{SideEffectState, SideEffectStatus};
 use application::{AppError, ApplicationMutator};
 use dxbot_core::types::{
-    BotId, CanonicalTarget, CommandId, CommandPayload, IdempotencyKey, InstanceId, OperationId,
-    OperationRequest, PrincipalRef, ProcessId, ProjectId, RequestDigest, TaskId,
+    BotId, BotSelector, CanonicalTarget, CasConditions, CommandId, CommandPayload, IdempotencyKey,
+    InstanceId, OperationId, OperationRequest, PrincipalRef, ProcessId, ProjectId, ProjectSelector,
+    RequestDigest, ScopeSelector, TaskId,
 };
 use serde_json::{Value, json};
 
@@ -350,6 +351,7 @@ fn missing_linked_process_rolls_back_task_control_atomically() {
             constraints: Default::default(),
             control_history: Vec::new(),
             process_ref: Some("process:missing".to_owned()),
+            execution_refs: Vec::new(),
         },
     );
     let mutator = ApplicationMutator::with_state(state);
@@ -477,17 +479,61 @@ fn task_submit_persists_execution_constraints() {
     let mutator = ApplicationMutator::new();
     seed_bot(&mutator, "alpha");
     seed_bot(&mutator, "beta");
-    let op = submit_task(
-        &mutator,
-        "cmd-submit",
-        "alpha",
-        json!({
-            "delegate_to_bot": "bot:beta",
-            "requested_sender_bot": "bot:alpha",
-            "deadline": "2026-09-01T00:00:00Z",
-            "budget": "1000"
-        }),
+    mutator
+        .mutate(&request(
+            "cmd-project-delegation",
+            "project-create",
+            CanonicalTarget::Instance(instance()),
+            json!({"name": "delegation-project", "owner_bot": "bot:alpha"}),
+            None,
+        ))
+        .expect("project create");
+    let scope = ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
+        "delegation-project".to_owned(),
+    )));
+    let mut member = request(
+        "cmd-member-beta",
+        "project-member-set",
+        CanonicalTarget::Membership {
+            scope: scope.clone(),
+            member_bot: BotSelector::CanonicalId(BotId("beta".to_owned())),
+        },
+        json!({"role_ref": "member"}),
+        None,
     );
+    member.payload.cas = Some(CasConditions {
+        if_revision: None,
+        if_generation: None,
+        if_host_generation: None,
+        if_execution_generation: None,
+        if_source_revision: None,
+        if_scope_revision: None,
+        if_project_revision: Some(1),
+        if_channel_revision: None,
+        if_membership_generation: None,
+        if_proposal_revision: None,
+        if_target_scope_revision: None,
+        if_receipt_revision: None,
+    });
+    mutator.mutate(&member).expect("recipient membership");
+    let op = "op-cmd-submit".to_owned();
+    mutator
+        .mutate(&request(
+            "cmd-submit",
+            "task-submit",
+            CanonicalTarget::Project {
+                id: ProjectId("delegation-project".to_owned()),
+                revision: 2,
+            },
+            json!({
+                "delegate_to_bot": "bot:beta",
+                "requested_sender_bot": "bot:alpha",
+                "deadline": "2026-09-01T00:00:00Z",
+                "budget": "1000"
+            }),
+            Some(text("delegated work")),
+        ))
+        .expect("delegated recipient Task");
     let state = mutator.snapshot().expect("snapshot");
     let task = state
         .tasks
@@ -506,6 +552,23 @@ fn task_submit_persists_execution_constraints() {
         Some("2026-09-01T00:00:00Z")
     );
     assert_eq!(task.constraints.budget.as_deref(), Some("1000"));
+    assert_eq!(task.owner, "bot:beta");
+    assert_eq!(state.delegations.len(), 1);
+    let delegation = &state.delegations[0];
+    assert_eq!(delegation.task_id, task.id);
+    assert_eq!(delegation.status, application::DelegationStatus::Accepted);
+    assert_eq!(
+        delegation.from_bot,
+        BotSelector::CanonicalId(BotId("alpha".to_owned()))
+    );
+    assert_eq!(
+        delegation.to_bot,
+        BotSelector::CanonicalId(BotId("beta".to_owned()))
+    );
+    let process = state.processes.values().next().expect("sender process");
+    assert_eq!(process.scope_ref, "project:delegation-project");
+    assert_eq!(process.initiator_ref, "bot:alpha");
+    assert!(process.child_refs.contains(&format!("task:{}", task.id.0)));
 }
 
 #[test]
@@ -630,6 +693,8 @@ fn side_effect_reconcile_resolves_by_operation_linkage() {
             status: SideEffectStatus::Dispatched,
             evidence: Vec::new(),
             operation_ref: Some(OperationId("op-xyz".to_owned())),
+            execution_ref: None,
+            process_ref: None,
         },
     );
     let mutator = ApplicationMutator::with_state(seeded);
@@ -670,6 +735,8 @@ fn side_effect_operation_linkage_reports_ambiguity() {
                 status: SideEffectStatus::Dispatched,
                 evidence: Vec::new(),
                 operation_ref: Some(OperationId("op-dup".to_owned())),
+                execution_ref: None,
+                process_ref: None,
             },
         );
     }
@@ -707,6 +774,7 @@ fn task_result_selects_artifact_by_id() {
             constraints: Default::default(),
             control_history: Vec::new(),
             process_ref: None,
+            execution_refs: Vec::new(),
         },
     );
     let mutator = ApplicationMutator::with_state(seeded);

@@ -10,6 +10,11 @@ use provider_host::{
 };
 use std::time::Duration;
 
+fn proxy_endpoint() -> String {
+    std::env::var("DXBOT_TEST_OPENAI_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:10000".to_owned())
+}
+
 fn task(intent: &str) -> TaskDescription {
     TaskDescription {
         intent: intent.to_string(),
@@ -21,15 +26,15 @@ fn task(intent: &str) -> TaskDescription {
 
 #[test]
 fn provider_infra_001_transport_construction() {
-    let transport = HttpTransport::new("http://localhost:10000", Duration::from_secs(10));
-    assert_eq!(transport.base_url, "http://localhost:10000");
+    let transport = HttpTransport::new(&proxy_endpoint(), Duration::from_secs(10));
+    assert_eq!(transport.base_url, proxy_endpoint());
     assert_eq!(transport.timeout, Duration::from_secs(10));
 }
 
 #[test]
-#[ignore = "requires local OpenAI-compatible proxy on localhost:10000"]
+#[ignore = "requires OpenAI-compatible proxy via DXBOT_TEST_OPENAI_ENDPOINT (default localhost:10000)"]
 fn provider_infra_002_non_streaming_completion() {
-    let transport = HttpTransport::new("http://localhost:10000", Duration::from_secs(30));
+    let transport = HttpTransport::new(&proxy_endpoint(), Duration::from_secs(30));
     let protocol = ChatCompletionProtocol::new(transport, 1024 * 1024, 1000);
     let request = ProviderRequest {
         model: "alibaba/deepseek-v4-flash-0731".to_string(),
@@ -64,9 +69,9 @@ fn provider_infra_002_non_streaming_completion() {
 }
 
 #[test]
-#[ignore = "requires local OpenAI-compatible proxy on localhost:10000"]
+#[ignore = "requires OpenAI-compatible proxy via DXBOT_TEST_OPENAI_ENDPOINT (default localhost:10000)"]
 fn provider_infra_003_streaming_parse() {
-    let transport = HttpTransport::new("http://localhost:10000", Duration::from_secs(30));
+    let transport = HttpTransport::new(&proxy_endpoint(), Duration::from_secs(30));
     let protocol = ChatCompletionProtocol::new(transport, 1024 * 1024, 1000);
     let request = ProviderRequest {
         model: "alibaba/deepseek-v4-flash-0731".to_string(),
@@ -101,7 +106,7 @@ fn provider_infra_003_streaming_parse() {
 
 #[test]
 fn provider_infra_004_deadline_exceeded_before_transport() {
-    let transport = HttpTransport::new("http://localhost:10000", Duration::from_secs(30));
+    let transport = HttpTransport::new(&proxy_endpoint(), Duration::from_secs(30));
     let protocol = ChatCompletionProtocol::new(transport, 1024 * 1024, 1000);
     let request = ProviderRequest {
         model: "alibaba/deepseek-v4-flash-0731".to_string(),
@@ -129,9 +134,9 @@ fn provider_infra_004_deadline_exceeded_before_transport() {
 }
 
 #[test]
-#[ignore = "requires local OpenAI-compatible proxy on localhost:10000"]
+#[ignore = "requires OpenAI-compatible proxy via DXBOT_TEST_OPENAI_ENDPOINT (default localhost:10000)"]
 fn provider_infra_005_output_bounded() {
-    let transport = HttpTransport::new("http://localhost:10000", Duration::from_secs(30));
+    let transport = HttpTransport::new(&proxy_endpoint(), Duration::from_secs(30));
     let protocol = ChatCompletionProtocol::new(transport, 10, 2);
     let request = ProviderRequest {
         model: "alibaba/deepseek-v4-flash-0731".to_string(),
@@ -242,7 +247,7 @@ fn provider_infra_008_existing_canary_still_works() {
 
 #[test]
 fn provider_common_cancel_preempts_transport() {
-    let transport = HttpTransport::new("http://localhost:10000", Duration::from_secs(30));
+    let transport = HttpTransport::new(&proxy_endpoint(), Duration::from_secs(30));
     let protocol = ChatCompletionProtocol::new(transport, 1024, 16);
     let request = ProviderRequest {
         model: "cancel-test".to_string(),

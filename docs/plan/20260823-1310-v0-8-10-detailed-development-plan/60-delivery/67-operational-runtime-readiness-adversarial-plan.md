@@ -17,7 +17,7 @@ depends_on: ["DXB-DEL-060", "DXB-DEL-061", "DXB-DEL-066", "DXB-ARC-010", "DXB-AR
 두 문제를 명시적으로 분리한다.
 
 1. **CLI closeout 잔여 계약 결함**: `dxb → Control → Application/Security → durable result/recovery` 실행 spine은 상당히 닫혔지만, post-closeout 적대적 재감사에서 사용자 표면 계약 누락이 다시 발견됐다.
-2. **Operational Runtime gap**: CLI가 Task/Process를 만들 수 있는 것과 Brain/Context/Scheduler/Core/Provider가 실제 AI 실행을 수행하는 것은 별개다. 현재 후자는 production composition 기준으로 아직 닫히지 않았다.
+2. **Operational Runtime gap**: CLI가 Task/Process를 만들 수 있는 것과 Brain/Context/Scheduler/Core/Provider가 실제 AI 실행을 수행하는 것은 별개다. 계획 최초 baseline에서는 후자가 production composition 기준으로 닫히지 않았고, 본 plan은 그 gap을 §15의 executable evidence로 폐쇄했다.
 
 이 문서는 신규 제품 의미를 임의로 정의하지 않는다. 이미 Accepted인 Domain/Runtime/Provider 계약을 실제 production composition과 executable journey로 연결하는 순서, blocker, evidence gate를 소유한다.
 
@@ -35,7 +35,7 @@ depends_on: ["DXB-DEL-060", "DXB-DEL-061", "DXB-DEL-066", "DXB-ARC-010", "DXB-AR
 
 ### 2.2 현재 판정
 
-**CLI execution spine: Conditional PASS. CLI contract-complete 선언: Reopened. Operational DXBOT: NOT READY.**
+**CLI execution spine: PASS. CLI residual findings: Resolved. Operational DXBOT: READY (local P0 profile).**
 
 강한 부분:
 
@@ -49,7 +49,7 @@ depends_on: ["DXB-DEL-060", "DXB-DEL-061", "DXB-DEL-066", "DXB-ARC-010", "DXB-AR
 - machine JSON/JSONL ANSI 오염 방지
 - Runtime bootstrap identity/default-generation manifest
 
-그러나 아래 §3 CLI residual finding이 열려 있고, §4의 실제 AI execution spine이 production Runtime Host에 연결되지 않았으므로 `dxb task submit` 성공을 곧바로 "Bot이 실제 AI 작업을 수행한다"는 의미로 확대해서는 안 된다.
+아래 §3/§4는 2026-08-29 최초 재감사 finding과 종료 조건을 보존한다. 실제 폐쇄 구현·built journey·fault/backtest·독립 검수 결과는 §15~§16이 소유하며, §10의 local P0 Operational Ready 조건을 모두 충족했다.
 
 ## 3. Post-closeout CLI Adversarial Findings
 
@@ -57,12 +57,12 @@ depends_on: ["DXB-DEL-060", "DXB-DEL-061", "DXB-DEL-066", "DXB-ARC-010", "DXB-AR
 
 | ID | Finding | 상태 | 근거 / 종료 조건 |
 |---|---|---|---|
-| BF-OR-CLI-001 | `dxb version`이 live endpoint가 있어도 remote compatibility를 추가하지 않음 | Open | `DXB-IFC-043`은 endpoint가 있으면 remote compatibility를 추가하도록 요구한다. 현재 `Discovery::show_version()`은 항상 `remote_compatibility=None`; production `render_version()`은 endpoint handshake를 시도하지 않는다. offline version은 계속 성공해야 하며 endpoint가 있을 때만 bounded best-effort compatibility projection을 추가한다. |
-| BF-OR-CLI-002 | `runtime start --ready-at`이 frozen local field인데 production에서 silent-ignore | Open | registry는 `ready_at:ReadyAt?@local{process,storage,runtime,control}=control`을 소유한다. 현재 `start_runtime()`은 값을 읽지 않고 항상 Control handshake readiness까지 대기한다. 모든 allowed value를 실제 readiness predicate로 구현하거나 지원하지 않는 값은 fail closed해야 한다. |
-| BF-OR-CLI-003 | human mutation output이 `DXB-IFC-043`의 first-use 정보 순서를 충족하지 못함 | Open | 현재 `render_operation()`은 command/status/OperationId만 출력한다. selected Instance, committed resource refs(`BotRef/MainConversationRef/TaskRef/ProcessRef` 등), receipt state, next safe action을 안전하게 보여줘야 한다. raw content/secret은 echo하지 않는다. |
-| BF-OR-CLI-004 | human failure가 owner/renderer의 typed next action을 사용자에게 노출하지 않음 | Open | machine error는 `next_actions`를 보강하지만 human `render_error()`는 code/message만 출력한다. RuntimeUnavailable/ProviderUnavailable/ApprovalRequired/RecoveryRequired/Conflict/Partial 등에 대해 next safe action을 human에서도 보여주되 raw shell string을 stable contract로 만들지 않는다. |
-| BF-OR-CLI-005 | unknown command의 bounded distance-thresholded suggestion이 없음 | Open | `DXB-IFC-041` 요구와 달리 `resolve_cli_path()`는 `unknown command path`만 반환한다. 63-row registry에서만 bounded candidate를 만들고 threshold 밖이면 suggestion을 생략한다. 두 번째 semantic command table을 만들지 않는다. |
-| BF-OR-DOC-001 | M6 cumulative freeze evidence 문구와 M5 Provider Acceptance 상태가 모순 | Open | `DXB-DEL-060`은 누적 gate지만 `DXB-DEL-061`의 Provider/DeepSeek 13개 Acceptance는 `Executable`, `AT-SCHEMA-001` evidence는 "all prior milestones passed"라고 기록한다. AT-SCHEMA 자체 결과와 M6 cumulative freeze를 분리하고 실제 provider evidence 전에는 full product freeze를 주장하지 않는다. |
+| BF-OR-CLI-001 | `dxb version`이 live endpoint가 있어도 remote compatibility를 추가하지 않음 | Resolved | offline exit 0을 유지하고 live authenticated handshake에서 protocol/schema/compatibility를 additive projection하는 built regression PASS. |
+| BF-OR-CLI-002 | `runtime start --ready-at`이 frozen local field인데 production에서 silent-ignore | Resolved | `control`은 실제 handshake readiness이며 독립 관측할 수 없는 `process/storage/runtime`은 typed Incompatible exit 11로 fail closed하는 built regression PASS. |
+| BF-OR-CLI-003 | human mutation output이 `DXB-IFC-043`의 first-use 정보 순서를 충족하지 못함 | Resolved | human output에 Instance/Operation/Receipt, committed resource refs와 next safe action을 표시하고 raw content/secret은 echo하지 않는 regression PASS. |
+| BF-OR-CLI-004 | human failure가 owner/renderer의 typed next action을 사용자에게 노출하지 않음 | Resolved | Runtime/Provider/Approval/Recovery/Conflict 계열 human failure가 typed next action을 안전하게 표시하는 tests PASS. |
+| BF-OR-CLI-005 | unknown command의 bounded distance-thresholded suggestion이 없음 | Resolved | frozen 63-row registry만 사용하는 bounded threshold suggestion과 distant-candidate omission tests PASS; 실행 effect 0. |
+| BF-OR-DOC-001 | M6 cumulative freeze evidence 문구와 M5 Provider Acceptance 상태가 모순 | Resolved | `DXB-DEL-061`의 AT-SCHEMA fixture PASS와 cumulative M6 product freeze를 분리하고 실제 Provider evidence를 본 문서 §15에 기록했다. |
 
 ### 3.1 CLI 재폐쇄 원칙
 
@@ -75,7 +75,9 @@ depends_on: ["DXB-DEL-060", "DXB-DEL-061", "DXB-DEL-066", "DXB-ARC-010", "DXB-AR
 - ProviderUnavailable/ApprovalRequired/RecoveryRequired human output에 next safe action이 보임
 - unknown path suggestion은 bounded/thresholded하며 ambiguous 또는 먼 후보를 강제하지 않음
 
-## 4. Operational Runtime Blocking Findings
+## 4. Initial Operational Runtime Blocking Findings (historical)
+
+아래 BF-OR-RUN-001~011 본문은 최초 gap과 종료 조건을 보존한다. 현재 closure 판정과 실행 증거는 §15가 우선한다.
 
 ### BF-OR-RUN-001 — Production Provider composition 부재
 
@@ -470,23 +472,23 @@ GitHub Actions 실행을 증거로 사용하지 않는다. Provider live test가
 
 다음 조건을 **모두** 만족해야 `DXBOT Operational Ready`를 선언한다.
 
-- [ ] BF-OR-CLI-001~005 폐쇄 및 binary regression PASS
-- [ ] BF-OR-DOC-001 정합성 수정
-- [ ] production Provider config/credential/registration/readiness owner 폐쇄
-- [ ] ReferenceProvider 없는 real Provider E2E PASS
-- [ ] explicit Execution identity + immutable Context Plan 구현
-- [ ] Resource Governor + Dynamic Core Lease Scheduler 구현
-- [ ] Provider result/evidence → Application atomic commit 구현
-- [ ] Process restart/recovery 실제 activity checkpoint와 연결
-- [ ] Memory retrieval/promotion → next Context Plan closed loop PASS
-- [ ] recipient durable Task 기반 Multi-Bot delegation PASS
-- [ ] Side Effect Ledger producer/reconcile PASS
-- [ ] operational storage backup/restore/migration/disk-pressure evidence PASS
-- [ ] required AuditIntent/redaction/secret canary PASS
-- [ ] OJ-001~007 built-binary journey PASS
-- [ ] workspace fmt/clippy/test PASS
-- [ ] Recheck 1 Structural / Consistency PASS
-- [ ] Recheck 2 Cross-Layer Executability PASS
+- [x] BF-OR-CLI-001~005 폐쇄 및 binary regression PASS
+- [x] BF-OR-DOC-001 정합성 수정
+- [x] production Provider config/credential/registration/readiness owner 폐쇄
+- [x] ReferenceProvider 없는 real Provider E2E PASS
+- [x] explicit Execution identity + immutable Context Plan 구현
+- [x] Resource Governor + Dynamic Core Lease Scheduler 구현
+- [x] Provider result/evidence → Application atomic commit 구현
+- [x] Process restart/recovery 실제 activity checkpoint와 연결
+- [x] Memory retrieval/promotion → next Context Plan closed loop PASS
+- [x] recipient durable Task 기반 Multi-Bot delegation PASS
+- [x] Side Effect Ledger producer/reconcile PASS
+- [x] operational storage backup/restore/migration/disk-pressure evidence PASS
+- [x] required AuditIntent/redaction/secret canary PASS
+- [x] OJ-001~007 built-binary journey PASS
+- [x] workspace fmt/clippy/test PASS
+- [x] Recheck 1 Structural / Consistency PASS
+- [x] Recheck 2 Cross-Layer Executability PASS
 
 ## 11. Recheck 1 — Structural / Consistency
 
@@ -556,3 +558,41 @@ R0 CLI residual closure
 ```
 
 우선순위의 핵심은 **Provider를 먼저 연결하고, 그 다음 Task를 실제 Execution으로 승격한 뒤 Scheduler/Core를 붙이는 것**이다. Memory와 Multi-Bot을 먼저 확장하면 실제 실행 spine이 없는 상태에서 canonical state와 orchestration 복잡도만 커지므로 금지한다.
+
+## 15. 2026-08-29 구현·fault·backtest 증거 갱신
+
+이 절은 Initial Evidence Ledger 이후 현재 tree에서 직접 실행한 증거를 소유한다. `Operational Ready`는 commercial model 품질 인증이나 M6 full product freeze가 아니라, 본 문서 §10의 **local P0 Operational Runtime** 조건을 모두 충족했다는 판정이다.
+
+| 기준 | 실제 Evidence | 최종 판정 |
+|---|---|---|
+| R0 / BF-OR-CLI-001~005 | built `dxb` entrypoint: offline/live version v3 compatibility, `ready_at=control`, 독립 관측 불가 stage exit 11, human refs/receipt/next action, bounded unknown suggestion | Resolved / PASS |
+| R1 / BF-OR-DOC-001 | `DXB-DEL-061` schema fixture PASS와 cumulative M6 gate 분리, `DXB-DEL-066` historical closeout 연결, local-control v2→v3 evolution 정리 | Resolved / PASS |
+| R2 / BF-OR-RUN-001 | owner-only `provider-config.json`, `env:<NAME>` credential reference, shared `ProviderHost`, no production ReferenceProvider fallback, list/show/doctor same generation/status, secret canary 비노출 | Resolved / PASS |
+| R3~R6 / BF-OR-RUN-002~006 | explicit immutable Execution/Context Plan, Task+Execution+Process atomic admission, bounded queue/concurrency 4, Core Lease generation fence, Provider cancellation, Result/Evidence/SideEffect atomic commit, SIGKILL recovery/fresh attempt | Resolved / PASS |
+| R7 / BF-OR-RUN-007 / OJ-004 | built `dxb`: Task A real Provider Result/Evidence → typed Memory Proposal → approval/promotion → stop/restart → Task B의 같은 accepted revision/statement가 immutable Context Plan과 실제 Provider request에 포함; 자동 promotion 0 | Resolved / PASS |
+| R8 / BF-OR-RUN-008 / OJ-005 | built `dxb`: Project/Channel membership+approval, 3 Bot, recipient-owned durable Task/Execution/Process, 각각 real Provider Result/Evidence+Confirmed effect, typed result join, restart 동일 graph; exact retry duplicate 0은 Application UoW test | Resolved / PASS |
+| R9 / BF-OR-RUN-009 | Side Effect `Prepared→Dispatched→Confirmed/Unknown`, success Result와 Confirmed atomic commit, response loss Unknown/RecoveryRequired, stale/late result effect 0 | Resolved / PASS |
+| R9 / BF-OR-RUN-010 storage | actual Application/Security JSON bounds 64/16 MiB; path-scoped `StorageFull` partial-write fault에서 Application prior snapshot, Runtime Audit digest chain, OfflineStorage prior artifact 보존; owner-only SHA-256 backup manifest, dry-run/apply restore, symlink/path traversal/digest corruption fail closed, v1→v2 pre-backup migration/rollback/nonterminal byte continuity | Resolved / PASS |
+| R9 / BF-OR-RUN-011 audit/diagnostics/service | producer UoW required Admitted/Running/Dispatched/terminal AuditIntent, bounded redacted digest-chain outbox/rebuild/tamper startup failure; authenticated local-control v3 live provider/storage/audit/resource/recovery diagnostics; explicit graceful order; `deploy/systemd/dxbot-runtime.service`, runbook, ADR-0140, systemd parser verify exit 0 | Resolved / PASS |
+| OJ-001 | built `dxb` + configured DeepSeek adapter/Common HTTP local fixture: start→ready→create/activate→submit→Context/CoreLease→non-empty Result/Evidence→durable audit→projection loss/rebuild exact keys | PASS |
+| OJ-002 / OJ-006 | Provider call 중 Runtime Host `SIGKILL`→same Instance/Task/Process, HostGeneration 2, SideEffect Unknown, RecoveryRequired audit→explicit generation 2 attempt→terminal Result→same Process Completed; duplicate audit key 0 | PASS |
+| OJ-003 | built `dxb` 401/429/503/malformed/output overflow/transport/deadline matrix: typed outcome, secret 비노출, no blind retry, doctor active permits 0; unconfigured/bad credential/generation fence 회귀 포함 | PASS |
+| OJ-007 | built `dxb` repeated supervised stop/start: stable InstanceId, strictly increasing HostGeneration, bounded lock handoff/state size, endpoint unpublish, Task/Process/Memory/Approval/Audit continuity, audit duplicate 0, active permits 0 | PASS |
+| Provider backtest | isolated explicit `DXBOT_TEST_OPENAI_ENDPOINT` local proxy에서 기존 ignored `AT-DEEPSEEK-002~005` 4/4, `AT-PROVIDER-INFRA-002/003/005` 3/3 직접 실행 | PASS |
+| 전체 quality/backtest | `cargo fmt --all -- --check`; strict workspace all-target/all-feature clippy; `cargo test --workspace --all-features`(CLI entrypoint 18/18 포함); plan/agent-guide validators active+self-test; `git diff --check` | 모두 exit 0 / PASS |
+
+### 15.1 독립 검수 3회와 finding closure
+
+1. **Structural / Consistency 독립 검수**: crate/module placement, Canonical Owner, ADR-0138/0139, local-control v3, snapshot/migration/backup 이름과 bounds, secret/config 경계를 검사해 medium/high finding 0으로 PASS했다. low finding인 local `.kiro/` artifact는 변경·commit 대상에서 제외한다.
+2. **Cross-Layer Executability 독립 검수**: `CLI→Control/Auth→Application→Scheduler/CoreLease→Provider→Result/Process/Memory/SideEffect→Persistence/Audit→Recovery`와 provider/storage/restart fault를 추적했고 medium/high finding 0으로 PASS했다.
+3. **Hostile Operational 독립 검수**: 최초에는 (a) production writer StorageFull 증거, (b) supported supervisor/runbook, (c) ignored proxy canary 실행을 blocker로 판정했다. 이후 actual write routines의 partial `StorageFull` tests, systemd unit+runbook+ADR-0140, endpoint-overridden 4+3 proxy backtest를 추가했고 strict workspace/full test/validator를 다시 모두 통과했다.
+
+추가 review finding도 수정했다: crafted backup manifest path traversal 차단, Security AuditIntent projection key를 operation/action/target length-prefix로 정합화, stop 직후 restart single-writer lock handoff race를 bounded 10-second retry로 폐쇄했다.
+
+## 16. 최종 판정
+
+2026-08-29 현재 §10의 17개 조건, BF-OR-CLI/DOC/RUN findings, R0~R9, built OJ-001~007, production-path storage/audit/service fault evidence, workspace quality/backtest, 세 독립 검수와 finding 수정이 모두 concrete tool output으로 폐쇄됐다.
+
+**최종 판정: DXBOT local P0 Operational Runtime — Operational Ready.**
+
+경계: 이 판정은 owner-local Linux Runtime과 configured OpenAI-compatible Provider contract에 대한 것이다. 특정 commercial endpoint의 SLA·모델 품질·비용 정책 인증이나 M6 full product freeze를 의미하지 않는다.

@@ -14,7 +14,7 @@ workspace = true
 dxbot-core = { path = "../dxbot-core" }
 runtime-audit = { path = "../runtime-audit" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 futures = "0.3"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }

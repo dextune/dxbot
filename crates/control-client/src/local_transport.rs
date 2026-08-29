@@ -70,6 +70,21 @@ impl LocalControlClient {
         Ok(handshake)
     }
 
+    pub fn runtime_diagnostics(&self) -> Result<Value, ClientError> {
+        let (mut stream, _handshake) = self.connect_and_handshake()?;
+        write_local_control_frame(&mut stream, &LocalControlRequest::RuntimeDiagnostics)
+            .map_err(codec_error)?;
+        match read_local_control_frame::<_, LocalControlResponse>(&mut stream)
+            .map_err(codec_error)?
+        {
+            LocalControlResponse::Data { value } => Ok(value),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(Box::new(error))),
+            _ => Err(ClientError::Transport(
+                "unexpected response after Runtime diagnostics".to_owned(),
+            )),
+        }
+    }
+
     pub fn preflight(
         &self,
         payload: &CommandPayload,

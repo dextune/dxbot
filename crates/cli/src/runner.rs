@@ -161,16 +161,18 @@ fn prepare_invocation(args: &[String]) -> Result<PreparedInvocation, DxbotError>
         )));
     }
     if normalized.root_version && normalized.command_tokens.is_empty() {
-        return Ok(PreparedInvocation::Offline(render_version(
-            format_from_tokens(&normalized.global_tokens)?,
-        )));
+        let mut version_args = vec!["version".to_owned()];
+        version_args.extend(normalized.global_tokens);
+        let input = parse_bound_input(&version_args)?;
+        return Ok(PreparedInvocation::Offline(render_version(&input)));
     }
     if normalized.command_tokens.is_empty() {
         return Err(usage_error("missing command"));
     }
 
     let group = &normalized.command_tokens[0];
-    if !commands_in_group(group).is_empty()
+    if metadata_for_key(group).is_none()
+        && !commands_in_group(group).is_empty()
         && (normalized.command_tokens.len() == 1
             || normalized
                 .command_tokens
@@ -215,7 +217,7 @@ fn execute_prepared_buffered(prepared: PreparedInvocation) -> Result<CliOutput, 
         } => {
             let format = input.global_options.format;
             match command_key.as_str() {
-                "version" => Ok(render_version(format)),
+                "version" => Ok(render_version(&input)),
                 "runtime-start" => start_runtime(&input, format),
                 "runtime-status" => runtime_status(&input, format),
                 "runtime-stop-host" => stop_runtime_host(&input, format),
@@ -246,24 +248,44 @@ fn start_runtime(input: &CliInput, format: OutputFormat) -> Result<CliOutput, Dx
         let profile = input.global_options.profile.as_deref();
         let explicit_instance = input.global_options.instance.as_deref();
         let timeout = parse_timeout(input.global_options.timeout.as_deref())?;
-
-        if let Ok(selected) = discovery.select_endpoint(profile, explicit_instance) {
-            if connect_selected(&selected, START_CONNECT_TIMEOUT)
-                .and_then(|client| client.handshake().map_err(client_error))
-                .is_ok()
-            {
-                return Ok(render_value(
-                    json!({
-                        "status": "already-running",
-                        "instance_id": selected.descriptor.instance_id,
-                        "host_generation": selected.descriptor.host_generation,
-                        "endpoint": selected.descriptor.endpoint,
-                    }),
-                    format,
-                    Some("Runtime already running"),
-                ));
-            }
+        let ready_at = local_string(input, "ready_at")?.unwrap_or_else(|| "control".to_owned());
+        if !matches!(
+            ready_at.as_str(),
+            "process" | "storage" | "runtime" | "control"
+        ) {
+            return Err(input_error(format!(
+                "unsupported --ready-at value: {ready_at}"
+            )));
         }
+        if ready_at != "control" {
+            return Err(incompatible_error(format!(
+                "--ready-at {ready_at} is not independently observable by this Runtime Host; use --ready-at control"
+            )));
+        }
+
+        let prior_generation =
+            if let Ok(selected) = discovery.select_endpoint(profile, explicit_instance) {
+                let generation = selected.descriptor.host_generation;
+                if connect_selected(&selected, START_CONNECT_TIMEOUT)
+                    .and_then(|client| client.handshake().map_err(client_error))
+                    .is_ok()
+                {
+                    return Ok(render_value(
+                        json!({
+                            "status": "already-running",
+                            "ready_at": ready_at,
+                            "instance_id": selected.descriptor.instance_id,
+                            "host_generation": selected.descriptor.host_generation,
+                            "endpoint": selected.descriptor.endpoint,
+                        }),
+                        format,
+                        Some("Runtime already running"),
+                    ));
+                }
+                Some(generation)
+            } else {
+                None
+            };
         if explicit_instance.is_some() {
             return Err(error_with(
                 ErrorCode::NotFound,
@@ -294,11 +316,22 @@ fn start_runtime(input: &CliInput, format: OutputFormat) -> Result<CliOutput, Dx
         let deadline = Instant::now() + timeout;
         loop {
             if let Ok(selected) = discovery.select_endpoint(profile, None) {
-                if let Ok(client) = connect_selected(&selected, START_CONNECT_TIMEOUT) {
-                    if client.handshake().is_ok() {
+                let newly_published = prior_generation
+                    .is_none_or(|generation| selected.descriptor.host_generation != generation);
+                if newly_published {
+                    // Discovery is commit-last: publication proves the process
+                    // started, durable stores recovered, Runtime composition
+                    // completed, and the Control endpoint was bound. `control`
+                    // additionally proves the endpoint handshake is live.
+                    let ready = ready_at != "control"
+                        || connect_selected(&selected, START_CONNECT_TIMEOUT)
+                            .and_then(|client| client.handshake().map_err(client_error))
+                            .is_ok();
+                    if ready {
                         return Ok(render_value(
                             json!({
                                 "status": "started",
+                                "ready_at": ready_at,
                                 "instance_id": selected.descriptor.instance_id,
                                 "host_generation": selected.descriptor.host_generation,
                                 "endpoint": selected.descriptor.endpoint,
@@ -313,13 +346,13 @@ fn start_runtime(input: &CliInput, format: OutputFormat) -> Result<CliOutput, Dx
                 local_error(format!("cannot inspect Runtime Host process: {error}"))
             })? {
                 return Err(runtime_unavailable(format!(
-                    "Runtime Host exited before control readiness: {status}"
+                    "Runtime Host exited before {ready_at} readiness: {status}"
                 )));
             }
             if Instant::now() >= deadline {
-                return Err(timeout_error(
-                    "Runtime Host did not reach control readiness",
-                ));
+                return Err(timeout_error(format!(
+                    "Runtime Host did not reach {ready_at} readiness"
+                )));
             }
             thread::sleep(START_POLL_INTERVAL);
         }
@@ -397,12 +430,16 @@ fn runtime_doctor(input: &CliInput, format: OutputFormat) -> Result<CliOutput, D
     #[cfg(unix)]
     {
         let paths = LocalPaths::discover();
-        let discovery = Discovery::at(paths.discovery_root);
-        let (_selected, _client, handshake) = authenticated_client(input)?;
-        let provider = discovery
-            .doctor_provider(&handshake.instance_id)
-            .map_err(|error| error.to_dxbot_error())?;
-        let diagnostics = vec![
+        let (_selected, client, handshake) = authenticated_client(input)?;
+        let live = client.runtime_diagnostics().map_err(client_error)?;
+        let live_sections = live
+            .get("sections")
+            .and_then(Value::as_array)
+            .ok_or_else(|| internal_error("Runtime diagnostics omitted bounded sections"))?;
+        if live_sections.len() > 16 {
+            return Err(internal_error("Runtime diagnostics exceeded section bound"));
+        }
+        let mut diagnostics = vec![
             json!({
                 "section": "control",
                 "status": "ready",
@@ -415,14 +452,31 @@ fn runtime_doctor(input: &CliInput, format: OutputFormat) -> Result<CliOutput, D
                 "status": if paths.journal_root.is_dir() { "ready" } else { "unavailable" },
                 "available": paths.journal_root.is_dir(),
             }),
-            json!({
-                "section": "provider",
-                "provider_id": provider.provider_id,
-                "status": provider.status,
-                "required_capabilities": provider.required_capabilities,
-                "available": provider.available,
-            }),
         ];
+        let mut seen = HashSet::new();
+        for section in live_sections {
+            let name = section
+                .get("section")
+                .and_then(Value::as_str)
+                .ok_or_else(|| internal_error("Runtime diagnostic section has no name"))?;
+            if !matches!(
+                name,
+                "provider" | "storage" | "audit" | "resource" | "recovery"
+            ) || !seen.insert(name.to_owned())
+            {
+                return Err(internal_error(
+                    "Runtime diagnostics contained unknown or duplicate section",
+                ));
+            }
+            diagnostics.push(section.clone());
+        }
+        for required in ["provider", "storage", "audit", "resource", "recovery"] {
+            if !seen.contains(required) {
+                return Err(internal_error(format!(
+                    "Runtime diagnostics omitted required section {required}"
+                )));
+            }
+        }
         let value = diagnostic_page(input, diagnostics)?;
         Ok(render_value(
             value,
@@ -845,10 +899,41 @@ fn render_operation(
 ) -> CliOutput {
     let renderer = MachineRenderer::new();
     match format {
-        OutputFormat::Human => CliOutput::success(format!(
-            "{command_key}: {} (operation {})\n",
-            result.status, result.operation_id.0
-        )),
+        OutputFormat::Human => {
+            let mut lines = vec![
+                format!("{command_key}: {}", result.status),
+                format!("Instance: {}", result.instance_id.0),
+                format!("Operation: {}", result.operation_id.0),
+                format!("Receipt: {}", result.receipt.disposition.as_str()),
+            ];
+            if !result.receipt.result_ref.is_empty() {
+                lines.push(format!("Result: {}", result.receipt.result_ref));
+            }
+            let mut next_action = None;
+            if let Some(Value::Object(payload)) = result.committed_payload.as_ref() {
+                for (key, value) in payload {
+                    if (key.ends_with("_ref") || key.ends_with("_refs")) && !value.is_null() {
+                        let rendered = value
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| value.to_string());
+                        lines.push(format!("{key}: {rendered}"));
+                        if next_action.is_none() {
+                            next_action = next_action_for_ref(key, value.as_str());
+                        }
+                    }
+                }
+            }
+            let next_action = next_action.unwrap_or_else(|| {
+                format!(
+                    "operation-show {{\"operation\":\"operation:{}\"}}",
+                    result.operation_id.0
+                )
+            });
+            lines.push(format!("Next action: {next_action}"));
+            lines.push(String::new());
+            CliOutput::success(lines.join("\n"))
+        }
         OutputFormat::Json => {
             let mut output = renderer.render_json(result);
             output.push('\n');
@@ -860,23 +945,75 @@ fn render_operation(
     }
 }
 
-fn render_version(format: OutputFormat) -> CliOutput {
-    let version = Discovery::show_version();
+fn next_action_for_ref(key: &str, value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let (command, argument) = match key {
+        "task_ref" => ("task-show", "task"),
+        "process_ref" => ("process-show", "process"),
+        "bot_ref" | "owner_bot_ref" => ("bot-show", "bot"),
+        "conversation_ref" | "main_conversation_ref" => ("conversation-show", "conversation"),
+        _ => return None,
+    };
+    Some(format!("{command} {{\"{argument}\":\"{value}\"}}"))
+}
+
+fn render_version(input: &CliInput) -> CliOutput {
+    let format = input.global_options.format;
+    let mut version = Discovery::show_version();
+    #[cfg(unix)]
+    {
+        let paths = LocalPaths::discover();
+        let discovery = Discovery::at(paths.discovery_root);
+        if let Ok(selected) = discovery.select_endpoint(
+            input.global_options.profile.as_deref(),
+            input.global_options.instance.as_deref(),
+        ) {
+            if let Ok(handshake) = connect_selected(&selected, START_CONNECT_TIMEOUT)
+                .and_then(|client| client.handshake().map_err(client_error))
+            {
+                let compatible = version
+                    .supported_protocol_versions
+                    .contains(&handshake.protocol_version)
+                    && version
+                        .supported_schema_versions
+                        .contains(&handshake.schema_version);
+                version.remote_compatibility = Some(dxbot_core::types::RemoteVersionInfo {
+                    runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    protocol_version: handshake.protocol_version,
+                    schema_version: handshake.schema_version,
+                    compatible,
+                });
+            }
+        }
+    }
     match format {
-        OutputFormat::Human => CliOutput::success(format!(
-            "dxb {} (protocol {}, schema {})\n",
-            version.client_version,
-            version
-                .supported_protocol_versions
-                .first()
-                .map(String::as_str)
-                .unwrap_or("unknown"),
-            version
-                .supported_schema_versions
-                .first()
-                .map(String::as_str)
-                .unwrap_or("unknown")
-        )),
+        OutputFormat::Human => {
+            let mut rendered = format!(
+                "dxb {} (protocol {}, schema {})",
+                version.client_version,
+                version
+                    .supported_protocol_versions
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("unknown"),
+                version
+                    .supported_schema_versions
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("unknown")
+            );
+            if let Some(remote) = &version.remote_compatibility {
+                rendered.push_str(&format!(
+                    "\nruntime {} (protocol {}, schema {}, compatible={})",
+                    remote.runtime_version,
+                    remote.protocol_version,
+                    remote.schema_version,
+                    remote.compatible
+                ));
+            }
+            rendered.push('\n');
+            CliOutput::success(rendered)
+        }
         OutputFormat::Json | OutputFormat::Jsonl => {
             let mut serialized = serde_json::to_string(&version).unwrap_or_else(|error| {
                 json!({"error": {"code": "internal-invariant", "message": error.to_string()}})
@@ -1074,13 +1211,6 @@ fn requested_color(args: &[String]) -> ColorMode {
             }
         })
         .unwrap_or(ColorMode::Auto)
-}
-
-fn format_from_tokens(tokens: &[String]) -> Result<OutputFormat, DxbotError> {
-    let args = std::iter::once("version".to_owned())
-        .chain(tokens.iter().cloned())
-        .collect::<Vec<_>>();
-    parse_bound_input(&args).map(|input| input.global_options.format)
 }
 
 fn parse_timeout(value: Option<&str>) -> Result<Duration, DxbotError> {
@@ -1426,7 +1556,7 @@ mod tests {
         assert_eq!(output.exit_code, 0);
         let value: Value = serde_json::from_str(output.stdout.trim()).expect("valid json");
         assert_eq!(value["supported_protocol_versions"][0], "1");
-        assert_eq!(value["supported_schema_versions"][0], "v2");
+        assert_eq!(value["supported_schema_versions"][0], "v3");
     }
 
     #[test]

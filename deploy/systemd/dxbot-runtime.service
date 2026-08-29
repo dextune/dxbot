@@ -1,0 +1,27 @@
+[Unit]
+Description=DXBOT Operational Runtime Host
+Documentation=file:///usr/share/doc/dxbot/runtime-service.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+UMask=0077
+StateDirectory=dxbot
+Environment=XDG_STATE_HOME=%S
+EnvironmentFile=-%E/dxbot/provider.env
+ExecStart=/usr/bin/dxb __runtime-host --runtime-root %S/dxbot/runtime --discovery-root %S/dxbot/discovery
+ExecStop=/usr/bin/dxb runtime stop --host-stop -y --format json
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/dxbot
+
+[Install]
+WantedBy=default.target

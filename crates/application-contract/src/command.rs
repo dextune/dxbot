@@ -116,7 +116,72 @@ pub fn resolve_cli_path(tokens: &[String]) -> Result<ResolvedCommand, DxbotError
         }
     }
 
-    best.ok_or_else(|| util::input_error(format!("unknown command path: {}", tokens.join(" "))))
+    best.ok_or_else(|| {
+        let path = tokens.join(" ");
+        let message = suggest_command_path(tokens).map_or_else(
+            || format!("unknown command path: {path}"),
+            |suggestion| format!("unknown command path: {path}; did you mean '{suggestion}'?"),
+        );
+        util::input_error(message)
+    })
+}
+
+/// Return one close, unambiguous command path from the frozen registry.
+///
+/// Suggestions are help-only: resolution never executes a fuzzy match. The
+/// registry is fixed at 63 rows, candidate paths are deduplicated, and both
+/// edit distance and accepted distance are bounded by the short command path.
+fn suggest_command_path(tokens: &[String]) -> Option<String> {
+    let mut candidates: Vec<(usize, String)> = Vec::new();
+    for row in &REGISTRY {
+        let path_tokens = cli_path_tokens(row.command_key);
+        let path = path_tokens.join(" ");
+        if candidates.iter().any(|(_, existing)| existing == &path) {
+            continue;
+        }
+        let supplied = tokens
+            .iter()
+            .take(path_tokens.len())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let distance = edit_distance(&supplied, &path);
+        let threshold = match path.chars().count() {
+            0..=4 => 1,
+            5..=12 => 2,
+            _ => 3,
+        };
+        if distance <= threshold {
+            candidates.push((distance, path));
+        }
+    }
+    candidates.sort();
+    let (best_distance, best_path) = candidates.first()?;
+    if candidates
+        .iter()
+        .skip(1)
+        .any(|(distance, _)| distance == best_distance)
+    {
+        return None;
+    }
+    Some(best_path.clone())
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right_chars: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right_chars.len()).collect();
+    let mut current = vec![0; right_chars.len() + 1];
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let substitution = previous[right_index] + usize::from(left_char != *right_char);
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right_chars.len()]
 }
 
 /// User-facing path tokens for a registry command.
@@ -193,5 +258,19 @@ mod tests {
             .expect("side-effect path must resolve");
         assert_eq!(resolved.command_key, "side-effect-reconcile");
         assert_eq!(resolved.consumed_path_tokens, 2);
+    }
+
+    #[test]
+    fn close_unknown_path_suggests_registry_command_without_executing_it() {
+        let error = resolve_cli_path(&args(&["taks", "submit"]))
+            .expect_err("fuzzy paths must never execute");
+        assert!(error.message.contains("did you mean 'task submit'?"));
+    }
+
+    #[test]
+    fn distant_unknown_path_omits_suggestion() {
+        let error =
+            resolve_cli_path(&args(&["completely-unrelated"])).expect_err("unknown path must fail");
+        assert!(!error.message.contains("did you mean"));
     }
 }

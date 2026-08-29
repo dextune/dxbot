@@ -28,6 +28,8 @@ pub struct DiscoveryEndpoint {
     pub endpoint: String,
     pub host_generation: i64,
     pub provider_id: String,
+    #[serde(default)]
+    pub provider_generation: i64,
     pub provider_ready: bool,
 }
 

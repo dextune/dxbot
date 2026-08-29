@@ -80,6 +80,8 @@ closeout에서 허용하는 변경은 다음과 같다.
 
 기존 `DXB-DEL-061`의 component Acceptance 결과는 소급 무효화하지 않는다. 단, 그 PASS를 L4/L5 완료 증거로 승격해서 해석하지 않는다.
 
+이 문서의 closeout 실행 증거는 해당 기준선의 역사적 증거로 보존한다. 이후 사용자 표면 계약을 재개방한 post-closeout finding과 Operational Runtime 준비 판정은 [DXB-DEL-067](67-operational-runtime-readiness-adversarial-plan.md)이 소유하며, 본 문서의 과거 PASS를 Operational Ready 또는 누적 product freeze로 확대하지 않는다.
+
 ## 5. Adversarial Findings Ledger
 
 상태는 `Resolved | Partial | Open Blocker | Evidence Pending`만 사용한다.
@@ -94,7 +96,7 @@ closeout에서 허용하는 변경은 다음과 같다.
 | BF-CLI-006 | downstream owner coverage 부족 | Partial | 다수 owner 연결 완료, Approval policy continuation/Process producer/bootstrap defaults는 아래 blocker |
 | BF-CLI-007 | component PASS를 product completion으로 오판 | Resolved by gate | L4/L5 별도 증거 필수화 |
 | BF-CLI-008 | parser identity helper production 오용 | Resolved | `ExecutionContext`가 trusted identity를 덮어씀 |
-| BF-CLI-009 | protocol/schema version drift | Resolved | `LOCAL_CONTROL_*` 단일 source, 새 watch/host-stop wire는 schema `v2` |
+| BF-CLI-009 | protocol/schema version drift | Resolved | `LOCAL_CONTROL_*` 단일 source, watch/host-stop + live diagnostics wire는 schema `v3` |
 | BF-CLI-010 | global/local option이 parse만 되고 무시 | Partial | `--all/--output/--color/--wait/--timeout` production 적용, 세부 command-local 필드 잔여 검수 필요 |
 | BF-CLI-011 | group/command help Runtime 의존 | Resolved | registry 기반 offline help exit 0 |
 | BF-CLI-012 | stale/diverged branch completion 왜곡 | Resolved (재확인 대기) | 2026-08-29 audit: 로컬 branch `main` 단일, `origin/main` 대비 ahead commit 0(작업은 uncommitted working tree). unclassified ahead product branch = 0. 사용자 승인 commit 시 최종 head로 재고정. |
@@ -141,7 +143,7 @@ closeout에서 허용하는 변경은 다음과 같다.
 - client-supplied Principal은 consistency binding일 뿐 authority evidence가 아니다.
 - socket type/owner/mode, InstanceId, HostGeneration, protocol/schema를 handshake에서 검증한다.
 - local control frame은 bounded size를 가진다.
-- watch/host-stop wire 추가에 맞춰 schema version을 `v2`로 갱신했다.
+- watch/host-stop wire 추가 당시 schema version을 `v2`로 갱신했고, DXB-DEL-067 live owner diagnostics wire 추가와 함께 current schema를 `v3`로 갱신했다.
 
 현재 portability 제한:
 

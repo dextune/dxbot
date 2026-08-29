@@ -1,7 +1,7 @@
 //! Versioned bounded local control contract shared by CLI and Runtime.
 //!
-//! Schema v2 adds bounded watch-next and host-generation stop requests. The
-//! explicit bump prevents a new CLI from handshaking successfully with a v1
+//! Schema v3 adds bounded live Runtime diagnostics. Schema v2 added bounded
+//! watch-next and host-generation stop requests. The explicit bump prevents a new CLI from handshaking successfully with a v1
 //! Runtime and only discovering the incompatibility after sending a new frame.
 
 use std::fmt;
@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: &str = "1";
-pub const LOCAL_CONTROL_SCHEMA_VERSION: &str = "v2";
+pub const LOCAL_CONTROL_SCHEMA_VERSION: &str = "v3";
 pub const MAX_LOCAL_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +64,7 @@ pub enum LocalControlRequest {
     StopHost {
         host_generation: i64,
     },
+    RuntimeDiagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -257,8 +258,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_tracks_watch_and_host_stop_shape() {
-        assert_eq!(LOCAL_CONTROL_SCHEMA_VERSION, "v2");
+    fn runtime_diagnostics_request_roundtrips() {
+        let request = LocalControlRequest::RuntimeDiagnostics;
+        let mut bytes = Vec::new();
+        write_local_control_frame(&mut bytes, &request).expect("frame writes");
+        let decoded: LocalControlRequest =
+            read_local_control_frame(&mut bytes.as_slice()).expect("frame reads");
+        assert_eq!(decoded, request);
+    }
+    #[test]
+    fn schema_version_tracks_watch_host_stop_and_diagnostics_shape() {
+        assert_eq!(LOCAL_CONTROL_SCHEMA_VERSION, "v3");
     }
 
     #[test]
