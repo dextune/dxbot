@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use application::ApplicationMutator;
 use control_server::{ControlServer, SecurityCoordinationStore, SecurityState};
 use dxbot_core::types::{
-    ApprovalId, BotId, BotSelector, CanonicalTarget, CasConditions, CommandId, CommandPayload,
+    BotId, BotSelector, CanonicalTarget, CasConditions, CommandId, CommandPayload,
     IdempotencyKey, InstanceId, OperationId, OperationRequest, PrincipalRef, ProjectId,
     ProjectSelector, RequestDigest, ScopeSelector,
 };
@@ -91,7 +91,13 @@ fn project_create_commits_membership_and_security_binding_for_bot_subject() {
     server
         .handle_request(
             &principal(),
-            &request("bot-create", "bot", instance.clone(), None, json!({"name": "bot-a"})),
+            &request(
+                "bot-create",
+                "bot",
+                instance.clone(),
+                None,
+                json!({"name": "bot-a"}),
+            ),
         )
         .expect("bot create");
     server
