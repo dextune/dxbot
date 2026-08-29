@@ -4,8 +4,8 @@
 //! authenticated peer UID. The socket itself is owner-only and clients verify
 //! its owner/type/generation, but pathname permissions are not treated as peer
 //! identity. Same-UID process isolation is intentionally not claimed.
-//! Every connection performs a version/generation handshake before accepting an
-//! operation request.
+//! Every connection performs a version/generation handshake before accepting one
+//! bounded request.
 
 #![cfg(unix)]
 
@@ -102,9 +102,6 @@ impl LocalControlServer {
         &self.endpoint_path
     }
 
-    /// Serve forever until the listener itself fails. Each connection carries
-    /// at most one operation after its handshake, keeping framing and recovery
-    /// boundaries simple and bounded.
     pub fn serve(&self) -> Result<(), io::Error> {
         loop {
             let (stream, _) = self.listener.accept()?;
@@ -112,8 +109,6 @@ impl LocalControlServer {
         }
     }
 
-    /// Serve exactly one accepted connection. Exposed for deterministic
-    /// integration tests and controlled host shutdown loops.
     pub fn serve_one(&self) -> Result<(), io::Error> {
         let (stream, _) = self.listener.accept()?;
         self.handle_stream(stream)
@@ -128,10 +123,10 @@ impl LocalControlServer {
             .map_err(codec_io)?;
         let hello = match first {
             LocalControlRequest::Hello { hello } => hello,
-            LocalControlRequest::Submit { .. } => {
+            LocalControlRequest::Submit { .. } | LocalControlRequest::LookupBinding { .. } => {
                 write_error(
                     &mut stream,
-                    protocol_error("submit received before local control handshake"),
+                    protocol_error("request received before local control handshake"),
                 )?;
                 return Ok(());
             }
@@ -195,6 +190,21 @@ impl LocalControlServer {
                     Err(error) => write_error(&mut stream, error.to_dxbot_error()),
                 }
             }
+            LocalControlRequest::LookupBinding {
+                command_id,
+                idempotency_key,
+            } => match self.control.lookup_binding(
+                &authenticated_principal,
+                &command_id,
+                &idempotency_key,
+            ) {
+                Ok(result) => write_local_control_frame(
+                    &mut stream,
+                    &LocalControlResponse::Binding { result },
+                )
+                .map_err(codec_io),
+                Err(error) => write_error(&mut stream, error.to_dxbot_error()),
+            },
         }
     }
 }
