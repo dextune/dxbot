@@ -1,16 +1,15 @@
-//! Principal-to-scope authority bindings.
+//! Principal authority bindings.
 //!
-//! [`AuthorityManager`] is the canonical owner of `AuthorityBinding` grants:
-//! which principal holds which role on which scope. Default is deny-unknown:
-//! an absent binding grants nothing, and a revoked binding grants nothing.
-//!
-//! Scopes are flattened to a deterministic canonical key because the network
-//! `ScopeSelector` is not `Hash`; the key preserves scope identity exactly.
+//! [`AuthorityManager`] is the canonical owner of grants. Scope grants remain
+//! exact and deny-unknown. A distinct instance-global role set exists for
+//! operations whose canonical target has no Bot/Project/Channel scope (for
+//! example instance creation or recovery). Global authority is always explicit;
+//! principal registration alone still grants nothing.
 
 use std::collections::{HashMap, HashSet};
 
 use dxbot_core::types::{
-    BotSelector, PrincipalRef, ProjectSelector, ScopeSelector, {ChannelSelector},
+    BotSelector, ChannelSelector, PrincipalRef, ProjectSelector, ScopeSelector,
 };
 
 use crate::Error;
@@ -20,6 +19,8 @@ use crate::Error;
 pub struct AuthorityManager {
     /// principal key -> scope key -> roles
     bindings: HashMap<String, HashMap<String, HashSet<String>>>,
+    /// principal key -> explicit instance-global roles
+    global_roles: HashMap<String, HashSet<String>>,
 }
 
 impl AuthorityManager {
@@ -47,6 +48,19 @@ impl AuthorityManager {
         Ok(())
     }
 
+    /// Explicitly grant an instance-global role.
+    pub fn bind_global_authority(
+        &mut self,
+        principal: &PrincipalRef,
+        role: &str,
+    ) -> Result<(), Error> {
+        self.global_roles
+            .entry(principal.0.clone())
+            .or_default()
+            .insert(role.to_owned());
+        Ok(())
+    }
+
     /// Check whether `principal` holds `required_role` on `scope`.
     ///
     /// Unknown principals or scopes are denied (`Ok(false)`), never an error.
@@ -70,6 +84,19 @@ impl AuthorityManager {
         Ok(held)
     }
 
+    /// Check an explicit instance-global role. Registration alone never makes
+    /// this return true.
+    pub fn check_global_authority(
+        &self,
+        principal: &PrincipalRef,
+        required_role: &str,
+    ) -> Result<bool, Error> {
+        Ok(self
+            .global_roles
+            .get(&principal.0)
+            .is_some_and(|roles| roles.contains(required_role)))
+    }
+
     /// Revoke every role `principal` holds on `scope`.
     ///
     /// Revoking an absent binding is a safe no-op (idempotent).
@@ -83,6 +110,21 @@ impl AuthorityManager {
             by_principal.remove(&key);
             if by_principal.is_empty() {
                 self.bindings.remove(&principal.0);
+            }
+        }
+        Ok(())
+    }
+
+    /// Revoke one instance-global role. Absent grants are a safe no-op.
+    pub fn revoke_global_authority(
+        &mut self,
+        principal: &PrincipalRef,
+        role: &str,
+    ) -> Result<(), Error> {
+        if let Some(roles) = self.global_roles.get_mut(&principal.0) {
+            roles.remove(role);
+            if roles.is_empty() {
+                self.global_roles.remove(&principal.0);
             }
         }
         Ok(())
@@ -102,5 +144,33 @@ fn scope_key(scope: &ScopeSelector) -> String {
         ScopeSelector::Channel(ChannelSelector::ProjectExact { project, name }) => {
             format!("channel:{project}:{name}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn registration_does_not_imply_global_authority() {
+        let manager = AuthorityManager::new();
+        let principal = PrincipalRef("local:i:uid:1000".to_owned());
+        assert!(!manager.check_global_authority(&principal, "operator").unwrap());
+    }
+
+    #[test]
+    fn global_authority_is_explicit_and_revocable() {
+        let mut manager = AuthorityManager::new();
+        let principal = PrincipalRef("local:i:uid:1000".to_owned());
+        manager
+            .bind_global_authority(&principal, "operator")
+            .unwrap();
+        assert!(manager.check_global_authority(&principal, "operator").unwrap());
+        manager
+            .revoke_global_authority(&principal, "operator")
+            .unwrap();
+        assert!(!manager.check_global_authority(&principal, "operator").unwrap());
     }
 }
