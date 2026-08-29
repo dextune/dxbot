@@ -8,8 +8,9 @@
 use dxbot_core::DxbotError;
 use dxbot_core::types::{CommandPayload, InstanceId, PrincipalRef};
 
-use crate::{CliInput, contract, metadata_for_key};
+use crate::field_spec::local_field_names;
 use crate::util;
+use crate::{CliInput, contract, metadata_for_key};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionContext {
@@ -49,9 +50,6 @@ pub fn project_for_execution(
     Ok(payload)
 }
 
-/// `typed_fields` is already parsed/validated by `invocation`; this projection
-/// only consumes the frozen `@local` markers to prevent validated UX state from
-/// becoming semantic wire state. No command-specific local field list exists.
 fn remove_local_semantic_fields(
     input: &CliInput,
     payload: &mut CommandPayload,
@@ -65,18 +63,8 @@ fn remove_local_semantic_fields(
     let options = payload.semantic_options.as_object_mut().ok_or_else(|| {
         util::invariant("CommandPayload semantic_options must be a JSON object")
     })?;
-    for raw in metadata.typed_fields.split(';') {
-        let raw = raw.trim();
-        if raw.is_empty() || !raw.contains("@local") {
-            continue;
-        }
-        let Some((name, _)) = raw.split_once(':') else {
-            return Err(util::invariant(format!(
-                "invalid typed field metadata for {}: {raw}",
-                input.command_key
-            )));
-        };
-        options.remove(name.trim());
+    for name in local_field_names(metadata.typed_fields) {
+        options.remove(name);
     }
     Ok(())
 }
