@@ -2,9 +2,9 @@
 //! publication.
 //!
 //! This is the Runtime Host owner for first-Instance bootstrap, generation
-//! fencing, stale endpoint replacement, durable Application composition,
-//! control-server composition, and discovery publication. The CLI only
-//! spawns/contacts this owner.
+//! fencing, stale endpoint replacement, durable Application/Security
+//! composition, control-server composition, and discovery publication. The CLI
+//! only spawns/contacts this owner.
 
 #![cfg(unix)]
 
@@ -15,14 +15,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use application::ApplicationMutator;
-use control_server::{ControlServer, LocalControlServer, SecurityState};
+use control_server::{
+    ControlServer, LocalControlServer, SecurityCoordinationStore, SecurityState,
+};
 use dxbot_core::types::InstanceId;
 use fs2::FileExt;
+use provider_host::ProviderHost;
 use runtime_bootstrap::bootstrap::Error as BootstrapError;
 use runtime_bootstrap::{DiscoveryEndpoint, DiscoveryState, RuntimeBootstrap};
+use runtime_security::SecurityStateStore;
 
 const HOST_LOCK_FILE: &str = ".runtime-host.lock";
 const APPLICATION_STATE_FILE: &str = "application-state.json";
+const SECURITY_STATE_FILE: &str = "security-state.json";
+const SECURITY_COORDINATION_FILE: &str = ".security-application-uow.json";
 const OWNER_DIRECTORY_MODE: u32 = 0o700;
 const OWNER_FILE_MODE: u32 = 0o600;
 
@@ -80,12 +86,30 @@ impl LocalRuntimeHost {
 
         let application = Arc::new(
             ApplicationMutator::with_persistent_state(runtime_root.join(APPLICATION_STATE_FILE))
-                .map_err(|error| io::Error::other(format!(
-                    "cannot restore Application state: {error:?}"
-                )))?,
+                .map_err(|error| {
+                    io::Error::other(format!("cannot restore Application state: {error:?}"))
+                })?,
         );
-        let security = Arc::new(Mutex::new(SecurityState::new()));
-        let control = Arc::new(ControlServer::new(security, application));
+        let (security_store, security_state) =
+            SecurityStateStore::open(runtime_root.join(SECURITY_STATE_FILE)).map_err(|error| {
+                io::Error::other(format!("cannot restore Security state: {error}"))
+            })?;
+        let security: Arc<Mutex<SecurityState>> = Arc::new(Mutex::new(security_state));
+        let coordination_store = Arc::new(SecurityCoordinationStore::new(
+            runtime_root.join(SECURITY_COORDINATION_FILE),
+        ));
+        let control = Arc::new(
+            ControlServer::with_persistence(
+                security,
+                application,
+                ProviderHost::new(),
+                Arc::new(security_store),
+                coordination_store,
+            )
+            .map_err(|error| {
+                io::Error::other(format!("cannot recover Control coordination: {error}"))
+            })?,
+        );
         let server = LocalControlServer::bind(
             endpoint_path.clone(),
             instance_id.clone(),
@@ -167,7 +191,10 @@ fn open_host_lock(path: &Path) -> Result<File, io::Error> {
             if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    format!("Runtime Host lock is not a direct regular file: {}", path.display()),
+                    format!(
+                        "Runtime Host lock is not a direct regular file: {}",
+                        path.display()
+                    ),
                 ));
             }
             OpenOptions::new().read(true).write(true).open(path)?
@@ -204,7 +231,10 @@ fn replace_bootstrap_or_stale_endpoint(path: &Path) -> Result<(), io::Error> {
             if !file_type.is_file() && !file_type.is_socket() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("refusing to replace unexpected endpoint type: {}", path.display()),
+                    format!(
+                        "refusing to replace unexpected endpoint type: {}",
+                        path.display()
+                    ),
                 ));
             }
             fs::remove_file(path)
