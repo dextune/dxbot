@@ -144,27 +144,45 @@ impl ControlServer {
                 "request principal binding mismatch".to_string(),
             ));
         }
+        self.authorize_mutation(authenticated_principal, &request.payload.canonical_target)?;
+        self.application.mutate(request).map_err(map_app_error)
+    }
 
+    /// Read-only binding lookup used by CLI recovery. Cross-principal lookup is
+    /// rejected before Application state is consulted, preventing receipt
+    /// existence disclosure to another authenticated UID.
+    pub fn lookup_binding(
+        &self,
+        authenticated_principal: &PrincipalRef,
+        command_id: &CommandId,
+        key: &IdempotencyKey,
+    ) -> Result<Option<OperationResult>, ServerError> {
+        if key.principal_ref != *authenticated_principal {
+            return Err(ServerError::PermissionDenied(
+                "binding lookup principal mismatch".to_owned(),
+            ));
+        }
+        self.require_active_principal(authenticated_principal)?;
+        self.application
+            .lookup_binding(command_id, key)
+            .map_err(map_app_error)
+    }
+
+    fn authorize_mutation(
+        &self,
+        authenticated_principal: &PrincipalRef,
+        target: &CanonicalTarget,
+    ) -> Result<(), ServerError> {
         let security = self.security.lock().map_err(|_| {
             ServerError::InternalInvariant("security state lock unavailable".to_string())
         })?;
-
-        let principal_state = security
-            .principals
-            .resolve_principal(authenticated_principal)
-            .map_err(|_| ServerError::PermissionDenied("unauthenticated principal".to_string()))?;
-        if principal_state.status != PrincipalStatus::Active {
-            return Err(ServerError::PermissionDenied(
-                "principal is not active".to_string(),
-            ));
-        }
+        let principal_state = active_principal(&security, authenticated_principal)?;
 
         let is_local_operator = security
             .authority
             .check_global_authority(&principal_state.ref_, LOCAL_OPERATOR_ROLE)
             .map_err(|_| ServerError::PermissionDenied("global authority check failed".to_owned()))?;
-
-        let scoped_authorized = match scope_for_target(&request.payload.canonical_target) {
+        let scoped_authorized = match scope_for_target(target) {
             Some(scope) => security
                 .authority
                 .check_authority(&principal_state.ref_, &scope, OPERATION_ROLE)
@@ -174,13 +192,35 @@ impl ControlServer {
             None => false,
         };
 
-        if !is_local_operator && !scoped_authorized {
-            return Err(ServerError::PermissionDenied("not authorized".to_string()));
+        if is_local_operator || scoped_authorized {
+            Ok(())
+        } else {
+            Err(ServerError::PermissionDenied("not authorized".to_string()))
         }
-
-        drop(security);
-        self.application.mutate(request).map_err(map_app_error)
     }
+
+    fn require_active_principal(&self, principal: &PrincipalRef) -> Result<(), ServerError> {
+        let security = self.security.lock().map_err(|_| {
+            ServerError::InternalInvariant("security state lock unavailable".to_owned())
+        })?;
+        active_principal(&security, principal).map(|_| ())
+    }
+}
+
+fn active_principal(
+    security: &SecurityState,
+    principal: &PrincipalRef,
+) -> Result<runtime_security::PrincipalState, ServerError> {
+    let principal_state = security
+        .principals
+        .resolve_principal(principal)
+        .map_err(|_| ServerError::PermissionDenied("unauthenticated principal".to_string()))?;
+    if principal_state.status != PrincipalStatus::Active {
+        return Err(ServerError::PermissionDenied(
+            "principal is not active".to_string(),
+        ));
+    }
+    Ok(principal_state)
 }
 
 fn map_app_error(error: AppError) -> ServerError {
