@@ -26,7 +26,9 @@ use crate::state::{
     MessageState, ProcessState, ProjectState, SideEffectState, TaskState, ThreadState,
 };
 
-const SNAPSHOT_VERSION: u32 = 3;
+// ProcessState is an additive v2 field. Keep the version stable and rely on
+// serde(default) so existing v2 snapshots load with an empty process set.
+const SNAPSHOT_VERSION: u32 = 2;
 const OWNER_DIRECTORY_MODE: u32 = 0o700;
 const OWNER_FILE_MODE: u32 = 0o600;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -46,7 +48,7 @@ impl ApplicationStateStore {
             Ok(metadata) => {
                 validate_snapshot_file(&path, &metadata)?;
                 let bytes = fs::read(&path).map_err(io_error)?;
-                let snapshot: SnapshotV3 = serde_json::from_slice(&bytes).map_err(|error| {
+                let snapshot: SnapshotV2 = serde_json::from_slice(&bytes).map_err(|error| {
                     AppError::Internal(format!("application snapshot is corrupt: {error}"))
                 })?;
                 snapshot.into_state()?
@@ -64,7 +66,7 @@ impl ApplicationStateStore {
         fs::create_dir_all(parent).map_err(io_error)?;
         harden_directory(parent)?;
 
-        let bytes = serde_json::to_vec(&SnapshotV3::from_state(state)).map_err(|error| {
+        let bytes = serde_json::to_vec(&SnapshotV2::from_state(state)).map_err(|error| {
             AppError::Internal(format!("cannot serialize application snapshot: {error}"))
         })?;
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -101,13 +103,14 @@ impl ApplicationStateStore {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotV3 {
+struct SnapshotV2 {
     version: u32,
     bots: Vec<BotState>,
     conversations: Vec<ConversationState>,
     messages: Vec<MessageState>,
     threads: Vec<ThreadState>,
     tasks: Vec<TaskState>,
+    #[serde(default)]
     processes: Vec<ProcessState>,
     projects: Vec<ProjectState>,
     channels: Vec<ChannelState>,
@@ -122,7 +125,7 @@ struct SnapshotV3 {
     delegations: Vec<DelegationSnapshot>,
 }
 
-impl SnapshotV3 {
+impl SnapshotV2 {
     fn from_state(state: &DomainState) -> Self {
         let mut bots: Vec<_> = state.bots.values().cloned().collect();
         bots.sort_by(|left, right| left.id.0.cmp(&right.id.0));
@@ -428,6 +431,36 @@ mod tests {
             restored.command_bindings.get(&CommandId("command-a".to_owned())),
             Some(&OperationId("operation-a".to_owned()))
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_v2_without_processes_still_loads() {
+        let path = path();
+        let legacy = serde_json::json!({
+            "version": 2,
+            "bots": [],
+            "conversations": [],
+            "messages": [],
+            "threads": [],
+            "tasks": [],
+            "projects": [],
+            "channels": [],
+            "memories": [],
+            "side_effects": [],
+            "receipts": [],
+            "results": [],
+            "command_bindings": [],
+            "command_request_digests": [],
+            "idempotency_bindings": [],
+            "memberships": [],
+            "delegations": []
+        });
+        fs::write(&path, serde_json::to_vec(&legacy).expect("legacy encodes")).expect("legacy writes");
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(OWNER_FILE_MODE)).expect("mode sets");
+        let (_, restored) = ApplicationStateStore::open(path.clone()).expect("legacy loads");
+        assert!(restored.processes.is_empty());
         let _ = fs::remove_file(path);
     }
 }
