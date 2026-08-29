@@ -42,13 +42,19 @@ fn current_revision(state: &DomainState, target: &CanonicalTarget) -> Option<i64
 fn expected_revision(target: &CanonicalTarget, cas: &Option<CasConditions>) -> Option<i64> {
     let cas = cas.as_ref()?;
     match target {
-        CanonicalTarget::Project { .. } => cas.if_project_revision.or(cas.if_scope_revision).or(cas.if_revision),
-        CanonicalTarget::Channel { .. } => cas.if_channel_revision.or(cas.if_scope_revision).or(cas.if_revision),
+        CanonicalTarget::Project { .. } => cas
+            .if_project_revision
+            .or(cas.if_scope_revision)
+            .or(cas.if_revision),
+        CanonicalTarget::Channel { .. } => cas
+            .if_channel_revision
+            .or(cas.if_scope_revision)
+            .or(cas.if_revision),
+        CanonicalTarget::Thread { .. } => cas.if_source_revision.or(cas.if_revision),
         CanonicalTarget::Memory { .. } => cas.if_proposal_revision.or(cas.if_revision),
         CanonicalTarget::Operation { .. } => cas.if_receipt_revision,
         CanonicalTarget::Bot { .. }
         | CanonicalTarget::Conversation { .. }
-        | CanonicalTarget::Thread { .. }
         | CanonicalTarget::Task { .. }
         | CanonicalTarget::SideEffect { .. } => cas.if_revision,
         _ => None,
@@ -85,5 +91,39 @@ pub fn cas_if_revision(revision: i64) -> CasConditions {
         if_proposal_revision: None,
         if_target_scope_revision: None,
         if_receipt_revision: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dxbot_core::types::{ThreadId, ThreadSelector};
+
+    use super::*;
+    use crate::state::ThreadState;
+
+    #[test]
+    fn thread_branch_prefers_source_revision_cas() {
+        let mut state = DomainState::new();
+        let id = ThreadId("thread-a".to_owned());
+        state.threads.insert(
+            id.clone(),
+            ThreadState {
+                id: id.clone(),
+                conversation_id: dxbot_core::types::ConversationId("conversation-a".to_owned()),
+                revision: 7,
+                parent_message_id: None,
+                title: "a".to_owned(),
+                messages: Vec::new(),
+            },
+        );
+        let target = CanonicalTarget::Thread {
+            id,
+            parent_id: None,
+            revision: 7,
+        };
+        let mut cas = cas_if_revision(99);
+        cas.if_source_revision = Some(7);
+        assert_eq!(resolve_outcome(&state, &target, &Some(cas)), DomainOutcome::Updated);
+        let _ = ThreadSelector::CanonicalId(ThreadId("unused".to_owned()));
     }
 }
