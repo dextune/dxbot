@@ -1,37 +1,40 @@
-//! Principal authority bindings.
+//! Principal authority and membership-subject authority bindings.
 //!
-//! [`AuthorityManager`] is the canonical owner of grants. Scope grants remain
-//! exact and deny-unknown. A distinct instance-global role set exists for
-//! operations whose canonical target has no Bot/Project/Channel scope (for
-//! example instance creation or recovery). Global authority is always explicit;
-//! principal registration alone still grants nothing.
+//! Authenticated Principal authority and Bot membership authority are distinct
+//! canonical records. A BotId is never promoted to a PrincipalRef. Application
+//! coordinates membership facts with the membership-subject binding generation.
 
 use std::collections::{HashMap, HashSet};
 
 use dxbot_core::types::{
     BotSelector, ChannelSelector, PrincipalRef, ProjectSelector, ScopeSelector,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
-/// Canonical in-memory store of authority bindings.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipAuthorityBinding {
+    pub binding_id: String,
+    pub scope: ScopeSelector,
+    pub member_bot: BotSelector,
+    pub role: String,
+    pub generation: i64,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthorityManager {
-    /// principal key -> scope key -> roles
     bindings: HashMap<String, HashMap<String, HashSet<String>>>,
-    /// principal key -> explicit instance-global roles
     global_roles: HashMap<String, HashSet<String>>,
+    membership_bindings: HashMap<String, MembershipAuthorityBinding>,
 }
 
 impl AuthorityManager {
-    /// Create an empty authority store (deny-unknown).
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Grant `role` to `principal` on `scope`.
-    ///
-    /// Granting is idempotent: re-granting the same role is a no-op.
     pub fn bind_authority(
         &mut self,
         principal: &PrincipalRef,
@@ -48,7 +51,6 @@ impl AuthorityManager {
         Ok(())
     }
 
-    /// Explicitly grant an instance-global role.
     pub fn bind_global_authority(
         &mut self,
         principal: &PrincipalRef,
@@ -61,9 +63,6 @@ impl AuthorityManager {
         Ok(())
     }
 
-    /// Check whether `principal` holds `required_role` on `scope`.
-    ///
-    /// Unknown principals or scopes are denied (`Ok(false)`), never an error.
     pub fn check_authority(
         &self,
         principal: &PrincipalRef,
@@ -71,21 +70,13 @@ impl AuthorityManager {
         required_role: &str,
     ) -> Result<bool, Error> {
         let key = scope_key(scope);
-        let held = self
+        Ok(self
             .bindings
             .get(&principal.0)
-            .map(|by_principal| {
-                by_principal
-                    .get(&key)
-                    .map(|roles| roles.contains(required_role))
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        Ok(held)
+            .and_then(|by_principal| by_principal.get(&key))
+            .is_some_and(|roles| roles.contains(required_role)))
     }
 
-    /// Check an explicit instance-global role. Registration alone never makes
-    /// this return true.
     pub fn check_global_authority(
         &self,
         principal: &PrincipalRef,
@@ -97,9 +88,6 @@ impl AuthorityManager {
             .is_some_and(|roles| roles.contains(required_role)))
     }
 
-    /// Revoke every role `principal` holds on `scope`.
-    ///
-    /// Revoking an absent binding is a safe no-op (idempotent).
     pub fn revoke_authority(
         &mut self,
         principal: &PrincipalRef,
@@ -115,7 +103,6 @@ impl AuthorityManager {
         Ok(())
     }
 
-    /// Revoke one instance-global role. Absent grants are a safe no-op.
     pub fn revoke_global_authority(
         &mut self,
         principal: &PrincipalRef,
@@ -129,9 +116,43 @@ impl AuthorityManager {
         }
         Ok(())
     }
+
+    pub fn apply_membership_binding(
+        &mut self,
+        binding: MembershipAuthorityBinding,
+    ) -> Result<(), Error> {
+        match self.membership_bindings.get(&binding.binding_id) {
+            Some(existing) if existing == &binding => return Ok(()),
+            Some(existing) if binding.generation < existing.generation => {
+                return Err(Error::StaleAuthorityBinding(binding.binding_id));
+            }
+            _ => {}
+        }
+        self.membership_bindings
+            .insert(binding.binding_id.clone(), binding);
+        Ok(())
+    }
+
+    pub fn revoke_membership_binding(
+        &mut self,
+        binding_id: &str,
+        expected_generation: i64,
+    ) -> Result<(), Error> {
+        let Some(existing) = self.membership_bindings.get_mut(binding_id) else {
+            return Err(Error::UnknownAuthorityBinding(binding_id.to_owned()));
+        };
+        if existing.generation != expected_generation {
+            return Err(Error::StaleAuthorityBinding(binding_id.to_owned()));
+        }
+        existing.active = false;
+        Ok(())
+    }
+
+    pub fn membership_binding(&self, binding_id: &str) -> Option<MembershipAuthorityBinding> {
+        self.membership_bindings.get(binding_id).cloned()
+    }
 }
 
-/// Flatten a [`ScopeSelector`] into a stable canonical key.
 fn scope_key(scope: &ScopeSelector) -> String {
     match scope {
         ScopeSelector::Bot(BotSelector::CanonicalId(id)) => format!("bot:{}", id.0),
@@ -151,6 +172,8 @@ fn scope_key(scope: &ScopeSelector) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use dxbot_core::types::{BotId, ProjectId};
+
     use super::*;
 
     #[test]
@@ -164,13 +187,26 @@ mod tests {
     fn global_authority_is_explicit_and_revocable() {
         let mut manager = AuthorityManager::new();
         let principal = PrincipalRef("local:i:uid:1000".to_owned());
-        manager
-            .bind_global_authority(&principal, "operator")
-            .unwrap();
+        manager.bind_global_authority(&principal, "operator").unwrap();
         assert!(manager.check_global_authority(&principal, "operator").unwrap());
-        manager
-            .revoke_global_authority(&principal, "operator")
-            .unwrap();
+        manager.revoke_global_authority(&principal, "operator").unwrap();
         assert!(!manager.check_global_authority(&principal, "operator").unwrap());
+    }
+
+    #[test]
+    fn membership_binding_keeps_bot_subject_separate_from_principal() {
+        let mut manager = AuthorityManager::new();
+        let binding = MembershipAuthorityBinding {
+            binding_id: "membership-1".to_owned(),
+            scope: ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
+                "project-a".to_owned(),
+            ))),
+            member_bot: BotSelector::CanonicalId(BotId("bot-a".to_owned())),
+            role: "member".to_owned(),
+            generation: 1,
+            active: true,
+        };
+        manager.apply_membership_binding(binding.clone()).unwrap();
+        assert_eq!(manager.membership_binding("membership-1"), Some(binding));
     }
 }
