@@ -15,6 +15,7 @@ application-contract = { path = "../application-contract" }
 dxbot-core = { path = "../dxbot-core" }
 runtime-security = { path = "../runtime-security" }
 application = { path = "../application" }
+provider-host = { path = "../provider-host" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
