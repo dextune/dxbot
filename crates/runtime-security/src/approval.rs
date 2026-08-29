@@ -86,6 +86,7 @@ impl ApprovalManager {
             || binding.target.trim().is_empty()
             || binding.policy_generation <= 0
             || required_approvers.is_empty()
+            || has_duplicate_approvers(&required_approvers)
         {
             return Err(Error::InvalidApprovalBinding);
         }
@@ -141,6 +142,10 @@ impl ApprovalManager {
         if record.decisions.iter().any(|existing| existing.by == *by) {
             return Err(Error::ApprovalAlreadyDecided(approval_id.clone()));
         }
+        let next_revision = record
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::ApprovalRevisionExhausted(approval_id.clone()))?;
 
         record.decisions.push(ApprovalDecisionRecord {
             by: by.clone(),
@@ -158,10 +163,7 @@ impl ApprovalManager {
                 }
             }
         }
-        record.revision = record
-            .revision
-            .checked_add(1)
-            .ok_or(Error::ApprovalRevisionExhausted(approval_id.clone()))?;
+        record.revision = next_revision;
         Ok(record.clone())
     }
 
@@ -200,11 +202,17 @@ impl ApprovalManager {
     }
 
     pub fn find_by_operation(&self, operation_id: &OperationId) -> Result<ApprovalRecord, Error> {
-        self.approvals
+        let mut matches = self
+            .approvals
             .values()
-            .find(|record| record.operation_id == *operation_id)
-            .cloned()
-            .ok_or_else(|| Error::UnknownApproval(ApprovalId(operation_id.0.clone())))
+            .filter(|record| record.operation_id == *operation_id);
+        let Some(first) = matches.next() else {
+            return Err(Error::UnknownApproval(ApprovalId(operation_id.0.clone())));
+        };
+        if matches.next().is_some() {
+            return Err(Error::AmbiguousApprovalOperation(operation_id.clone()));
+        }
+        Ok(first.clone())
     }
 
     pub fn list_approvals(&self) -> Vec<ApprovalRecord> {
@@ -228,5 +236,69 @@ impl ApprovalManager {
             | ApprovalState::Expired
             | ApprovalState::Revoked => None,
         })
+    }
+}
+
+fn has_duplicate_approvers(approvers: &[PrincipalRef]) -> bool {
+    approvers
+        .iter()
+        .enumerate()
+        .any(|(index, principal)| approvers[index + 1..].contains(principal))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    fn binding() -> ApprovalBinding {
+        ApprovalBinding {
+            action: "delete".to_owned(),
+            target: "project:a".to_owned(),
+            policy_generation: 1,
+        }
+    }
+
+    #[test]
+    fn duplicate_approvers_are_rejected() {
+        let mut manager = ApprovalManager::new();
+        let principal = PrincipalRef("p".to_owned());
+        assert_eq!(
+            manager.create_bound_approval(
+                OperationId("op".to_owned()),
+                binding(),
+                vec![principal.clone(), principal],
+            ),
+            Err(Error::InvalidApprovalBinding)
+        );
+    }
+
+    #[test]
+    fn operation_selector_fails_closed_when_ambiguous() {
+        let mut manager = ApprovalManager::new();
+        let operation = OperationId("op".to_owned());
+        manager
+            .create_bound_approval(
+                operation.clone(),
+                binding(),
+                vec![PrincipalRef("p1".to_owned())],
+            )
+            .expect("first");
+        manager
+            .create_bound_approval(
+                operation.clone(),
+                ApprovalBinding {
+                    action: "publish".to_owned(),
+                    target: "project:a".to_owned(),
+                    policy_generation: 2,
+                },
+                vec![PrincipalRef("p2".to_owned())],
+            )
+            .expect("second");
+        assert_eq!(
+            manager.find_by_operation(&operation),
+            Err(Error::AmbiguousApprovalOperation(operation))
+        );
     }
 }
