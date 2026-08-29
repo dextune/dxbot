@@ -10,10 +10,12 @@ use std::io::{Read, Write};
 
 use dxbot_core::DxbotError;
 use dxbot_core::types::{
-    CommandId, IdempotencyKey, InstanceId, OperationRequest, OperationResult, PrincipalRef,
+    CanonicalTarget, CasConditions, CommandId, CommandPayload, IdempotencyKey, InstanceId,
+    OperationRequest, OperationResult, PrincipalRef,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: &str = "1";
 pub const LOCAL_CONTROL_SCHEMA_VERSION: &str = "v1";
@@ -40,9 +42,12 @@ pub struct LocalControlHandshake {
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum LocalControlRequest {
     Hello { hello: LocalControlHello },
+    Preflight {
+        payload: CommandPayload,
+        raw_selector: Option<Value>,
+    },
+    Query { payload: CommandPayload },
     Submit { request: OperationRequest },
-    /// Read-only recovery lookup. The server authenticates the peer and requires
-    /// the key's principal scope to match before exposing any binding.
     LookupBinding {
         command_id: CommandId,
         idempotency_key: IdempotencyKey,
@@ -53,6 +58,11 @@ pub enum LocalControlRequest {
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum LocalControlResponse {
     Handshake { handshake: LocalControlHandshake },
+    Preflight {
+        canonical_target: CanonicalTarget,
+        cas: CasConditions,
+    },
+    Data { value: Value },
     Operation { result: OperationResult },
     Binding { result: Option<OperationResult> },
     Error { error: DxbotError },
@@ -95,7 +105,6 @@ impl LocalControlHello {
     }
 }
 
-/// Write one bounded JSON frame.
 pub fn write_local_control_frame<W, T>(
     writer: &mut W,
     value: &T,
@@ -128,8 +137,6 @@ where
         .map_err(|error| LocalControlCodecError::Io(error.to_string()))
 }
 
-/// Read exactly one bounded JSON frame. The advertised length is validated
-/// before allocating the payload buffer.
 pub fn read_local_control_frame<R, T>(reader: &mut R) -> Result<T, LocalControlCodecError>
 where
     R: Read,
