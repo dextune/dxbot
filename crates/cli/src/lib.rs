@@ -3,6 +3,9 @@
 /// Local journal: OS-locked single-writer ownership, hash chain, bounded retention.
 pub mod journal;
 
+/// Adapter from the CLI-owned durable journal to the control-client submission protocol.
+pub mod submission_journal;
+
 /// CLI discovery: help/version, exact Instance selection, fail-closed Runtime
 /// bootstrap delegation, and provider descriptor diagnostics.
 pub mod discovery;
