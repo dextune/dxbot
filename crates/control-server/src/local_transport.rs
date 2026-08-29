@@ -1,11 +1,8 @@
 //! Owner-only Unix-domain control transport.
 //!
-//! P0 LocalPrincipal is derived server-side from the Runtime Instance and the
-//! authenticated peer UID. The socket itself is owner-only and clients verify
-//! its owner/type/generation, but pathname permissions are not treated as peer
-//! identity. Same-UID process isolation is intentionally not claimed.
-//! Every connection performs a version/generation handshake before accepting one
-//! bounded request.
+//! P0 LocalPrincipal is derived server-side from Runtime Instance + peer UID.
+//! Every connection performs a version/generation handshake and then serves one
+//! bounded preflight/query/submit/recovery request.
 
 #![cfg(unix)]
 
@@ -58,7 +55,6 @@ impl LocalControlServer {
         if let Some(parent) = endpoint_path.parent() {
             fs::create_dir_all(parent)?;
         }
-
         let listener = UnixListener::bind(&endpoint_path)?;
         fs::set_permissions(&endpoint_path, fs::Permissions::from_mode(SOCKET_MODE))?;
         let metadata = fs::symlink_metadata(&endpoint_path)?;
@@ -74,12 +70,10 @@ impl LocalControlServer {
                 "local control endpoint is not owner-only",
             ));
         }
-
         let owner_principal_ref = local_principal(&instance_id, metadata.uid());
         control
             .register_local_operator(&owner_principal_ref)
             .map_err(|error| io::Error::other(error.to_string()))?;
-
         Ok(Self {
             listener,
             endpoint_path,
@@ -92,8 +86,6 @@ impl LocalControlServer {
         })
     }
 
-    /// Principal expected for the owner UID. Actual requests always use the
-    /// peer credential read from each accepted socket.
     pub fn principal_ref(&self) -> &PrincipalRef {
         &self.owner_principal_ref
     }
@@ -123,7 +115,7 @@ impl LocalControlServer {
             .map_err(codec_io)?;
         let hello = match first {
             LocalControlRequest::Hello { hello } => hello,
-            LocalControlRequest::Submit { .. } | LocalControlRequest::LookupBinding { .. } => {
+            _ => {
                 write_error(
                     &mut stream,
                     protocol_error("request received before local control handshake"),
@@ -131,7 +123,6 @@ impl LocalControlServer {
                 return Ok(());
             }
         };
-
         if hello.instance_id != self.instance_id
             || hello.host_generation != self.host_generation
             || hello.protocol_version != LOCAL_CONTROL_PROTOCOL_VERSION
@@ -149,7 +140,6 @@ impl LocalControlServer {
             )?;
             return Ok(());
         }
-
         write_local_control_frame(
             &mut stream,
             &LocalControlResponse::Handshake {
@@ -164,13 +154,41 @@ impl LocalControlServer {
         )
         .map_err(codec_io)?;
 
-        let second = read_local_control_frame::<_, LocalControlRequest>(&mut stream)
+        let request = read_local_control_frame::<_, LocalControlRequest>(&mut stream)
             .map_err(codec_io)?;
-        match second {
+        match request {
             LocalControlRequest::Hello { .. } => write_error(
                 &mut stream,
                 protocol_error("duplicate local control handshake"),
             ),
+            LocalControlRequest::Preflight {
+                payload,
+                raw_selector,
+            } => match self
+                .control
+                .preflight(&authenticated_principal, &payload, raw_selector.as_ref())
+            {
+                Ok((canonical_target, cas)) => write_local_control_frame(
+                    &mut stream,
+                    &LocalControlResponse::Preflight {
+                        canonical_target,
+                        cas,
+                    },
+                )
+                .map_err(codec_io),
+                Err(error) => write_error(&mut stream, error.to_dxbot_error()),
+            },
+            LocalControlRequest::Query { payload } => match self
+                .control
+                .query(&authenticated_principal, &payload)
+            {
+                Ok(value) => write_local_control_frame(
+                    &mut stream,
+                    &LocalControlResponse::Data { value },
+                )
+                .map_err(codec_io),
+                Err(error) => write_error(&mut stream, error.to_dxbot_error()),
+            },
             LocalControlRequest::Submit { request } => {
                 if request.payload.instance_id != self.instance_id {
                     return write_error(
