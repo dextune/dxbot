@@ -73,7 +73,20 @@ impl ApprovalManager {
         Ok(id)
     }
 
+    /// Compatibility API for internal callers that already hold the current
+    /// record. Public CLI decisions should use `decide_approval_if_revision`.
     pub fn decide_approval(
+        &mut self,
+        approval_id: &ApprovalId,
+        decision: ApprovalDecision,
+        by: &PrincipalRef,
+    ) -> Result<ApprovalState, Error> {
+        let expected_revision = self.get_approval(approval_id)?.revision;
+        self.decide_approval_if_revision(approval_id, expected_revision, decision, by)
+            .map(|record| record.state)
+    }
+
+    pub fn decide_approval_if_revision(
         &mut self,
         approval_id: &ApprovalId,
         expected_revision: i64,
@@ -110,9 +123,10 @@ impl ApprovalManager {
                 }
             }
         }
-        record.revision = record.revision.checked_add(1).ok_or_else(|| {
-            Error::ApprovalAlreadyDecided(approval_id.clone())
-        })?;
+        record.revision = record
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::ApprovalAlreadyDecided(approval_id.clone()))?;
         Ok(record.clone())
     }
 
