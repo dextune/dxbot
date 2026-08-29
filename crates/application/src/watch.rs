@@ -1,9 +1,11 @@
 //! Stateless bounded watch projection over canonical Task/Process revisions.
 //!
-//! The cursor is the last observed canonical revision. A jump larger than one
-//! is reported as a gap rather than silently dropping intermediate progress.
-//! No watcher state is canonical or retained server-side, so reconnect/restart
-//! only requires the caller's cursor.
+//! The cursor encodes the last observed canonical revision as an opaque,
+//! lexicographically monotonic fixed-width token. Legacy decimal revision
+//! cursors remain accepted. A jump larger than one is reported as a gap rather
+//! than silently dropping intermediate progress. No watcher state is canonical
+//! or retained server-side, so reconnect/restart only requires the caller's
+//! cursor.
 
 use std::time::{Duration, Instant};
 
@@ -12,6 +14,9 @@ use serde_json::{Value, json};
 
 use crate::mutation::{AppError, ApplicationMutator};
 use crate::state::{ProcessLifecycle, TaskStatus};
+
+const CURSOR_PREFIX: &str = "r";
+const CURSOR_WIDTH: usize = 19;
 
 impl ApplicationMutator {
     pub fn watch_next(
@@ -77,7 +82,7 @@ impl ApplicationMutator {
             };
 
             match requested {
-                None => return Ok(observation.into_value()),
+                None => return observation.into_value(),
                 Some(cursor) if observation.revision < cursor => {
                     return Err(AppError::Conflict(format!(
                         "watch cursor {cursor} is ahead of current revision {}",
@@ -91,12 +96,12 @@ impl ApplicationMutator {
                     )));
                 }
                 Some(cursor) if observation.revision > cursor => {
-                    return Ok(observation.into_value());
+                    return observation.into_value();
                 }
                 Some(_) if observation.terminal => {
                     // A reconnect at the terminal revision still receives one
                     // idempotent terminal observation and may then exit.
-                    return Ok(observation.into_value());
+                    return observation.into_value();
                 }
                 Some(_) => {}
             }
@@ -116,26 +121,37 @@ struct Observation {
 }
 
 impl Observation {
-    fn into_value(mut self) -> Value {
+    fn into_value(mut self) -> Result<Value, AppError> {
+        let cursor = format_cursor(self.revision)?;
         if let Some(object) = self.value.as_object_mut() {
-            object.insert("cursor".to_owned(), json!(self.revision.to_string()));
+            object.insert("cursor".to_owned(), json!(cursor));
             object.insert("terminal".to_owned(), json!(self.terminal));
         }
-        self.value
+        Ok(self.value)
     }
+}
+
+fn format_cursor(revision: i64) -> Result<String, AppError> {
+    if revision < 0 {
+        return Err(AppError::Internal(
+            "canonical watch revision must be non-negative".to_owned(),
+        ));
+    }
+    Ok(format!("{CURSOR_PREFIX}{revision:0CURSOR_WIDTH$}"))
 }
 
 fn parse_cursor(cursor: Option<&str>) -> Result<Option<i64>, AppError> {
     cursor
         .map(|value| {
-            value
+            let encoded = value.strip_prefix(CURSOR_PREFIX).unwrap_or(value);
+            encoded
                 .parse::<i64>()
                 .map_err(|_| AppError::Conflict(format!("invalid watch cursor: {value}")))
-                .and_then(|value| {
-                    if value < 0 {
+                .and_then(|revision| {
+                    if revision < 0 {
                         Err(AppError::Conflict("watch cursor must be non-negative".to_owned()))
                     } else {
-                        Ok(value)
+                        Ok(revision)
                     }
                 })
         })
@@ -216,12 +232,12 @@ mod tests {
                 Duration::from_millis(1),
             )
             .expect("watch succeeds");
-        assert_eq!(value["cursor"], "3");
+        assert_eq!(value["cursor"], "r0000000000000000003");
         assert_eq!(value["terminal"], false);
     }
 
     #[test]
-    fn process_watch_rejects_cursor_gap() {
+    fn process_watch_rejects_legacy_cursor_gap() {
         let mut state = DomainState::new();
         let id = ProcessId("process-a".to_owned());
         state.processes.insert(
@@ -250,5 +266,14 @@ mod tests {
             )
             .expect_err("gap must fail");
         assert!(matches!(error, AppError::GapDetected(_)));
+    }
+
+    #[test]
+    fn fixed_width_cursor_is_lexicographically_monotonic_across_digit_boundary() {
+        let nine = format_cursor(9).expect("nine");
+        let ten = format_cursor(10).expect("ten");
+        assert!(nine < ten);
+        assert_eq!(parse_cursor(Some(&ten)).expect("parse"), Some(10));
+        assert_eq!(parse_cursor(Some("10")).expect("legacy parse"), Some(10));
     }
 }
