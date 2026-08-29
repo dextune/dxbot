@@ -28,6 +28,7 @@ pub use contract::{CommandPayload, PreflightPlan, TargetMaterialization};
 pub use execution::{ExecutionContext, project_for_execution};
 pub use golden::GoldenContract;
 pub use local_control::{
-    LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_VERSION, LocalControlHandshake,
-    LocalControlHello, LocalControlRequest, LocalControlResponse, MAX_LOCAL_CONTROL_FRAME_BYTES,
+    LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_VERSION, LocalControlCodecError,
+    LocalControlHandshake, LocalControlHello, LocalControlRequest, LocalControlResponse,
+    MAX_LOCAL_CONTROL_FRAME_BYTES, read_local_control_frame, write_local_control_frame,
 };
