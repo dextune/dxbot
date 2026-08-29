@@ -22,7 +22,7 @@ pub fn materialize_content(input: &mut CliInput) -> Result<(), DxbotError> {
 
     input.content = Some(match source {
         ContentSource::Text { value } => {
-            ensure_bound(value.as_bytes().len() as u64, "inline text")?;
+            ensure_bound(value.len() as u64, "inline text")?;
             ContentSource::Text { value }
         }
         ContentSource::InputFile { path } => {
@@ -159,9 +159,12 @@ mod tests {
         let mut input = application_contract::parse_bound_input(&args(&[
             "conversation-send",
             "conversation-a",
-            &"x".repeat(MAX_MATERIALIZED_CONTENT_BYTES as usize + 1),
+            "hello",
         ]))
-        .expect("parser accepts OS-provided token");
+        .expect("input parses");
+        input.content = Some(ContentSource::Text {
+            value: "x".repeat(MAX_MATERIALIZED_CONTENT_BYTES as usize + 1),
+        });
         let error = materialize_content(&mut input).expect_err("content must be bounded");
         assert_eq!(error.code, ErrorCode::InvalidInput);
     }
