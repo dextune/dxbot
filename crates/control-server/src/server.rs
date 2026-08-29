@@ -7,14 +7,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use application::mutation::AppError;
 use application::ApplicationMutator;
+use application::mutation::AppError;
+use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
 use dxbot_core::types::*;
-use runtime_security::{
-    ApprovalManager, AuthorityManager, PrincipalManager, PrincipalStatus,
-};
+use runtime_security::{ApprovalManager, AuthorityManager, PrincipalManager, PrincipalStatus};
 
 const OPERATION_ROLE: &str = "mutator";
+const LOCAL_OPERATOR_ROLE: &str = "operator";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerError {
@@ -22,6 +22,36 @@ pub enum ServerError {
     NotFound(String),
     Conflict(String),
     InternalInvariant(String),
+}
+
+impl ServerError {
+    pub fn to_dxbot_error(&self) -> DxbotError {
+        let (code, category, message) = match self {
+            Self::PermissionDenied(message) => {
+                (ErrorCode::PermissionDenied, ErrorCategory::Permission, message.clone())
+            }
+            Self::NotFound(message) => (ErrorCode::NotFound, ErrorCategory::Input, message.clone()),
+            Self::Conflict(message) => (ErrorCode::Conflict, ErrorCategory::Conflict, message.clone()),
+            Self::InternalInvariant(message) => (
+                ErrorCode::InternalInvariant,
+                ErrorCategory::Internal,
+                message.clone(),
+            ),
+        };
+        DxbotError {
+            code,
+            category,
+            message,
+            retryable: false,
+            operation_ref: None,
+            target_refs: Vec::new(),
+            field_violations: Vec::new(),
+            current_revision: None,
+            current_generation: None,
+            resume_cursor: None,
+            next_actions: Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Display for ServerError {
@@ -43,6 +73,29 @@ impl SecurityState {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Register and explicitly grant the P0 local operator role to the
+    /// server-authenticated Instance+UID principal. Repeated authentication by
+    /// the same local UID is idempotent; arbitrary registered principals still
+    /// receive no authority.
+    pub fn ensure_local_operator(&mut self, principal: &PrincipalRef) -> Result<(), ServerError> {
+        if self.principals.resolve_principal(principal).is_err() {
+            self.principals
+                .register_principal(principal.clone())
+                .map_err(|error| {
+                    ServerError::InternalInvariant(format!(
+                        "cannot register authenticated local principal: {error}"
+                    ))
+                })?;
+        }
+        self.authority
+            .bind_global_authority(principal, LOCAL_OPERATOR_ROLE)
+            .map_err(|error| {
+                ServerError::InternalInvariant(format!(
+                    "cannot grant authenticated local operator role: {error}"
+                ))
+            })
+    }
 }
 
 /// The mutator already owns synchronized domain state, so ControlServer keeps
@@ -62,6 +115,15 @@ impl ControlServer {
             security,
             application,
         }
+    }
+
+    pub fn register_local_operator(&self, principal: &PrincipalRef) -> Result<(), ServerError> {
+        self.security
+            .lock()
+            .map_err(|_| {
+                ServerError::InternalInvariant("security state lock unavailable".to_owned())
+            })?
+            .ensure_local_operator(principal)
     }
 
     /// Handle a mutation for a principal already derived by the trusted local
@@ -97,16 +159,22 @@ impl ControlServer {
             ));
         }
 
-        let scope = scope_for_target(&request.payload.canonical_target).ok_or_else(|| {
-            ServerError::PermissionDenied(
-                "target does not expose an authorizable P0 scope".to_string(),
-            )
-        })?;
-        let authorized = security
+        let is_local_operator = security
             .authority
-            .check_authority(&principal_state.ref_, &scope, OPERATION_ROLE)
-            .map_err(|_| ServerError::PermissionDenied("authority check failed".to_string()))?;
-        if !authorized {
+            .check_global_authority(&principal_state.ref_, LOCAL_OPERATOR_ROLE)
+            .map_err(|_| ServerError::PermissionDenied("global authority check failed".to_owned()))?;
+
+        let scoped_authorized = match scope_for_target(&request.payload.canonical_target) {
+            Some(scope) => security
+                .authority
+                .check_authority(&principal_state.ref_, &scope, OPERATION_ROLE)
+                .map_err(|_| {
+                    ServerError::PermissionDenied("scope authority check failed".to_owned())
+                })?,
+            None => false,
+        };
+
+        if !is_local_operator && !scoped_authorized {
             return Err(ServerError::PermissionDenied("not authorized".to_string()));
         }
 
@@ -131,8 +199,8 @@ fn map_app_error(error: AppError) -> ServerError {
 }
 
 /// Project only targets whose P0 authority scope is unambiguous from the
-/// canonical target itself. Unknown ownership fails closed instead of being
-/// routed through a fabricated fallback scope.
+/// canonical target itself. Instance-global local operator authority is checked
+/// separately; unknown ownership never fabricates a fallback scope.
 fn scope_for_target(target: &CanonicalTarget) -> Option<ScopeSelector> {
     match target {
         CanonicalTarget::Bot { id, .. } => {
