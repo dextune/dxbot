@@ -2,7 +2,7 @@
 //!
 //! Endpoint metadata is validated before every connection. Runtime identity,
 //! HostGeneration and the server-derived local Principal are then bound by the
-//! versioned handshake before preflight, query, host action, submit or recovery lookup.
+//! versioned handshake before preflight, query, watch, host action, submit or recovery lookup.
 
 #![cfg(unix)]
 
@@ -114,6 +114,35 @@ impl LocalControlClient {
             LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
             _ => Err(ClientError::Transport(
                 "unexpected response after query".to_owned(),
+            )),
+        }
+    }
+
+    pub fn watch_next(
+        &self,
+        payload: &CommandPayload,
+        cursor: Option<String>,
+        timeout: Duration,
+    ) -> Result<Value, ClientError> {
+        let (mut stream, handshake) = self.connect_and_handshake()?;
+        validate_payload_identity(payload, &handshake)?;
+        let timeout_ms = u64::try_from(timeout.as_millis()).map_err(|_| {
+            ClientError::Transport("watch timeout exceeds u64 milliseconds".to_owned())
+        })?;
+        write_local_control_frame(
+            &mut stream,
+            &LocalControlRequest::WatchNext {
+                payload: payload.clone(),
+                cursor,
+                timeout_ms,
+            },
+        )
+        .map_err(codec_error)?;
+        match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
+            LocalControlResponse::Data { value } => Ok(value),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
+            _ => Err(ClientError::Transport(
+                "unexpected response after watch".to_owned(),
             )),
         }
     }
