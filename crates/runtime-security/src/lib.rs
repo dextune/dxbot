@@ -24,14 +24,13 @@ pub use state::{
     SecurityDelta, SecurityState, SecurityStateStore,
 };
 
-use dxbot_core::types::{ApprovalId, OperationId, PrincipalRef};
+use dxbot_core::types::{ApprovalId, PrincipalRef};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     DuplicatePrincipal(PrincipalRef),
     UnknownPrincipal(PrincipalRef),
     UnknownApproval(ApprovalId),
-    AmbiguousApprovalOperation(OperationId),
     ApprovalAlreadyDecided(ApprovalId),
     InvalidApprover(PrincipalRef),
     InvalidApprovalBinding,
