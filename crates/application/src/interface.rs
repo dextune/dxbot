@@ -929,7 +929,7 @@ fn membership_page(
         state
             .memberships
             .values()
-            .filter(|row| row.scope == scope)
+            .filter(|row| row.active && row.scope == scope)
             .map(|row| (row.id.clone(), membership_value(row)))
             .collect(),
         page_size,
@@ -1192,5 +1192,41 @@ mod tests {
         )
         .expect("CAS materializes");
         assert_eq!(cas.if_target_scope_revision, Some(7));
+    }
+
+    #[test]
+    fn membership_list_hides_inactive_generation_tombstones() {
+        let mut state = DomainState::new();
+        let scope = ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
+            "project-a".to_owned(),
+        )));
+        let member = BotSelector::CanonicalId(BotId("bot-a".to_owned()));
+        let key = membership_key(&scope, &member);
+        state.memberships.insert(
+            key.clone(),
+            MembershipRecord {
+                id: key,
+                scope: scope.clone(),
+                member_bot: member,
+                role: "member".to_owned(),
+                generation: 2,
+                active: false,
+                created_at: 1,
+            },
+        );
+        let payload = CommandPayload {
+            command_key: "project-member-list".to_owned(),
+            principal_ref: PrincipalRef("p".to_owned()),
+            instance_id: InstanceId("i".to_owned()),
+            canonical_target: CanonicalTarget::Project {
+                id: ProjectId("project-a".to_owned()),
+                revision: 1,
+            },
+            cas: None,
+            content: None,
+            semantic_options: json!({}),
+        };
+        let value = membership_page(&state, &payload, 50, None).expect("page");
+        assert_eq!(value["items"], json!([]));
     }
 }
