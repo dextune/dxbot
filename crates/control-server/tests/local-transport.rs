@@ -1,7 +1,7 @@
 //! End-to-end local control framing/authentication test.
 
 #![cfg(unix)]
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
