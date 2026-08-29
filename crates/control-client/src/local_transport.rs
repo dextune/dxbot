@@ -19,7 +19,9 @@ use application_contract::{
     LocalControlHello, LocalControlRequest, LocalControlResponse, read_local_control_frame,
     write_local_control_frame,
 };
-use dxbot_core::types::{InstanceId, OperationRequest, OperationResult, PrincipalRef};
+use dxbot_core::types::{
+    CommandId, IdempotencyKey, InstanceId, OperationRequest, OperationResult, PrincipalRef,
+};
 
 use crate::{ClientError, Transport};
 
@@ -65,14 +67,11 @@ impl LocalControlClient {
         &self.endpoint_path
     }
 
-    /// Authenticate the selected Instance and obtain the server-derived local
-    /// principal. No command payload is accepted before this handshake.
     pub fn handshake(&self) -> Result<LocalControlHandshake, ClientError> {
         let (_stream, handshake) = self.connect_and_handshake()?;
         Ok(handshake)
     }
 
-    /// Build the fallible transport consumed by `SubmissionClient`.
     pub fn into_transport(self) -> Transport {
         Box::new(move |request| self.submit(request))
     }
@@ -104,9 +103,42 @@ impl LocalControlClient {
         match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
             LocalControlResponse::Operation { result } => Ok(result),
             LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
-            LocalControlResponse::Handshake { .. } => Err(ClientError::Transport(
-                "unexpected handshake response after submit".to_owned(),
-            )),
+            LocalControlResponse::Handshake { .. } | LocalControlResponse::Binding { .. } => {
+                Err(ClientError::Transport(
+                    "unexpected response after operation submit".to_owned(),
+                ))
+            }
+        }
+    }
+
+    /// Read-only canonical binding lookup for response-loss/restart recovery.
+    pub fn lookup_binding(
+        &self,
+        command_id: &CommandId,
+        key: &IdempotencyKey,
+    ) -> Result<Option<OperationResult>, ClientError> {
+        let (mut stream, handshake) = self.connect_and_handshake()?;
+        if key.principal_ref != handshake.principal_ref {
+            return Err(ClientError::Transport(
+                "lookup key principal does not match authenticated local principal".to_owned(),
+            ));
+        }
+        write_local_control_frame(
+            &mut stream,
+            &LocalControlRequest::LookupBinding {
+                command_id: command_id.clone(),
+                idempotency_key: key.clone(),
+            },
+        )
+        .map_err(codec_error)?;
+        match read_local_control_frame::<_, LocalControlResponse>(&mut stream).map_err(codec_error)? {
+            LocalControlResponse::Binding { result } => Ok(result),
+            LocalControlResponse::Error { error } => Err(ClientError::Remote(error)),
+            LocalControlResponse::Handshake { .. } | LocalControlResponse::Operation { .. } => {
+                Err(ClientError::Transport(
+                    "unexpected response after binding lookup".to_owned(),
+                ))
+            }
         }
     }
 
@@ -134,9 +166,9 @@ impl LocalControlClient {
         let handshake = match response {
             LocalControlResponse::Handshake { handshake } => handshake,
             LocalControlResponse::Error { error } => return Err(ClientError::Remote(error)),
-            LocalControlResponse::Operation { .. } => {
+            LocalControlResponse::Operation { .. } | LocalControlResponse::Binding { .. } => {
                 return Err(ClientError::Transport(
-                    "operation response received before handshake".to_owned(),
+                    "non-handshake response received before handshake".to_owned(),
                 ));
             }
         };
