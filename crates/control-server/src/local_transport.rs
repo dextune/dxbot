@@ -1,8 +1,9 @@
 //! Owner-only Unix-domain control transport.
 //!
 //! P0 LocalPrincipal is derived server-side from the Runtime Instance and the
-//! owner UID of an owner-only socket. Kernel pathname permissions authenticate
-//! the local UID class; same-UID process isolation is intentionally not claimed.
+//! authenticated peer UID. The socket itself is owner-only and clients verify
+//! its owner/type/generation, but pathname permissions are not treated as peer
+//! identity. Same-UID process isolation is intentionally not claimed.
 //! Every connection performs a version/generation handshake before accepting an
 //! operation request.
 
@@ -36,7 +37,7 @@ pub struct LocalControlServer {
     endpoint_ino: u64,
     instance_id: InstanceId,
     host_generation: i64,
-    principal_ref: PrincipalRef,
+    owner_principal_ref: PrincipalRef,
     control: Arc<ControlServer>,
 }
 
@@ -74,13 +75,9 @@ impl LocalControlServer {
             ));
         }
 
-        let principal_ref = PrincipalRef(format!(
-            "local:{}:uid:{}",
-            instance_id.0,
-            metadata.uid()
-        ));
+        let owner_principal_ref = local_principal(&instance_id, metadata.uid());
         control
-            .register_local_operator(&principal_ref)
+            .register_local_operator(&owner_principal_ref)
             .map_err(|error| io::Error::other(error.to_string()))?;
 
         Ok(Self {
@@ -90,13 +87,15 @@ impl LocalControlServer {
             endpoint_ino: metadata.ino(),
             instance_id,
             host_generation,
-            principal_ref,
+            owner_principal_ref,
             control,
         })
     }
 
+    /// Principal expected for the owner UID. Actual requests always use the
+    /// peer credential read from each accepted socket.
     pub fn principal_ref(&self) -> &PrincipalRef {
-        &self.principal_ref
+        &self.owner_principal_ref
     }
 
     pub fn endpoint_path(&self) -> &Path {
@@ -123,6 +122,7 @@ impl LocalControlServer {
     fn handle_stream(&self, mut stream: UnixStream) -> Result<(), io::Error> {
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
+        let authenticated_principal = local_principal(&self.instance_id, peer_uid(&stream)?);
 
         let first = read_local_control_frame::<_, LocalControlRequest>(&mut stream)
             .map_err(codec_io)?;
@@ -161,7 +161,7 @@ impl LocalControlServer {
                 handshake: LocalControlHandshake {
                     instance_id: self.instance_id.clone(),
                     host_generation: self.host_generation,
-                    principal_ref: self.principal_ref.clone(),
+                    principal_ref: authenticated_principal.clone(),
                     protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION.to_owned(),
                     schema_version: LOCAL_CONTROL_SCHEMA_VERSION.to_owned(),
                 },
@@ -183,7 +183,10 @@ impl LocalControlServer {
                         incompatible_error("request instance does not match endpoint".to_owned()),
                     );
                 }
-                match self.control.handle_request(&self.principal_ref, &request) {
+                match self
+                    .control
+                    .handle_request(&authenticated_principal, &request)
+                {
                     Ok(result) => write_local_control_frame(
                         &mut stream,
                         &LocalControlResponse::Operation { result },
@@ -210,6 +213,28 @@ impl Drop for LocalControlServer {
     }
 }
 
+fn local_principal(instance_id: &InstanceId, uid: u32) -> PrincipalRef {
+    PrincipalRef(format!("local:{}:uid:{uid}", instance_id.0))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_uid(stream: &UnixStream) -> Result<u32, io::Error> {
+    let credentials = nix::sys::socket::getsockopt(
+        stream,
+        nix::sys::socket::sockopt::PeerCredentials,
+    )
+    .map_err(|error| io::Error::other(format!("cannot authenticate local peer: {error}")))?;
+    Ok(credentials.uid())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn peer_uid(_stream: &UnixStream) -> Result<u32, io::Error> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "safe peer-credential authentication is not implemented for this Unix target",
+    ))
+}
+
 fn validate_absent_endpoint(path: &Path) -> Result<(), io::Error> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -222,7 +247,10 @@ fn validate_absent_endpoint(path: &Path) -> Result<(), io::Error> {
             };
             Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                format!("refusing to replace existing control endpoint {kind}: {}", path.display()),
+                format!(
+                    "refusing to replace existing control endpoint {kind}: {}",
+                    path.display()
+                ),
             ))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
