@@ -1,16 +1,16 @@
 //! Production execution-context projection for CLI input.
 //!
 //! Parser-side `CliInput::instance_id` / `principal_ref` remain compatibility
-//! conveniences for isolated projection tests. Production orchestration must
-//! bind a verified Runtime Instance and a principal learned from the trusted
-//! local transport boundary before the payload becomes dispatchable.
+//! conveniences for isolated projection tests. Production orchestration binds a
+//! verified Runtime Instance and authenticated Principal, and removes every
+//! registry-owned `@local` field before producing a wire payload.
 
 use dxbot_core::DxbotError;
 use dxbot_core::types::{CommandPayload, InstanceId, PrincipalRef};
 
-use crate::{CliInput, contract};
+use crate::{CliInput, contract, metadata_for_key};
+use crate::util;
 
-/// Identity material supplied by verified discovery/authenticated transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionContext {
     pub instance_id: InstanceId,
@@ -26,16 +26,10 @@ impl ExecutionContext {
     }
 }
 
-/// Project a command payload using only trusted execution identity.
-///
-/// Local `--profile` / `--instance` values may participate in discovery before
-/// this function is called, but they cannot become authenticated identity here.
 pub fn project_for_execution(
     input: &CliInput,
     context: &ExecutionContext,
 ) -> Result<CommandPayload, DxbotError> {
-    // Normalize the compatibility projection to the already-verified Instance
-    // so target materialization cannot fall back to profile/local synthetic IDs.
     let mut normalized = input.clone();
     normalized.global_options.instance = Some(context.instance_id.0.clone());
     normalized.global_options.profile = None;
@@ -43,8 +37,8 @@ pub fn project_for_execution(
     let mut payload = contract::CommandPayload::from_cli_input(&normalized)?.inner;
     payload.instance_id = context.instance_id.clone();
     payload.principal_ref = context.principal_ref.clone();
+    remove_local_semantic_fields(&normalized, &mut payload)?;
 
-    // Instance-targeted operations must bind exactly to the verified Instance.
     if matches!(
         &payload.canonical_target,
         dxbot_core::types::CanonicalTarget::Instance(_)
@@ -53,6 +47,38 @@ pub fn project_for_execution(
             dxbot_core::types::CanonicalTarget::Instance(context.instance_id.clone());
     }
     Ok(payload)
+}
+
+/// `typed_fields` is already parsed/validated by `invocation`; this projection
+/// only consumes the frozen `@local` markers to prevent validated UX state from
+/// becoming semantic wire state. No command-specific local field list exists.
+fn remove_local_semantic_fields(
+    input: &CliInput,
+    payload: &mut CommandPayload,
+) -> Result<(), DxbotError> {
+    let metadata = metadata_for_key(&input.command_key).ok_or_else(|| {
+        util::invariant(format!(
+            "known command '{}' has no metadata row",
+            input.command_key
+        ))
+    })?;
+    let options = payload.semantic_options.as_object_mut().ok_or_else(|| {
+        util::invariant("CommandPayload semantic_options must be a JSON object")
+    })?;
+    for raw in metadata.typed_fields.split(';') {
+        let raw = raw.trim();
+        if raw.is_empty() || !raw.contains("@local") {
+            continue;
+        }
+        let Some((name, _)) = raw.split_once(':') else {
+            return Err(util::invariant(format!(
+                "invalid typed field metadata for {}: {raw}",
+                input.command_key
+            )));
+        };
+        options.remove(name.trim());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -91,5 +117,18 @@ mod tests {
             payload.canonical_target,
             CanonicalTarget::Instance(InstanceId("verified-instance".to_owned()))
         );
+    }
+
+    #[test]
+    fn registry_local_fields_never_cross_wire() {
+        let input = crate::parse_bound_input(&args(&["bot-list", "--all"]))
+            .expect("local all parses");
+        assert_eq!(input.fields["all"], true);
+        let context = ExecutionContext::new(
+            InstanceId("verified-instance".to_owned()),
+            PrincipalRef("local:verified-instance:uid:1000".to_owned()),
+        );
+        let payload = project_for_execution(&input, &context).expect("projection succeeds");
+        assert!(payload.semantic_options.get("all").is_none());
     }
 }
