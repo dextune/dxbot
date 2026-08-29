@@ -1,70 +1,76 @@
-//! Domain-outcome semantics.
-//!
-//! These semantics resolve what would happen to a canonical target given the
-//! current in-memory domain state and optional CAS conditions. They are kept
-//! separate from the receipt disposition: a receipt records what the operation
-//! *did*, a [`DomainOutcome`] records the *reason* a mutation is allowed or
-//! rejected at the domain layer.
+//! Domain-outcome semantics separated from Operation receipt disposition.
 
 use dxbot_core::types::{CanonicalTarget, CasConditions};
 
 use crate::state::DomainState;
 
-/// The resolved outcome of attempting a mutation against a canonical target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DomainOutcome {
-    /// The target does not exist yet and can be materialized.
     Created,
-    /// The target exists and the CAS conditions are satisfied.
     Updated,
-    /// The target currently holds a different revision than the request expects.
     Conflict,
-    /// The target does not exist but a precondition requires it to exist.
     NotFound,
-    /// The principal is not permitted to mutate the target.
     PermissionDenied,
 }
 
-/// The exact object revision a target refers to, if it exists in state.
-fn current_revision(current_state: &DomainState, target: &CanonicalTarget) -> Option<i64> {
+fn current_revision(state: &DomainState, target: &CanonicalTarget) -> Option<i64> {
     match target {
         CanonicalTarget::Instance(_) => Some(0),
-        CanonicalTarget::Bot { id, .. } => current_state.bots.get(id).map(|b| b.revision),
+        CanonicalTarget::Bot { id, .. } => state.bots.get(id).map(|row| row.revision),
         CanonicalTarget::Conversation { id, .. } => {
-            current_state.conversations.get(id).map(|c| c.revision)
+            state.conversations.get(id).map(|row| row.revision)
         }
-        CanonicalTarget::Thread { id, .. } => current_state.threads.get(id).map(|t| t.revision),
-        CanonicalTarget::Task { id, .. } => current_state.tasks.get(id).map(|t| t.revision),
-        // Targets not materialized in the in-memory fixture are treated as absent.
+        CanonicalTarget::Thread { id, .. } => state.threads.get(id).map(|row| row.revision),
+        CanonicalTarget::Task { id, .. } => state.tasks.get(id).map(|row| row.revision),
+        CanonicalTarget::Project { id, .. } => state.projects.get(id).map(|row| row.revision),
+        CanonicalTarget::Channel { id, .. } => state.channels.get(id).map(|row| row.revision),
+        CanonicalTarget::Memory { id, .. } => state.memories.get(id).map(|row| row.revision),
+        CanonicalTarget::Operation { operation_id, .. } => state
+            .results
+            .get(operation_id)
+            .map(|result| result.receipt.last_progress),
+        CanonicalTarget::SideEffect { id, .. } => {
+            state.side_effects.get(id).map(|row| row.revision)
+        }
+        CanonicalTarget::Membership { .. }
+        | CanonicalTarget::Approval { .. }
+        | CanonicalTarget::Provider { .. }
+        | CanonicalTarget::Process { .. } => None,
+    }
+}
+
+fn expected_revision(target: &CanonicalTarget, cas: &Option<CasConditions>) -> Option<i64> {
+    let cas = cas.as_ref()?;
+    match target {
+        CanonicalTarget::Project { .. } => cas.if_project_revision.or(cas.if_scope_revision).or(cas.if_revision),
+        CanonicalTarget::Channel { .. } => cas.if_channel_revision.or(cas.if_scope_revision).or(cas.if_revision),
+        CanonicalTarget::Memory { .. } => cas.if_proposal_revision.or(cas.if_revision),
+        CanonicalTarget::Operation { .. } => cas.if_receipt_revision,
+        CanonicalTarget::Bot { .. }
+        | CanonicalTarget::Conversation { .. }
+        | CanonicalTarget::Thread { .. }
+        | CanonicalTarget::Task { .. }
+        | CanonicalTarget::SideEffect { .. } => cas.if_revision,
         _ => None,
     }
 }
 
-/// Resolve the domain outcome of a mutation attempt without applying it.
-///
-/// * Absent target without a revision precondition → [`Created`](DomainOutcome::Created).
-/// * Absent target with a revision precondition → [`NotFound`](DomainOutcome::NotFound).
-/// * Present target whose revision matches (or has no) precondition → [`Updated`](DomainOutcome::Updated).
-/// * Present target whose revision differs from the precondition → [`Conflict`](DomainOutcome::Conflict).
 pub fn resolve_outcome(
-    current_state: &DomainState,
+    state: &DomainState,
     target: &CanonicalTarget,
     cas: &Option<CasConditions>,
 ) -> DomainOutcome {
-    let current = current_revision(current_state, target);
-    let expected = cas.as_ref().and_then(|c| c.if_revision);
+    let current = current_revision(state, target);
+    let expected = expected_revision(target, cas);
     match (current, expected) {
         (None, None) => DomainOutcome::Created,
         (None, Some(_)) => DomainOutcome::NotFound,
         (Some(_), None) => DomainOutcome::Updated,
-        (Some(cur), Some(want)) if cur == want => DomainOutcome::Updated,
+        (Some(current), Some(expected)) if current == expected => DomainOutcome::Updated,
         (Some(_), Some(_)) => DomainOutcome::Conflict,
     }
 }
 
-/// Build [`CasConditions`] expressing a single `if_revision` precondition.
-///
-/// Convenience for tests and callers that only care about the revision guard.
 pub fn cas_if_revision(revision: i64) -> CasConditions {
     CasConditions {
         if_revision: Some(revision),
