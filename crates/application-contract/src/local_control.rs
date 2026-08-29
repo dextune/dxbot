@@ -1,4 +1,8 @@
 //! Versioned bounded local control contract shared by CLI and Runtime.
+//!
+//! Schema v2 adds bounded watch-next and host-generation stop requests. The
+//! explicit bump prevents a new CLI from handshaking successfully with a v1
+//! Runtime and only discovering the incompatibility after sending a new frame.
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -12,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: &str = "1";
-pub const LOCAL_CONTROL_SCHEMA_VERSION: &str = "v1";
+pub const LOCAL_CONTROL_SCHEMA_VERSION: &str = "v2";
 pub const MAX_LOCAL_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +233,11 @@ mod tests {
         let decoded: LocalControlRequest =
             read_local_control_frame(&mut bytes.as_slice()).expect("frame reads");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn schema_version_tracks_watch_and_host_stop_shape() {
+        assert_eq!(LOCAL_CONTROL_SCHEMA_VERSION, "v2");
     }
 
     #[test]
