@@ -6,7 +6,7 @@ status: "Accepted"
 normative: true
 priority: "P0"
 last_updated: "2026-08-29"
-depends_on: ["DXB-BASE-000", "DXB-GOV-005", "DXB-IFC-043", "DXB-DEL-060", "DXB-DEL-061", "DXB-DEL-062", "DXB-DEL-063", "DXB-DEL-066"]
+depends_on: ["DXB-BASE-000", "DXB-GOV-005", "DXB-IFC-043", "DXB-DEL-060", "DXB-DEL-061", "DXB-DEL-062", "DXB-DEL-063", "DXB-DEL-066", "DXB-DEL-067"]
 package_path: "docs/plan/20260823-1310-v0-8-10-detailed-development-plan"
 review_revision: 10
 adversarial_review_rounds: 5
@@ -34,12 +34,20 @@ v0.8.10은 기능 확장이 아니라 v0.8.9를 실제 사용자 관점에서 �
 - approval/provider/ambiguity/recovery: 설계 GO
 - multi-instance와 pagination/output: 설계 GO
 
-위 GO는 문서 계약 완결 판정이다. Rust/Runtime/CLI 실행 Acceptance는 구현 전까지 `Blocked`이며 실제 제품 사용성 PASS를 주장하지 않는다.
+위 GO는 문서 계약 완결 판정이다. 실제 제품 판정은 최신 executable evidence와 post-closeout 적대적 재감사를 함께 적용한다.
 
 새 CLI command, wizard, auto-start, auto mutation retry, generic RPC/IDL/Workflow engine, DB/Harness 제품 고정, TUI/Web/Plugin/distributed scope는 추가하지 않는다.
 
 ## CLI 개발 종료 Gate
 
-기존 Acceptance의 component/projection PASS와 실제 `dxb` 제품 완료를 구분한다. 기능 확장 없이 CLI를 종료하기 위한 blocking finding, execution spine, 63-operation executability, binary user journey, crash/recovery 및 최종 2회 재검수 기준은 [CLI 개발 완료 적대적 종료 플랜](60-delivery/66-cli-completion-adversarial-plan.md)을 따른다.
+기존 Acceptance의 component/projection PASS와 실제 `dxb` 제품 완료를 구분한다. 기능 확장 없이 CLI를 종료하기 위한 blocking finding, execution spine, 63-operation executability, binary user journey, crash/recovery 및 최종 2회 재검수의 역사적 closeout evidence는 [CLI 개발 완료 적대적 종료 플랜](60-delivery/66-cli-completion-adversarial-plan.md)을 따른다.
 
-`CLI Complete`는 해당 closeout 문서의 Binary/Journey Gate가 executable evidence로 모두 닫힌 뒤에만 선언한다.
+## Post-closeout 재감사와 실운영 준비
+
+GitHub `main`을 CLI closeout 이후 다시 적대적으로 검토한 결과, execution/security/recovery spine은 유지되지만 version live compatibility, `runtime start --ready-at`, human mutation/result actionability, human failure next action, unknown-command suggestion의 사용자 표면 계약이 다시 열렸다.
+
+또한 CLI가 Task/Process를 durable하게 생성하는 것과 실제 Brain/Context Plan→Execution→Resource Governor→Dynamic Core Lease→real Provider→Result/Evidence→Memory/Recovery를 수행하는 것은 별도 완료 조건이다.
+
+현재 reopened CLI finding과 production Provider/Execution/Memory/Multi-Bot/운영 준비의 전체 순서 및 `DXBOT Operational Ready` Gate는 [CLI 이후 DXBOT 실운영 준비 적대적 개발 플랜](60-delivery/67-operational-runtime-readiness-adversarial-plan.md)을 따른다.
+
+`DXB-DEL-066`의 과거 실행 PASS만으로 현재 `CLI Contract Complete` 또는 전체 `DXBOT Operational Ready`를 자동 선언하지 않는다.
