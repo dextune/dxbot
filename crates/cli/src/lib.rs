@@ -74,7 +74,7 @@ pub use recovery::{
     BindingKey, BindingLookup, RecoveryAction, RecoveryEntry, RecoveryError, RecoveryManager,
     ReusedIds,
 };
-pub use runner::{CliOutput, execute};
+pub use runner::{CliOutput, execute, run_process};
 pub use safe_writer::SafeWriter;
 pub use selector::SelectorResolver;
 pub use submission::{SubmissionFlowError, submit_or_recover};
