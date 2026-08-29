@@ -41,6 +41,10 @@ impl MembershipManager {
         Self { state }
     }
 
+    pub fn snapshot(&self) -> Result<DomainState, AppError> {
+        self.lock().map(|state| state.clone())
+    }
+
     pub fn set_membership(
         &mut self,
         scope: &ScopeSelector,
@@ -165,7 +169,7 @@ impl MembershipManager {
         bot: &BotSelector,
     ) -> Result<String, AppError> {
         let membership = self.require_member(scope, bot)?;
-        if matches!(membership.role.as_str(), "owner" | "admin" | "delegate") {
+        if Self::can_delegate(&membership.role) {
             Ok(membership.role)
         } else {
             Err(AppError::PermissionDenied(format!(
@@ -175,6 +179,14 @@ impl MembershipManager {
         }
     }
 
+    pub fn can_delegate(role: &str) -> bool {
+        let role = role.trim();
+        role.eq_ignore_ascii_case("owner")
+            || role.eq_ignore_ascii_case("admin")
+            || role.eq_ignore_ascii_case("delegate")
+            || role.eq_ignore_ascii_case("coordinator")
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, DomainState>, AppError> {
         self.state
             .lock()
@@ -182,8 +194,10 @@ impl MembershipManager {
     }
 }
 
-fn membership_key(scope: &ScopeSelector, bot: &BotSelector) -> String {
-    format!("{}|{}", scope_key(scope), bot_key(bot))
+pub(crate) fn membership_key(scope: &ScopeSelector, bot: &BotSelector) -> String {
+    let scope = scope_key(scope);
+    let bot = bot_key(bot);
+    format!("{}:{scope}{}:{bot}", scope.len(), bot.len())
 }
 
 fn scope_key(scope: &ScopeSelector) -> String {
