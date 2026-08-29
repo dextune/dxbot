@@ -209,6 +209,7 @@ impl ControlServer {
         self.recover_pending()?;
         self.authorize_payload_identity(authenticated_principal, payload)?;
         self.require_local_operator_or_scope(authenticated_principal, &payload.canonical_target)?;
+        reject_unowned_semantics(payload)?;
         match payload.command_key.as_str() {
             "approval-list" | "approval-show" => self.approval_query(payload),
             "provider-list" | "provider-show" => self.provider_query(payload),
@@ -255,6 +256,7 @@ impl ControlServer {
             return Ok(result);
         }
 
+        reject_unowned_semantics(&request.payload)?;
         application_contract::validate_materialized_cas(&request.payload)
             .map_err(|error| ServerError::Conflict(error.message))?;
         self.require_provider_admission(&request.payload)?;
@@ -544,11 +546,17 @@ impl ControlServer {
         })? else {
             return Ok(());
         };
-        let committed = self
+        let committed = match self
             .application
             .lookup_binding(&record.request.command_id, &record.request.idempotency_key)
             .map_err(map_app_error)?
-            .is_some();
+        {
+            Some(result) => {
+                validate_exact_retry(&result, &record.request)?;
+                true
+            }
+            None => false,
+        };
         if committed {
             let mut candidate = self.lock_security()?.clone();
             candidate
@@ -805,6 +813,39 @@ fn validate_exact_retry(
         return Err(ServerError::Conflict(
             "existing command binding does not match exact retry identity".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn reject_unowned_semantics(payload: &CommandPayload) -> Result<(), ServerError> {
+    let unsupported: &[&str] = match payload.command_key.as_str() {
+        "bot-create" => &[
+            "brain_policy",
+            "permission_policy",
+            "resource_policy",
+            "provider_policy",
+        ],
+        "task-submit" => &[
+            "delegate_to_bot",
+            "requested_sender_bot",
+            "deadline",
+            "budget",
+        ],
+        "task-cancel" | "task-suspend" => &["reason"],
+        "task-result" => &["artifact_id"],
+        "memory-get" => &["scope"],
+        "memory-promote" => &["declassification_ref"],
+        "approval-deny" => &["reason"],
+        _ => &[],
+    };
+    if let Some(field) = unsupported
+        .iter()
+        .find(|field| payload.semantic_options.get(**field).is_some())
+    {
+        return Err(ServerError::Conflict(format!(
+            "{} field '{field}' requires canonical owner semantics that are not yet available; refusing to ignore it",
+            payload.command_key
+        )));
     }
     Ok(())
 }
