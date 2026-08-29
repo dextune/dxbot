@@ -1,9 +1,4 @@
-//! Versioned local control wire contract shared by CLI client and Runtime
-//! control server.
-//!
-//! Transport framing is a 32-bit big-endian byte length followed by one JSON
-//! document. The frame ceiling is part of the contract so malformed local peers
-//! cannot force unbounded allocation before authentication/dispatch.
+//! Versioned bounded local control contract shared by CLI and Runtime.
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -15,7 +10,6 @@ use dxbot_core::types::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: &str = "1";
 pub const LOCAL_CONTROL_SCHEMA_VERSION: &str = "v1";
@@ -44,7 +38,7 @@ pub enum LocalControlRequest {
     Hello { hello: LocalControlHello },
     Preflight {
         payload: CommandPayload,
-        raw_selector: Option<Value>,
+        raw_selector: Option<serde_json::Value>,
     },
     Query { payload: CommandPayload },
     Submit { request: OperationRequest },
@@ -52,6 +46,9 @@ pub enum LocalControlRequest {
         command_id: CommandId,
         idempotency_key: IdempotencyKey,
     },
+    /// Host action, not an Application Command. The generation supplied by the
+    /// client is checked against the live host generation before shutdown.
+    StopHost { host_generation: i64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,7 +59,7 @@ pub enum LocalControlResponse {
         canonical_target: CanonicalTarget,
         cas: CasConditions,
     },
-    Data { value: Value },
+    Data { value: serde_json::Value },
     Operation { result: OperationResult },
     Binding { result: Option<OperationResult> },
     Error { error: DxbotError },
@@ -85,9 +82,7 @@ impl fmt::Display for LocalControlCodecError {
                 formatter,
                 "local control frame exceeds bound: {length} > {maximum}"
             ),
-            Self::InvalidJson(message) => {
-                write!(formatter, "invalid local control JSON: {message}")
-            }
+            Self::InvalidJson(message) => write!(formatter, "invalid local control JSON: {message}"),
         }
     }
 }
@@ -124,11 +119,9 @@ where
             maximum: MAX_LOCAL_CONTROL_FRAME_BYTES,
         });
     }
-    let length = u32::try_from(payload.len()).map_err(|_| {
-        LocalControlCodecError::OversizedFrame {
-            length: payload.len(),
-            maximum: MAX_LOCAL_CONTROL_FRAME_BYTES,
-        }
+    let length = u32::try_from(payload.len()).map_err(|_| LocalControlCodecError::OversizedFrame {
+        length: payload.len(),
+        maximum: MAX_LOCAL_CONTROL_FRAME_BYTES,
     })?;
     writer
         .write_all(&length.to_be_bytes())
@@ -200,13 +193,20 @@ mod tests {
     }
 
     #[test]
+    fn host_stop_generation_roundtrips() {
+        let request = LocalControlRequest::StopHost { host_generation: 9 };
+        let mut bytes = Vec::new();
+        write_local_control_frame(&mut bytes, &request).expect("frame writes");
+        let decoded: LocalControlRequest =
+            read_local_control_frame(&mut bytes.as_slice()).expect("frame reads");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
     fn oversized_advertised_frame_is_rejected_before_payload_read() {
         let oversized = (MAX_LOCAL_CONTROL_FRAME_BYTES as u32 + 1).to_be_bytes();
         let error = read_local_control_frame::<_, LocalControlRequest>(&mut oversized.as_slice())
             .expect_err("oversized frame must fail");
-        assert!(matches!(
-            error,
-            LocalControlCodecError::OversizedFrame { .. }
-        ));
+        assert!(matches!(error, LocalControlCodecError::OversizedFrame { .. }));
     }
 }
