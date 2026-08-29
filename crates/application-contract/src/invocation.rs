@@ -1,29 +1,23 @@
 //! Registry-driven user invocation binding.
 //!
-//! `CliInput::parse` intentionally parses one canonical `command_key`. This
-//! module is the only bridge from user-facing path positionals to the frozen
-//! typed-field registry. It prevents the binary from growing a second 63-command
-//! parser table while keeping parser-only local options out of wire ownership.
+//! `CliInput::parse` parses one canonical command key and primary selector.
+//! This module binds remaining positionals/named fields against the same frozen
+//! typed-field metadata used by parser selector routing and wire-local stripping.
 
 use dxbot_core::DxbotError;
 use dxbot_core::types::ContentSource;
 use serde_json::{Map, Value, json};
 
+use crate::field_spec::{
+    FieldSpec, is_content_type, is_selector_type, is_user_source, parse_field_specs,
+    primary_selector_name,
+};
 use crate::util;
 use crate::{CliInput, CommandMetadata, metadata_for_key};
 
 pub const MAX_CLI_TOKENS: usize = 4096;
 pub const MAX_CLI_TOKEN_BYTES: usize = 1024 * 1024;
 const MAX_PAGE_SIZE: u64 = 1000;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FieldSpec {
-    name: String,
-    type_name: String,
-    source: String,
-    required: bool,
-    multiple: bool,
-}
 
 /// Parse canonical command-key argv and bind remaining user positionals to the
 /// registry's typed field order. Unknown fields, illegal duplicates, malformed
@@ -48,8 +42,7 @@ fn validate_argv_bounds(args: &[String]) -> Result<(), DxbotError> {
     if args.len() > MAX_CLI_TOKENS {
         return Err(util::input_error(format!(
             "too many CLI tokens: {} > {}",
-            args.len(),
-            MAX_CLI_TOKENS
+            args.len(), MAX_CLI_TOKENS
         )));
     }
     if let Some((index, token)) = args
@@ -77,7 +70,7 @@ fn bind_positionals(input: &mut CliInput, metadata: CommandMetadata) -> Result<(
     let mut next = 0usize;
     for value in positionals {
         while next < specs.len()
-            && !can_bind_positional(input, &specs[next], primary_selector.as_deref())
+            && !can_bind_positional(input, &specs[next], primary_selector)
         {
             next += 1;
         }
@@ -87,7 +80,7 @@ fn bind_positionals(input: &mut CliInput, metadata: CommandMetadata) -> Result<(
                 input.command_key
             )));
         };
-        bind_one(input, spec, primary_selector.as_deref(), value)?;
+        bind_one(input, spec, primary_selector, value)?;
         if !spec.multiple {
             next += 1;
         }
@@ -126,6 +119,9 @@ fn bind_one(
         return Ok(());
     }
     if is_content_type(&spec.type_name) {
+        if input.content.is_some() {
+            return Err(util::input_error("multiple content sources are not allowed"));
+        }
         input.content = Some(ContentSource::Text { value });
         return Ok(());
     }
@@ -186,7 +182,7 @@ fn validate_fields(input: &CliInput, metadata: CommandMetadata) -> Result<(), Dx
         if !spec.required || !is_user_source(&spec.source) {
             continue;
         }
-        let present = if is_primary_selector(spec, primary_selector.as_deref()) {
+        let present = if is_primary_selector(spec, primary_selector) {
             input.selector.is_some()
         } else if is_content_type(&spec.type_name) {
             input.content.is_some()
@@ -360,13 +356,6 @@ fn field_present(fields: &Value, name: &str) -> bool {
         .is_some_and(|object| object.contains_key(name))
 }
 
-fn primary_selector_name(specs: &[FieldSpec]) -> Option<String> {
-    specs
-        .iter()
-        .find(|spec| is_user_source(&spec.source) && is_selector_type(&spec.type_name))
-        .map(|spec| spec.name.clone())
-}
-
 fn is_primary_selector(spec: &FieldSpec, primary_selector: Option<&str>) -> bool {
     primary_selector.is_some_and(|name| name == spec.name) && is_selector_type(&spec.type_name)
 }
@@ -396,18 +385,6 @@ fn is_cas_field(name: &str) -> bool {
     name.starts_with("if_")
 }
 
-fn is_selector_type(type_name: &str) -> bool {
-    type_name.contains("Selector")
-}
-
-fn is_content_type(type_name: &str) -> bool {
-    type_name.starts_with("ContentSource")
-}
-
-fn is_user_source(source: &str) -> bool {
-    matches!(source, "argv" | "oneof")
-}
-
 fn selector_kind(spec: &FieldSpec) -> String {
     match spec.type_name.as_str() {
         value if value.contains("BotSelector") => "bot".to_owned(),
@@ -428,61 +405,6 @@ fn selector_kind(spec: &FieldSpec) -> String {
         value if value.contains("ScopeSelector") => "scope".to_owned(),
         _ => spec.name.replace('_', "-"),
     }
-}
-
-fn parse_field_specs(source: &str) -> Vec<FieldSpec> {
-    split_top_level(source)
-        .into_iter()
-        .filter_map(parse_field_spec)
-        .collect()
-}
-
-fn parse_field_spec(raw: &str) -> Option<FieldSpec> {
-    let raw = raw.trim();
-    if raw.is_empty() || raw == "none" {
-        return None;
-    }
-    let (name, rest) = raw.split_once(':')?;
-    let (typed, source) = rest.rsplit_once('@').unwrap_or((rest, "argv"));
-    let cardinality = typed.trim().chars().last();
-    let required = matches!(cardinality, Some('!' | '+'));
-    let multiple = matches!(cardinality, Some('*' | '+'));
-    let type_name = typed
-        .trim()
-        .trim_end_matches(['!', '?', '*', '+'])
-        .to_owned();
-    let source = source
-        .trim()
-        .split(['{', '='])
-        .next()
-        .unwrap_or_default()
-        .to_owned();
-    Some(FieldSpec {
-        name: name.trim().to_owned(),
-        type_name,
-        source,
-        required,
-        multiple,
-    })
-}
-
-fn split_top_level(source: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    for (index, ch) in source.char_indices() {
-        match ch {
-            '<' | '[' | '(' | '{' => depth = depth.saturating_add(1),
-            '>' | ']' | ')' | '}' => depth = depth.saturating_sub(1),
-            ';' if depth == 0 => {
-                parts.push(&source[start..index]);
-                start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(&source[start..]);
-    parts
 }
 
 #[cfg(test)]
@@ -528,6 +450,30 @@ mod tests {
                 value: "hello".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn named_task_owner_is_primary_but_memory_scope_can_be_secondary() {
+        let task = parse_bound_input(&args(&[
+            "task-submit",
+            "--owner",
+            "project:alpha",
+            "--text",
+            "do work",
+        ]))
+        .expect("named task owner parses");
+        assert_eq!(task.selector_value().as_deref(), Some("project:alpha"));
+
+        let memory = parse_bound_input(&args(&[
+            "memory-get",
+            "--memory",
+            "memory-a",
+            "--scope",
+            "project:alpha",
+        ]))
+        .expect("secondary memory scope parses");
+        assert_eq!(memory.selector_value().as_deref(), Some("memory-a"));
+        assert_eq!(memory.fields["scope"], "project:alpha");
     }
 
     #[test]
