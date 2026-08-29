@@ -1,6 +1,6 @@
 //! Adversarial transport-error coverage for the durable submission boundary.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use control_client::{ClientError, SubmissionClient};
 use dxbot_core::types::{
