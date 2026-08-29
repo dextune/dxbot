@@ -15,9 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::fs::PermissionsExt;
 
 use dxbot_core::receipt::ReceiptRecord;
-use dxbot_core::types::{
-    CommandId, OperationId, OperationResult, RequestDigest,
-};
+use dxbot_core::types::{CommandId, OperationId, OperationResult, RequestDigest};
 use serde::{Deserialize, Serialize};
 
 use crate::delegation::{DelegationRecord, DelegationStatus};
@@ -25,10 +23,10 @@ use crate::membership::MembershipRecord;
 use crate::mutation::AppError;
 use crate::state::{
     BotState, ChannelState, ConversationState, DomainState, IdempotencyBindingState, MemoryState,
-    MessageState, ProjectState, SideEffectState, TaskState, ThreadState,
+    MessageState, ProcessState, ProjectState, SideEffectState, TaskState, ThreadState,
 };
 
-const SNAPSHOT_VERSION: u32 = 2;
+const SNAPSHOT_VERSION: u32 = 3;
 const OWNER_DIRECTORY_MODE: u32 = 0o700;
 const OWNER_FILE_MODE: u32 = 0o600;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -48,7 +46,7 @@ impl ApplicationStateStore {
             Ok(metadata) => {
                 validate_snapshot_file(&path, &metadata)?;
                 let bytes = fs::read(&path).map_err(io_error)?;
-                let snapshot: SnapshotV2 = serde_json::from_slice(&bytes).map_err(|error| {
+                let snapshot: SnapshotV3 = serde_json::from_slice(&bytes).map_err(|error| {
                     AppError::Internal(format!("application snapshot is corrupt: {error}"))
                 })?;
                 snapshot.into_state()?
@@ -66,7 +64,7 @@ impl ApplicationStateStore {
         fs::create_dir_all(parent).map_err(io_error)?;
         harden_directory(parent)?;
 
-        let bytes = serde_json::to_vec(&SnapshotV2::from_state(state)).map_err(|error| {
+        let bytes = serde_json::to_vec(&SnapshotV3::from_state(state)).map_err(|error| {
             AppError::Internal(format!("cannot serialize application snapshot: {error}"))
         })?;
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -103,13 +101,14 @@ impl ApplicationStateStore {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotV2 {
+struct SnapshotV3 {
     version: u32,
     bots: Vec<BotState>,
     conversations: Vec<ConversationState>,
     messages: Vec<MessageState>,
     threads: Vec<ThreadState>,
     tasks: Vec<TaskState>,
+    processes: Vec<ProcessState>,
     projects: Vec<ProjectState>,
     channels: Vec<ChannelState>,
     memories: Vec<MemoryState>,
@@ -123,7 +122,7 @@ struct SnapshotV2 {
     delegations: Vec<DelegationSnapshot>,
 }
 
-impl SnapshotV2 {
+impl SnapshotV3 {
     fn from_state(state: &DomainState) -> Self {
         let mut bots: Vec<_> = state.bots.values().cloned().collect();
         bots.sort_by(|left, right| left.id.0.cmp(&right.id.0));
@@ -135,6 +134,8 @@ impl SnapshotV2 {
         threads.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         let mut tasks: Vec<_> = state.tasks.values().cloned().collect();
         tasks.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        let mut processes: Vec<_> = state.processes.values().cloned().collect();
+        processes.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         let mut projects: Vec<_> = state.projects.values().cloned().collect();
         projects.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         let mut channels: Vec<_> = state.channels.values().cloned().collect();
@@ -200,6 +201,7 @@ impl SnapshotV2 {
             messages,
             threads,
             tasks,
+            processes,
             projects,
             channels,
             memories,
@@ -236,6 +238,9 @@ impl SnapshotV2 {
         }
         for row in self.tasks {
             state.tasks.insert(row.id.clone(), row);
+        }
+        for row in self.processes {
+            state.processes.insert(row.id.clone(), row);
         }
         for row in self.projects {
             state.projects.insert(row.id.clone(), row);
