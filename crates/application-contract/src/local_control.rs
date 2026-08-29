@@ -9,7 +9,9 @@ use std::fmt;
 use std::io::{Read, Write};
 
 use dxbot_core::DxbotError;
-use dxbot_core::types::{InstanceId, OperationRequest, OperationResult, PrincipalRef};
+use dxbot_core::types::{
+    CommandId, IdempotencyKey, InstanceId, OperationRequest, OperationResult, PrincipalRef,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +41,12 @@ pub struct LocalControlHandshake {
 pub enum LocalControlRequest {
     Hello { hello: LocalControlHello },
     Submit { request: OperationRequest },
+    /// Read-only recovery lookup. The server authenticates the peer and requires
+    /// the key's principal scope to match before exposing any binding.
+    LookupBinding {
+        command_id: CommandId,
+        idempotency_key: IdempotencyKey,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -46,6 +54,7 @@ pub enum LocalControlRequest {
 pub enum LocalControlResponse {
     Handshake { handshake: LocalControlHandshake },
     Operation { result: OperationResult },
+    Binding { result: Option<OperationResult> },
     Error { error: DxbotError },
 }
 
@@ -158,6 +167,23 @@ mod tests {
     fn framed_roundtrip_preserves_hello() {
         let request = LocalControlRequest::Hello {
             hello: LocalControlHello::new(InstanceId("instance-a".to_owned()), 7),
+        };
+        let mut bytes = Vec::new();
+        write_local_control_frame(&mut bytes, &request).expect("frame writes");
+        let decoded: LocalControlRequest =
+            read_local_control_frame(&mut bytes.as_slice()).expect("frame reads");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn framed_roundtrip_preserves_binding_lookup() {
+        let request = LocalControlRequest::LookupBinding {
+            command_id: CommandId("command-a".to_owned()),
+            idempotency_key: IdempotencyKey {
+                principal_ref: PrincipalRef("principal-a".to_owned()),
+                key_digest: "key-a".to_owned(),
+                expires_at: 7,
+            },
         };
         let mut bytes = Vec::new();
         write_local_control_frame(&mut bytes, &request).expect("frame writes");
