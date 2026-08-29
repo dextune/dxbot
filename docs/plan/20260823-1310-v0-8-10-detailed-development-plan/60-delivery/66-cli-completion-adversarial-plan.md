@@ -6,862 +6,452 @@ status: "Accepted"
 normative: false
 priority: "P0"
 last_updated: "2026-08-29"
-depends_on: ["DXB-DEL-060", "DXB-DEL-061", "DXB-IFC-041", "DXB-IFC-042", "DXB-IFC-043", "DXB-RUN-033", "DXB-RUN-035"]
+depends_on: ["DXB-DEL-060", "DXB-DEL-061", "DXB-IFC-041", "DXB-IFC-042", "DXB-IFC-043", "DXB-RUN-032", "DXB-RUN-033", "DXB-RUN-035", "DXB-RUN-038"]
 ---
 # CLI 개발 완료 적대적 종료 플랜
 
-## 1. 목적
+## 1. 목적과 현재 판정
 
-이 문서는 DXBOT v0.8.10의 CLI를 **기능 확장 없이 실제 사용자 관점에서 완료 상태로 수렴**시키기 위한 종료(closeout) 실행 계획이다.
+이 문서는 DXBOT v0.8.10 CLI를 **기능 확장 없이 실제 사용자 관점의 완료 상태로 수렴**시키기 위한 closeout 계획과 실행 기록이다.
 
-현재 CLI의 parser, contract projection, journal, recovery, rendering, selector, confirmation, directive 등 개별 구성요소는 상당 부분 구현되어 있고 기존 Acceptance evidence도 존재한다. 그러나 제품 완료 판정은 component/unit test 통과가 아니라 실제 `dxb` binary가 verified Runtime endpoint를 선택하고, authenticated Control boundary를 통과하며, Application/Runtime owner까지 요청을 전달하고, 실패·재시작·복구 후에도 동일 operation identity를 보존하며, human/machine output 계약을 끝까지 지키는지로 판정한다.
+CLI 완료는 parser/unit/component PASS가 아니라 실제 `dxb` binary가 다음 흐름을 끝까지 만족할 때만 선언한다.
 
-이 문서는 새로운 제품 의미를 정의하지 않는다. 다음 Canonical Owner가 이미 소유하는 계약을 production binary에서 실제로 실행 가능한지 검증하고 미연결 부분을 폐쇄한다.
+`argv → typed input → verified Instance selection → authenticated LocalPrincipal → bounded preflight → canonical owner → durable result/stream → crash/restart recovery → human/machine render`
 
-- CLI surface, local selection, rendering, local journal: [DXB-IFC-041](../40-interfaces/41-cli.md), [DXB-IFC-043](../40-interfaces/43-cli-user-journeys.md)
-- typed input, preflight, command projection: [DXB-IFC-042](../40-interfaces/42-cli-input-contract.md)
-- milestone과 기존 Acceptance registry: [DXB-DEL-060](60-implementation-roadmap.md), [DXB-DEL-061](61-acceptance-traceability.md)
-- recovery semantics: `DXB-RUN-033`
-- Runtime bootstrap/discovery semantics: `DXB-RUN-035`
+2026-08-29 현재 구현 브랜치의 구조 검수 기준선은 `codex/cli-completion-finalize`의 `c6d9b04953d83e422bc7cdafc980d5300ce95efc`이며, 이 문서 갱신 이후 최종 검수에서 다시 head를 고정한다.
 
-`CLI Complete`는 이 문서의 Binary/Journey Gate가 executable evidence로 모두 닫힌 뒤에만 선언한다.
+**현재 판정은 `CLI Complete 아님`이다.** 다수의 production wiring과 correctness blocker는 폐쇄됐지만, 아래 Open Blocker와 executable evidence gate가 남아 있다. 특히 실행 가능한 `fmt/clippy/test/subprocess` 증거 없이 문서 또는 component test 존재만으로 완료를 선언하거나 `main`에 병합하지 않는다.
 
 ## 2. Scope Lock
 
 ### 2.1 허용 범위
 
-이번 closeout에서 허용하는 변경은 다음뿐이다.
+closeout에서 허용하는 변경은 다음과 같다.
 
-1. 기존 63개 P0 command를 실제 binary에서 접근 가능하게 연결한다.
-2. 기존 parser/help/preflight/Control/Host client/renderer/journal/recovery 계약의 미연결 경로를 연결한다.
-3. 기존 owner가 이미 정의한 operation을 실제 Application/Runtime 경계까지 전달한다.
-4. component test를 binary/subprocess/integration/fault evidence로 승격한다.
-5. 중복 parser, 임시 transport, fixture-only persistence가 production path에 남아 있으면 제거하거나 test-only로 격리한다.
-6. 실행 가능성을 위해 필요한 최소 dependency wiring과 private adapter를 추가한다.
-7. 발견된 contract violation, false-success, identity drift, output contamination, recovery ambiguity를 수정한다.
-8. branch/provenance가 실제 제품 상태를 오판하게 만드는 stale execution branch를 정리한다.
+1. frozen 63개 P0 command의 기존 의미를 production binary에서 실행 가능하게 연결한다.
+2. parser/help/preflight/Control/Host client/renderer/journal/recovery의 미연결 경로를 폐쇄한다.
+3. 기존 Canonical Owner가 정의한 operation을 Application/Runtime/Security/Provider owner까지 전달한다.
+4. false-success, identity drift, silent option ignore, output contamination, recovery ambiguity, stale CAS bypass를 수정한다.
+5. component evidence를 boundary/binary/journey/fault evidence로 승격한다.
+6. 기존 owner 계약을 실행 가능하게 만드는 최소 private adapter, persistence, dependency wiring을 추가한다.
+7. 발견된 코드↔문서 불일치를 같은 change set에서 갱신한다.
 
 ### 2.2 금지 범위
 
-다음은 CLI 완료 작업에 포함하지 않는다.
+다음은 closeout에서 새 의미로 만들지 않는다.
 
-- 신규 CLI command 또는 command group
-- 63-operation registry 외 신규 public operation
-- wizard, shell completion subsystem, TUI/Web UI
-- generic RPC/IDL/workflow framework 도입
-- Plugin management CLI
-- hidden current Bot/Project 같은 암묵 authority context
-- Runtime 자동 시작 확대
-- stale CAS 자동 mutation retry
-- 새로운 Provider 제품 추가
-- CLI가 Domain state, Authority, Receipt lifecycle을 소유하도록 하는 변경
-- 검증용/일회성 branch의 코드를 “ahead commit이 있다”는 이유만으로 `main`에 병합
-- binary evidence 없이 문서 또는 component PASS만으로 `CLI Complete`를 선언
+- 신규 public CLI command/group
+- frozen 63-operation registry 밖의 신규 public operation
+- generic RPC/IDL/workflow platform
+- CLI-owned Domain/Authority/Receipt/Provider state
+- BotId를 `PrincipalRef`로 승격하는 권한 편법
+- stale CAS 자동 retry
+- Provider 제품 신규 추가
+- 승인 정책을 CLI가 임의로 정의하거나 고위험 operation을 임의 분류
+- binary evidence 없이 `CLI Complete` 선언
+- validation/diagnostic branch를 제품 변경으로 무차별 merge
 
-기존 frozen operation을 실행 가능하게 만들기 위해 downstream owner 내부 구현이 부족한 경우 이는 신규 기능 추가가 아니라 **기존 contract의 executable closure**로 분류한다. 반대로 operation 의미 자체가 바뀌어야 한다면 구현을 중단하고 plan/ADR 재검토를 먼저 수행한다.
+기존 operation의 downstream owner 구현 부족이 단순 wiring이 아니라 **operation 의미·정책 생성 규칙을 새로 정의해야 하는 문제**라면 closeout 구현으로 추측하지 않고 Canonical Owner blocker로 남긴다.
 
-## 3. Baseline과 Repository Branch Audit
+## 3. Canonical Owner Lock
 
-### 3.1 코드 분석 baseline
-
-최초 closeout 분석의 코드 기준은 `d537e5273c7b1468f5c3606b65b8e1847737eabe` (`feat(runtime): implement grok adoption A1-A4`)다. 이후 finding은 항상 작업 시작 시점의 최신 `main`에서 다시 확인한다.
-
-### 3.2 2026-08-29 branch audit baseline
-
-branch audit는 `18abe4948ddde29dd31ca1f4e544fb5915604e91` (`docs: add CLI completion adversarial closeout plan`)을 기준으로 수행했다. 당시 `main` 외 원격 branch는 10개였다.
-
-| Branch | Audit 판정 | 처리 원칙 |
+| 의미 | Canonical Owner | CLI closeout 원칙 |
 |---|---|---|
-| `adversarial-review-converged` | `main`의 조상 | merged branch로 정리 대상 |
-| `adversarial-review-finalize` | `main`의 조상, PR #4 convergence commit | merged branch로 정리 대상 |
-| `develop/m1a-storage-proof` | `main`의 조상 | merged branch로 정리 대상 |
-| `docs/agents-md-review` | `main`의 조상 | merged branch로 정리 대상 |
-| `docs/grok-adoption-plan-staging` | PR #5로 병합됨 | merged branch로 정리 대상 |
-| `docs/v0-2-plan-review` | `main`의 조상 | merged branch로 정리 대상 |
-| `adversarial-review-final` | history상 diverged, 해당 membership/control-client 변경은 이후 convergence commit에서 수렴 | 직접 merge 금지, superseded branch로 정리 대상 |
-| `adversarial-review-validation` | PR #3 validation-only, 이후 PR #4 convergence가 제품 경로 소유 | 직접 merge 금지, superseded validation branch로 정리 대상 |
-| `automation/v0-8-five-pass-import` | `.dxbot-import/*` + one-shot import workflow 전용 | 제품 branch가 아님, 직접 merge 금지 |
-| `ci/m1a-validation-b0185d4` | runner availability 진단용, PR #2가 명시적으로 `Do not merge` | 직접 merge 금지 |
+| command inventory, typed input, wait/output contract | `DXB-IFC-041`, `DXB-IFC-042` + `application-contract` registry | 두 번째 command registry 금지 |
+| user journey / failure UX | `DXB-IFC-043` | machine stdout, typed next action 보존 |
+| Domain mutation/query/receipt binding | `application` | CLI state 복제 금지 |
+| LocalPrincipal/Authority/Approval | `runtime-security`, `DXB-RUN-032` | BotId ≠ Principal, deny unknown |
+| crash/replay identity | `DXB-RUN-033`, Application binding, CLI durable journal | blind replay 금지 |
+| Instance/bootstrap/discovery | `runtime-bootstrap`, Runtime Host, `DXB-RUN-035` | CLI가 Instance/Principal fabricating 금지 |
+| Provider registration/readiness | `provider-host` | readiness 판단을 CLI에 복제하지 않음 |
+| Process durable state | `application`, `DXB-RUN-038` | CLI show/watch projection만 소유 |
+| safe local export | CLI `SafeWriter` | no-follow/no-replace/bounded |
 
-위 audit에서 **현재 `main`에 추가 병합해야 할 제품 변경 branch는 0개**로 판정했다. Git commit ancestry의 `ahead_by` 값과 제품 의미의 미병합 여부를 동일시하지 않는다. squash/convergence, one-shot staging, validation-only branch는 content/provenance를 확인한 뒤 판정한다.
+## 4. Completion Level
 
-### 3.3 Branch audit invariant
-
-CLI closeout 중 branch 상태는 다음을 만족해야 한다.
-
-- 실제 제품 변경이 `main`보다 앞선 branch는 반드시 owner/Acceptance 영향과 함께 분류한다.
-- validation/import/runner diagnostic branch는 product code source로 병합하지 않는다.
-- superseded branch의 과거 commit을 다시 병합해 convergence fix를 되돌리지 않는다.
-- 동일 의미가 다른 history로 존재하면 tree/content와 최신 Canonical Owner를 기준으로 판단한다.
-- `CLI Complete` 직전 `unclassified_ahead_branches = 0`이어야 한다.
-
-## 4. Blocking Findings
-
-### BF-CLI-001 — production entrypoint의 미연결 command
-
-현재 `crates/cli/src/main.rs`는 다수 command를 `not_wired()`로 종료한다. 일부 first-use command도 payload projection 성공 후 실제 authenticated Runtime submission 대신 `RuntimeUnavailable`로 끝난다.
-
-**위험:** component projection test가 PASS여도 사용자는 실제 operation을 만들 수 없다.
-
-**종료 조건:** production binary path의 `not_wired()` 호출 0개. 지원하지 않는 command가 있다면 registry/owner contract와 함께 해결하며 false-success 또는 silent omission을 허용하지 않는다.
-
-### BF-CLI-002 — hardcoded Instance/Principal
-
-production entrypoint가 실제 discovery 결과 대신 기본 `InstanceId`/`PrincipalRef`를 직접 구성하면 multi-instance 선택, transport authentication, journal identity와 충돌한다.
-
-**종료 조건:** selected Instance는 `DXB-RUN-035` precedence를 통과한 verified descriptor에서 나오고 authenticated Principal은 trusted local transport boundary에서만 유도한다. payload의 principal은 consistency binding일 뿐 authentication evidence가 아니다.
-
-### BF-CLI-003 — Control transport 부재
-
-`SubmissionClient`는 submission/replay identity와 fail-closed transport semantics를 갖지만 production CLI가 verified local Control endpoint에 연결되는 concrete path가 없다.
-
-**종료 조건:** 실제 `dxb` subprocess가 authenticated local Control boundary를 통해 request/result 왕복을 수행한다. 새 generic RPC platform은 만들지 않는다.
-
-### BF-CLI-004 — durable CLI journal과 submission fixture 분리
-
-CLI에는 file-backed `LocalJournal`이 있으나 `control-client`의 `JournalStore`는 in-memory fixture다. production submission이 fixture store만 사용하면 process restart recovery와 local durable journal이 하나의 실행 경로로 연결되지 않는다.
-
-**종료 조건:** production submission은 CLI가 소유한 durable journal semantics를 사용하고, in-memory store는 test fixture로만 남는다. 동일 state를 두 owner에 dual-write하지 않는다.
-
-### BF-CLI-005 — command registry와 binary dispatch drift
-
-63개 command registry는 `application-contract`에 존재하지만 binary entrypoint에 별도의 수작업 group/subcommand dispatch와 help 문자열이 존재한다.
-
-**종료 조건:** command 존재 여부, typed input, wait/security/output metadata의 canonical source는 기존 registry다. CLI path resolution에 필요한 view는 해당 metadata에서 파생하며 두 번째 semantic registry를 만들지 않는다.
-
-### BF-CLI-006 — downstream Owner 실행 coverage 부족
-
-CLI가 payload를 만들 수 있어도 downstream owner가 해당 command를 실제 처리하지 않으면 binary는 완료되지 않는다.
-
-**종료 조건:** 63개 command 각각에 대해 `Path → Parse → Select → Preflight → Dispatch → Owner → Result/Stream → Recovery → Render`의 적용 가능 경로가 존재한다.
-
-### BF-CLI-007 — 기존 PASS evidence와 product completion의 수준 차이
-
-기존 Acceptance `Passed`는 유지한다. 다만 component/projection evidence를 실제 CLI product completion과 동일시하지 않는다.
-
-**종료 조건:** 아래 Completion Level의 L4 Binary와 L5 Journey evidence를 별도로 기록한다.
-
-### BF-CLI-008 — parser-side identity helper의 production 오용 위험
-
-`application-contract::CliInput`에는 local option에서 `InstanceId`와 `PrincipalRef`를 구성하는 convenience helper가 존재한다. profile은 Instance identity가 아니고 client-supplied principal은 authentication evidence가 아니다.
-
-**종료 조건:** production Instance는 verified discovery에서, authenticated Principal은 trusted transport에서만 온다. convenience helper가 test/projection 용도라면 production orchestration에서 호출하지 않는다.
-
-### BF-CLI-009 — version/compatibility representation drift
-
-CLI discovery와 control-client가 protocol/schema version을 서로 다른 문자열 형태로 소유하면 local version 출력과 remote compatibility 판정이 어긋날 수 있다.
-
-**종료 조건:** version/protocol/schema compatibility의 Canonical Owner를 하나로 유지하고 CLI/Control client가 동일 representation/source를 사용한다.
-
-### BF-CLI-010 — global option parsing과 실제 동작 분리
-
-production entrypoint가 `--profile`, `--instance`, `--color`, `--wait`, `--timeout` 값을 소비만 하고 execution/selection/rendering에 적용하지 않으면 사용자는 option이 적용됐다고 오판한다.
-
-**종료 조건:** 등록된 global option은 계약대로 실제 동작하거나, 미구현 상태라면 성공처럼 무시하지 않고 fail closed한다.
-
-### BF-CLI-011 — group/command help의 binary 계약 미폐쇄
-
-계약은 `dxb <group> --help`, `dxb <command> --help`가 Runtime 없이 exit 0이어야 한다.
-
-**종료 조건:** top/group/command help가 canonical metadata에서 생성되고 Runtime 접근 없이 exit 0을 반환한다.
-
-### BF-CLI-012 — stale/diverged branch가 completion 상태를 왜곡할 위험
-
-Git history상 `ahead_by > 0`인 branch라도 product code가 미병합됐다는 뜻은 아니다. convergence/squash branch, validation-only branch, import staging, CI diagnostic을 무차별 병합하면 최신 owner fix를 되돌리거나 임시 artifact를 제품 history에 넣을 수 있다.
-
-**종료 조건:** 모든 non-main branch는 `merged | superseded | temporary-diagnostic | active-product-work` 중 하나로 분류한다. `active-product-work`만 merge 후보이며, merge 전 최신 `main` 기준 code/docs/test 관계를 재검수한다. CLI Complete 직전 미분류 branch는 0개다.
-
-## 5. Completion Level
-
-| Level | 의미 | 대표 evidence | CLI Complete 판정 |
+| Level | 의미 | 대표 evidence | 완료 판정 |
 |---|---|---|---|
-| L0 Contract | registry/schema/document 관계 일치 | validator/golden | 불충분 |
-| L1 Projection | `CliInput → CommandPayload` 정확 | unit/component | 불충분 |
-| L2 Component | selector/journal/recovery/renderer 개별 invariant | crate tests | 불충분 |
-| L3 Boundary | verified endpoint/authenticated Control/Host 경계 왕복 | integration | 불충분 |
-| L4 Binary | 실제 build된 `dxb` subprocess가 명령 실행 | subprocess tests | 필수 |
-| L5 Journey | 정상·실패·복구 사용자 여정을 binary로 종료 | E2E/fault | **최종 완료 조건** |
+| L0 Contract | registry/schema/docs 정합 | validator/golden | 불충분 |
+| L1 Projection | `CliInput → CommandPayload` 정확 | unit | 불충분 |
+| L2 Component | selector/journal/security/persistence/renderer invariant | crate tests | 불충분 |
+| L3 Boundary | authenticated Control/Host/owner 왕복 | integration | 불충분 |
+| L4 Binary | 실제 build된 `dxb` subprocess | subprocess | **필수** |
+| L5 Journey | 정상·실패·재시작·복구 여정 | E2E/fault | **최종 필수** |
 
-기존 `DXB-DEL-061` 상태를 소급 변경하지 않는다. 이 문서는 CLI 제품 완료에 필요한 추가 종료 Gate를 소유한다.
+기존 `DXB-DEL-061`의 component Acceptance 결과는 소급 무효화하지 않는다. 단, 그 PASS를 L4/L5 완료 증거로 승격해서 해석하지 않는다.
 
-## 6. Canonical Execution Spine
+## 5. Adversarial Findings Ledger
+
+상태는 `Resolved | Partial | Open Blocker | Evidence Pending`만 사용한다.
+
+| ID | Finding | 상태 | 폐쇄/잔여 조건 |
+|---|---|---|---|
+| BF-CLI-001 | production binary command dispatch 미연결 | Resolved | registry-driven C/Q/H/S dispatch와 help path 연결 |
+| BF-CLI-002 | parser-side Instance/Principal을 production authority로 오용 | Resolved | verified discovery + transport-derived LocalPrincipal로 override |
+| BF-CLI-003 | concrete authenticated Control transport 부재 | Resolved | owner-only Unix socket, handshake, peer UID, generation fence 연결 |
+| BF-CLI-004 | durable CLI journal과 production submit/recovery 분리 | Resolved | production submission이 durable local journal과 binding lookup recovery 사용 |
+| BF-CLI-005 | registry와 binary dispatch/help drift | Resolved | 63-row registry에서 path/typed/wait/help metadata 파생 |
+| BF-CLI-006 | downstream owner coverage 부족 | Partial | 다수 owner 연결 완료, Approval policy continuation/Process producer/bootstrap defaults는 아래 blocker |
+| BF-CLI-007 | component PASS를 product completion으로 오판 | Resolved by gate | L4/L5 별도 증거 필수화 |
+| BF-CLI-008 | parser identity helper production 오용 | Resolved | `ExecutionContext`가 trusted identity를 덮어씀 |
+| BF-CLI-009 | protocol/schema version drift | Resolved | `LOCAL_CONTROL_*` 단일 source, 새 watch/host-stop wire는 schema `v2` |
+| BF-CLI-010 | global/local option이 parse만 되고 무시 | Partial | `--all/--output/--color/--wait/--timeout` production 적용, 세부 command-local 필드 잔여 검수 필요 |
+| BF-CLI-011 | group/command help Runtime 의존 | Resolved | registry 기반 offline help exit 0 |
+| BF-CLI-012 | stale/diverged branch completion 왜곡 | Evidence Pending | final branch audit에서 unclassified ahead branch 0 확인 |
+| BF-CLI-013 | `@local` field가 wire/RequestDigest로 누출 | Resolved | shared typed-field DSL parser로 wire projection에서 제거 |
+| BF-CLI-014 | `runtime stop`이 receipt만 성공하고 실제 host는 계속 실행 | Resolved | graceful commit 후 server shutdown; host-stop은 generation fenced |
+| BF-CLI-015 | Approval/Authority state가 in-memory라 restart 후 소실 | Resolved | durable `SecurityStateStore` + Runtime Host composition |
+| BF-CLI-016 | Membership row와 AuthorityBinding이 원자적이지 않고 BotId를 Principal로 오용할 위험 | Resolved | membership-subject binding, durable coordination marker, Bot/Principal 분리 |
+| BF-CLI-017 | Membership remove/re-add generation ABA | Resolved | inactive tombstone, App/Security generation 1→2→3, stale generation 거부 |
+| BF-CLI-018 | thread/task/memory/operation CAS가 preflight와 commit에서 불일치 | Resolved | source/scope/target-scope/receipt CAS 실제 commit 검증 + server materialized-CAS gate |
+| BF-CLI-019 | custom client가 preflight를 건너뛰어 필수 CAS 생략 가능 | Resolved | ControlServer가 `validate_materialized_cas` 재검증 |
+| BF-CLI-020 | exact retry가 changed RequestDigest/payload를 기존 commit으로 오인 | Resolved/Recovery recheck | normal request는 exact identity 재대조; crash-marker recovery도 동일 검증으로 최종 고정 필요 |
+| BF-CLI-021 | S stream이 buffered output 또는 비단조 cursor 사용 | Resolved | process entrypoint 직접 flush, fixed-width opaque revision cursor, explicit gap/resync |
+| BF-CLI-022 | machine JSON/JSONL에 ANSI/progress 오염 가능 | Resolved | color는 human only, machine stdout schema payload only |
+| BF-CLI-023 | parser가 named option 값을 positional로 재처리하고 primary/secondary selector를 혼동 | Resolved | argv cursor 단일 소비 + shared typed-field primary-selector metadata |
+| BF-CLI-024 | Provider 미구성인데 `bot activate`/`task submit` false-success | Resolved | Control owner에서 Ready `llm-chat` admission fail-closed |
+| BF-CLI-025 | failure가 machine-actionable next action을 제공하지 않음 | Resolved/Partial | 공통 renderer가 Runtime/Provider/Recovery/Incompatible/Partial action 보강; owner-specific action 계속 우선 |
+| BF-CLI-026 | Runtime bootstrap이 `DXB-RUN-035`의 default policy generations/owner binding/DataSchemaVersion을 원자적으로 만들지 않음 | **Open Blocker** | Runtime/bootstrap Canonical Owner 구현 필요 |
+| BF-CLI-027 | Approval decision 이후 원 high-risk operation 재평가/continuation owner 부재 | **Open Blocker** | policy owner가 pending operation 생성·park·re-evaluate를 소유해야 함 |
+| BF-CLI-028 | Process show/watch는 있으나 production Process 생성/transition owner가 없음 | **Open Blocker** | `DXB-RUN-038` owner가 실제 Process aggregate를 생성/갱신해야 함 |
+| BF-CLI-029 | frozen semantic field 일부가 canonical state/policy owner와 연결되지 않음 | **Open Blocker** | §8 semantic field audit 참조 |
+| BF-CLI-030 | `Cargo.lock`이 현재 crate dependency와 동기화되지 않음 | **Evidence Pending** | Cargo로 lockfile regenerate 후 diff 검증 |
+| BF-CLI-031 | 실행 가능한 Rust quality/binary evidence 미확보 | **Evidence Pending** | fmt/clippy/test/subprocess/fault 실제 PASS 필요 |
+
+## 6. 구현 폐쇄 상태
+
+### 6.1 Input / Contract
+
+완료된 항목:
+
+- user-facing command path와 63 command metadata를 frozen registry에서 파생한다.
+- command typed-field DSL parser를 공유해 invocation/primary-selector/wire-local stripping이 동일 source를 사용한다.
+- named value는 정확히 한 번 소비한다.
+- primary selector와 secondary selector-typed field를 구분한다.
+- `True`, `Bool`, `PageSize`, numeric primitive와 duplicate/unknown field를 Runtime 접속 전에 fail closed한다.
+- `@local`은 `CliInput`에만 존재하고 `CommandPayload.semantic_options`, `RequestDigest`, server-owned state에 들어가지 않는다.
+- mutation 필수 CAS는 ControlServer에서도 재검증한다.
+
+### 6.2 Discovery / Authentication / Transport
+
+완료된 항목:
+
+- production Instance는 verified discovery 결과에서만 선택한다.
+- authenticated Principal은 Unix peer credential과 Instance로 server-side derivation한다.
+- client-supplied Principal은 consistency binding일 뿐 authority evidence가 아니다.
+- socket type/owner/mode, InstanceId, HostGeneration, protocol/schema를 handshake에서 검증한다.
+- local control frame은 bounded size를 가진다.
+- watch/host-stop wire 추가에 맞춰 schema version을 `v2`로 갱신했다.
+
+현재 portability 제한:
+
+- safe peer credential 구현은 Linux/Android 경로가 production-ready이며 다른 Unix target은 현재 fail-closed `Unsupported`다. 지원 플랫폼 범위가 확대되기 전에는 silent downgrade하지 않는다.
+
+### 6.3 Submission / Identity / Recovery
+
+완료된 항목:
+
+- `Prepared → Dispatching → Observed/Terminal` durable journal 경계를 production submission에 연결했다.
+- CommandId/OperationId/IdempotencyKey/RequestDigest/InstanceId를 replay identity로 보존한다.
+- binding lookup을 통해 crash ambiguity를 수렴한다.
+- normal exact retry는 기존 result의 operation/instance/receipt/request digest를 다시 검증한다.
+- unknown/partial binding을 성공으로 재구성하지 않는다.
+- local timeout/SIGINT/broken pipe는 관측 종료일 뿐 Runtime operation cancel 의미가 아니다.
+
+최종 검수 잔여:
+
+- cross-owner Security recovery marker의 committed binding 판정도 normal exact-retry validator와 동일 검증을 사용해야 한다.
+
+### 6.4 Application / Security Cross-Owner UoW
+
+완료된 항목:
+
+- Application membership row와 Security membership-subject AuthorityBinding을 별도 Canonical Owner에 유지한다.
+- BotId를 PrincipalRef로 변환하지 않는다.
+- `prepare marker → Application durable commit → Security durable publish → marker clear` 순서로 crash window를 폐쇄한다.
+- restart 시 marker를 읽고 Application binding 존재 여부에 따라 Security delta apply/discard를 결정한다.
+- membership remove는 row를 삭제하지 않고 inactive generation tombstone을 남긴다.
+- Security revocation도 generation을 한 번 증가시키며 동일 delta replay는 idempotent하다.
+- Approval record는 pending OperationId + action + target + policy generation + revision을 보유한다.
+- Approval decision은 revision CAS, approver 검증, durable wakeup, durable AuditIntent를 가진다.
+
+### 6.5 Provider Admission
+
+완료된 항목:
+
+- Provider query는 `provider-host`의 동일 registration state를 읽는다.
+- default unconfigured Runtime에서 `bot activate`와 `task submit`은 `ProviderUnavailable`로 fail closed한다.
+- explicit Ready `llm-chat` Provider가 있을 때만 admission을 통과한다.
+- exact retry는 admission보다 먼저 canonical committed result를 반환하므로 Provider 장애가 과거 commit 의미를 변경하지 않는다.
+
+남은 owner 문제:
+
+- `DXB-RUN-035`가 요구하는 default Provider policy generation과 실제 provider configuration projection은 bootstrap/config Canonical Owner에서 닫혀야 한다.
+
+### 6.6 Query / Pagination / Export
+
+완료된 항목:
+
+- server page size는 bounded이며 oversized 값을 clamp하지 않고 거부한다.
+- `--all`은 page/item/byte ceiling과 cursor progress invariant를 가진다.
+- partial ceiling 도달은 resume cursor를 포함한 partial/resync error로 종료한다.
+- `--output`은 `SafeWriter`의 no-follow/no-replace/fsync publication만 사용한다.
+- inactive Membership tombstone은 list projection에서 숨기되 preflight CAS에는 보존한다.
+
+### 6.7 Stream
+
+완료된 항목:
+
+- S-kind command는 production `run_process`에서 output 전체를 메모리에 모으지 않고 event마다 write+flush한다.
+- `--format json`은 unbounded stream에 허용하지 않고 `human|jsonl`만 허용한다.
+- Task/Process watch cursor는 canonical revision 기반 fixed-width opaque token이다.
+- legacy decimal cursor는 입력 호환을 유지한다.
+- cursor gap은 explicit resync 오류이며 silent event loss를 성공으로 보지 않는다.
+- restart 후 watcher state가 없어도 canonical Task/Process revision에서 resync할 수 있다.
+
+`application::subscription`의 retained in-memory registry는 기존 component acceptance fixture/API이며 production CLI watch continuity의 Canonical Owner로 사용하지 않는다. production continuity를 위해 별도 subscriber state를 이 fixture와 이중 저장하지 않는다.
+
+### 6.8 Runtime Stop
+
+완료된 항목:
+
+- graceful stop은 Application commit receipt를 만든 뒤 Runtime Host serve loop에 shutdown을 반영한다.
+- host-stop은 authenticated endpoint owner와 exact HostGeneration을 요구한다.
+- response loss가 발생하더라도 committed graceful shutdown 의도를 되돌리지 않는다.
+
+## 7. Frozen 63 Command Route Matrix
+
+`route`는 production dispatcher가 command를 어디로 보내는지를 뜻한다. `owner-blocked`는 public command가 없다는 뜻이 아니라 downstream Canonical Owner의 실제 제품 의미가 아직 완결되지 않았다는 뜻이다.
+
+### 7.1 Host / Host-Query
+
+| Command | Kind | Route | 상태 |
+|---|---:|---|---|
+| runtime-start | H | Runtime Host bootstrap/spawn | Partial — BF-CLI-026 |
+| runtime-status | H/Q | discovery + authenticated handshake | Wired |
+| runtime-stop-graceful | C | Control→Application→Host shutdown | Wired |
+| runtime-stop-host | H | LocalControl HostGeneration action | Wired |
+| runtime-doctor | H/Q | discovery/control/provider diagnostic | Partial — section/page semantics 재검수 |
+| version | Q | offline contract constants | Wired |
+
+### 7.2 Bot / Conversation / Thread
+
+| Command family | Route | 상태 |
+|---|---|---|
+| bot create/list/show | Application C/Q | Wired; bot policy-default semantics는 BF-CLI-026/029 |
+| bot activate/deactivate/archive/restore | Control admission + Application | Wired; activate Provider fail-closed |
+| conversation show/send/history | Application | Wired |
+| thread create/list/show/send/history/branch | Application | Wired; source/conversation revision CAS enforced |
+
+### 7.3 Task / Process
+
+| Command family | Route | 상태 |
+|---|---|---|
+| task submit | Control Provider admission→Application | Partial — optional delegation/deadline/budget owner semantics BF-CLI-029 |
+| task list/show/result | Application Q | Partial — artifact-specific result semantics BF-CLI-029 |
+| task watch | Control S→Application canonical revision watch | Wired |
+| task cancel/suspend/resume/redirect | Application C | Partial — reason/supervision semantics BF-CLI-029 |
+| process show | Application Q | Owner-blocked producer — BF-CLI-028 |
+| process watch | Control S→Application | Owner-blocked producer — BF-CLI-028 |
+
+### 7.4 Project / Channel / Membership
+
+| Command family | Route | 상태 |
+|---|---|---|
+| project create/list/show/archive/restore | Application, create additionally Security UoW | Wired |
+| project member list/set/remove | Application + Security UoW | Wired, generation tombstone enforced |
+| channel create/list/show/history/send | Application | Wired |
+| channel member list/set/remove | Application + Security UoW | Wired, generation tombstone enforced |
+
+### 7.5 Memory / Approval / Provider / Recovery
+
+| Command family | Route | 상태 |
+|---|---|---|
+| memory get/search/history/propose | Application | Partial — optional scope semantics BF-CLI-029 |
+| memory promote | Application | Partial — target-scope CAS wired, declassification semantics BF-CLI-029 |
+| approval list/show | Security Q | Wired |
+| approval approve/deny | Application operation binding + Security durable delta | Partial — decision durable, original operation continuation BF-CLI-027 |
+| provider list/show | Provider Host Q | Wired |
+| operation show/reconcile | Application Q/C | Wired, receipt revision CAS enforced |
+| side-effect reconcile | Application C | Partial — operation-selector linkage owner data BF-CLI-029 |
+
+## 8. Semantic Field Audit — Silent Ignore 금지
+
+다음 frozen field는 parser가 허용하지만 현재 제품 owner 의미가 완전하지 않다. 이 표의 항목은 **성공처럼 무시된 채 CLI Complete가 될 수 없다.** owner 구현을 연결하거나 해당 operation이 그 의미를 이미 다른 canonical state에서 충족한다는 executable evidence가 필요하다.
+
+| Command / field | 현재 상태 | 필요한 Canonical closure |
+|---|---|---|
+| bot-create `brain_policy`, `permission_policy`, `resource_policy`, `provider_policy` | parsed/wire, Domain BotState 미보유 | `DXB-RUN-035` default policy generations 및 Bot policy binding owner |
+| task-submit `delegate_to_bot`, `requested_sender_bot` | parsed/wire, Task aggregate 미반영 | delegation/authority/sender policy owner |
+| task-submit `deadline`, `budget` | parsed/wire, TaskState 미반영 | Task execution aggregate budget/deadline semantics |
+| task-cancel/suspend `reason` | parsed/wire, durable directive reason 미보유 | supervision/directive audit semantics |
+| task-result `artifact_id` | parsed/wire, result projection 미선택 | result/artifact canonical reference owner |
+| memory-get optional `scope` | parsed/wire | memory selector scope disambiguation/validation |
+| memory-promote `declassification_ref` | parsed/wire | information-label/declassification owner |
+| approval-deny `reason` | parsed/wire | durable approval decision/audit reason semantics |
+| runtime-doctor `section`, `page_size`, `cursor` | parsed local/query | diagnostic section/page contract 완결 |
+| side-effect selector by Operation | parser 계약 존재, state linkage 부족 | SideEffect aggregate의 Operation linkage/lookup owner |
+
+이 표를 해결하지 않고 단순히 field를 wire에서 제거하거나 성공으로 무시하는 것은 금지한다.
+
+## 9. Open Canonical-Owner Blockers
+
+### 9.1 Runtime bootstrap defaults — BF-CLI-026
+
+`DXB-RUN-035` first-init atomicity는 최소한 다음을 요구한다.
+
+- new persistent `InstanceId`
+- initial `HostGeneration`
+- LocalPrincipal / owner AuthorityBinding
+- default Brain/Permission/Resource/Provider policy generations
+- DataSchemaVersion
+- publish-before-bind 금지 및 restart continuity
+
+현재 Runtime bootstrap은 Instance/Host/discovery 중심으로 연결되어 있으나 위 default policy/security/data-version package 전체를 생성하지 않는다. CLI가 자체 default policy를 발명하면 Owner 중복이므로 Runtime/bootstrap owner에서 먼저 닫아야 한다.
+
+### 9.2 Approval parking / continuation — BF-CLI-027
+
+Approval record/decision/persistence/wakeup은 연결됐지만, full journey는 다음을 추가로 요구한다.
+
+1. high-risk operation owner가 policy 평가로 pending Approval을 생성한다.
+2. 원 operation을 park하고 operation identity를 유지한다.
+3. approval Approved 후 wakeup이 원 operation 재평가를 트리거한다.
+4. 재평가 시 stale CAS이면 승인됐더라도 mutation은 실패해야 한다.
+
+CLI가 어떤 operation이 high-risk인지 새 규칙을 만들 수 없으므로 Security/Control/Application policy owner closure가 필요하다.
+
+### 9.3 Process producer — BF-CLI-028
+
+Process durable projection/show/watch는 존재하지만 실제 production Process 생성·transition producer가 없다. CLI에 새 Process create command를 추가하는 것은 금지 범위다. `DXB-RUN-038`의 internal process owner가 aggregate를 생성하고 lifecycle/revision을 갱신해야 show/watch journey가 실제로 성립한다.
+
+## 10. Execution Closeout Stages
+
+| Stage | Gate | 종료 조건 |
+|---|---|---|
+| C0 | Repository/branch audit | active product branch와 superseded/diagnostic branch 구분 |
+| C1 | Parser/contract | 63 path, primary/secondary selector, typed field, local/wire split 검증 |
+| C2 | Identity | verified Instance + authenticated Principal only |
+| C3 | Dispatch | H/HQ/C/Q/S 모두 owner route 존재, false-success 없음 |
+| C4 | Preflight/CAS | mutable path materialized CAS를 server에서도 검증 |
+| C5 | Owner coverage | 63 row 각각 owner 또는 명시적 canonical blocker 분류 |
+| C6 | Persistence/recovery | Application/Security/journal crash windows, exact retry, restart 검증 |
+| C7 | Output | machine stdout clean, stream direct flush, SafeWriter, partial cursor |
+| C8 | Binary/Journey | built `dxb` subprocess로 정상·실패·복구 여정 PASS |
+| C9 | Two reviews | Structural/Consistency + Cross-Layer Executability 각각 완료 |
+
+C0~C7의 코드가 존재해도 C8/C9가 없으면 `CLI Complete`가 아니다.
+
+## 11. Mandatory Binary/Journey Evidence
+
+최소 evidence set은 다음을 포함해야 한다.
+
+1. offline top/group/command help와 version
+2. first Runtime start / already-running / ambiguous Instance / explicit unknown Instance
+3. authenticated peer Principal 및 spoof 거부
+4. bot create/show, provider-unavailable activate, Ready-provider activate
+5. conversation/thread send/history와 CAS conflict
+6. task submit/list/show/watch/control/result의 적용 가능한 owner 경로
+7. `--all` pagination ceiling/resume cursor
+8. safe `--output`, overwrite/symlink 거부
+9. machine JSON/JSONL parseability와 ANSI/stderr contamination 부재
+10. graceful stop/host stop generation fence
+11. process watch restart/resync — Process producer가 존재한 뒤
+12. membership set/remove/re-add crash/restart와 generation 1→2→3
+13. Approval decision restart, wakeup 복원, 원 operation re-evaluate — policy owner closure 뒤
+14. Prepared/Dispatching response-loss recovery, exact retry, changed-digest conflict
+15. corrupt/stale discovery/security/application/journal/coordination state fail-closed
+
+## 12. Quality Gate
+
+최종 head에서 아래를 모두 실제 실행해야 한다.
 
 ```text
-argv/stdin/file/artifact
-        ↓
-CLI path resolution
-        ↓
-CliInput
-        ↓
-verified Instance selection
-        ↓
-bounded preflight / canonical target + CAS materialization
-        ↓
-CommandPayload
-        ↓
-CommandId + OperationId + IdempotencyKey + RequestDigest
-        ↓
-durable Prepared
-        ↓
-durable Dispatching
-        ↓
-authenticated Control/Host/Query/Stream boundary
-        ↓
-Application / Runtime / Provider owner
-        ↓
-Receipt / Result / Stream event
-        ↓
-Observed / Terminal 또는 recovery-required
-        ↓
-human | json | jsonl renderer
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 ```
 
-금지되는 우회:
+추가로 built `dxb` binary/subprocess journey와 fault/restart evidence를 수행한다.
 
-```text
-CLI → direct Domain mutation
-CLI → fabricated success payload
-CLI → unverified endpoint
-CLI → client-supplied principal을 authentication으로 신뢰
-CLI → in-memory-only production journal
-CLI → provider-specific branch
-CLI → stale validation branch를 product source로 재병합
-```
+현재 execution 환경에는 `cargo` toolchain이 없고 GitHub network resolution도 사용할 수 없으므로 위 명령의 **실행 PASS 증거는 아직 없다**. 저장소 규칙에 따라 GitHub Actions를 실행해 이를 대체하지 않는다. 이 상태는 BF-CLI-031이며, `main` 병합 금지 조건이다.
 
-## 7. 실행 단계
+`Cargo.lock` 또한 current dependency graph에서 regenerate/검증되어야 한다. lockfile을 checksum/전이 dependency 추측으로 손수 조작해 quality gate를 우회하지 않는다.
 
-### C0 — Evidence/Repository Baseline 확정
+## 13. Recheck 1 — Structural / Consistency Checklist
 
-**목적:** component PASS와 제품 완료를 분리하고 작업 시작점의 branch/provenance를 고정한다.
+첫 번째 재검수는 다음을 독립적으로 검사한다.
 
-#### 작업
+- file/path naming과 module loading
+- crate dependency / Cargo.lock / feature orphan
+- 63-row registry와 parser/help/dispatch의 단일 source
+- Domain/Security/Provider/Runtime Canonical Owner 중복 없음
+- BotId/Principal/Authority 경계
+- Application/Security membership generation과 crash marker 일치
+- protocol/schema version 및 snapshot compatibility
+- local field/wire field/RequestDigest 관계
+- docs/Acceptance/risk가 current implementation과 모순되지 않음
+- test가 production semantic bypass fixture를 사용하지 않음
 
-- CLI 관련 기존 Acceptance를 L0~L5 중 현재 evidence level로 분류한다.
-- 실제 binary subprocess를 실행하지 않는 test는 L4/L5로 승격하지 않는다.
-- 최신 `main` HEAD와 non-main branch를 audit한다.
-- branch는 `merged | superseded | temporary-diagnostic | active-product-work`로 분류한다.
-- `active-product-work`가 있으면 code/docs/test/owner 관계를 검토한 뒤에만 병합한다.
+발견 사항 수정 후 이 checklist를 다시 통과해야 Recheck 1 완료로 기록한다.
 
-#### Gate
+## 14. Recheck 2 — Cross-Layer Executability Checklist
 
-- CLI 관련 Acceptance의 evidence level이 명확하다.
-- unclassified non-main branch = 0.
-- active product branch의 미처리 변경 = 0 또는 명시적 blocker.
+두 번째 재검수는 같은 파일 목록을 읽는 것이 아니라 실제 흐름을 다음 순서로 추적한다.
 
-### C1 — Parser/Help/Registry 단일화
+`Input/Command → Contract → Discovery/Auth → Control → Application/Security → Persistence → Runtime → Provider Host → Recovery → Projection → CLI`
 
-**목적:** 수작업 parser/help와 frozen command registry drift 제거.
+각 흐름에 다음 adversarial condition을 대입한다.
 
-#### 작업
+- Provider none/unavailable/Ready/replaced
+- stale revision/generation/HostGeneration
+- response loss before/after durable commit
+- duplicate delivery / changed digest / changed operation id
+- SIGINT/broken pipe/local timeout
+- process restart / Runtime restart
+- Security/Application half-commit
+- membership remove/re-add ABA
+- cursor gap/reconnect/restart
+- output ceiling/resource pressure
+- corrupted/stale durable state
 
-- 63개 command key와 user-facing path의 exact coverage를 자동 검증한다.
-- `dxb`, group help, command help가 Runtime 없이 동작하는지 검증한다.
-- required/optional/local/source/CAS/wait 정보가 canonical metadata와 일치하게 한다.
-- `main.rs`는 path resolution과 orchestration만 담당하고 command semantics를 다시 소유하지 않는다.
+L4/L5 executable evidence까지 통과해야 Recheck 2를 최종 완료로 기록한다.
 
-#### 적대적 입력
+## 15. Main Merge / Completion Gate
 
-- unknown group/subcommand
-- typo suggestion threshold 경계
-- duplicate option
-- global option 순서 permutation
-- option value 누락
-- `--` 이후 positional
-- content source 복수 지정
-- selector 복수 지정
-- 잘못된 `--wait`, `--format`, `--color`
-- command help에서 Runtime 접근 시도
-- 플랫폼 지원 범위의 pathological argv
+다음 조건을 **모두** 만족하기 전에는 `main`으로 push/merge하지 않는다.
 
-#### Gate
+- [ ] BF-CLI-026 Runtime bootstrap default owner closure
+- [ ] BF-CLI-027 Approval parking/continuation closure
+- [ ] BF-CLI-028 Process production producer closure 또는 release scope의 canonical 재판정
+- [ ] BF-CLI-029 frozen semantic field audit 0 silent-ignore
+- [ ] BF-CLI-030 Cargo.lock regenerate/verified
+- [ ] BF-CLI-031 fmt/clippy/test/binary/journey executable PASS
+- [ ] Recheck 1 완료 + 발견 사항 재확인
+- [ ] Recheck 2 완료 + 발견 사항 재확인
+- [ ] final branch audit: unclassified ahead product branch = 0
+- [ ] final head SHA와 evidence artifact/log를 기록
 
-- registry 63개 중 binary parser 접근 불가 = 0
-- registry에 없는 success path = 0
-- help/runtime dependency = 0
+이 gate가 모두 닫힌 뒤에만 `CLI Complete`를 선언하고 `main`에 반영한다.
 
-### C2 — Instance Selection과 Authenticated Principal 수렴
+## 16. Stop Conditions
 
-**목적:** hardcoded identity와 client-authentication 혼동 제거.
+다음 상황에서는 구현을 임의로 확대하지 않는다.
 
-#### 작업
+1. frozen operation 의미를 바꿔야만 해결되는 경우
+2. 새로운 authority principal mapping을 발명해야 하는 경우
+3. high-risk approval policy를 새로 정의해야 하는 경우
+4. Process public create/control command가 새로 필요하다고 추정되는 경우
+5. Provider 제품을 추가해야 한다고 추정되는 경우
+6. executable validation 없이 release/main merge를 강행해야 하는 경우
 
-- `--instance → profile binding → exactly-one verified endpoint` precedence를 production entrypoint에 연결한다.
-- selected descriptor의 InstanceId/endpoint/host generation을 execution context로 고정한다.
-- authenticated Principal은 local transport가 제공하고 payload binding과 일치 여부만 검사한다.
-- stale descriptor, generation mismatch, unknown profile, ambiguity를 fail closed한다.
+이 경우 해당 Canonical Owner plan/ADR을 먼저 갱신하고 closeout은 그 결과를 소비한다.
 
-#### Gate
+## 17. Evidence Ledger
 
-- production hardcoded Instance = 0
-- production hardcoded authenticated Principal = 0
-- silent fallback = 0
-- stale generation acceptance = 0
+| 날짜 | 기준 | Evidence | 판정 |
+|---|---|---|---|
+| 2026-08-29 | `codex/cli-completion-finalize` structural baseline `c6d9b049...` | parser/identity/transport/security/persistence/provider/watch/output static + test-source review | Recheck 1 진행 중 |
+| 2026-08-29 | local execution environment | `cargo`/`rustc` executable unavailable; GitHub network resolution unavailable | executable gate 미충족 |
+| 2026-08-29 | repository policy | GitHub Actions 실행 금지 | CI를 로컬 검증 대체물로 사용하지 않음 |
 
-### C3 — Control/Host/Query/Stream Production Boundary 연결
-
-**목적:** `not_wired`를 실제 owner 경로로 대체한다.
-
-Command kind를 하나의 mutation transport에 억지로 합치지 않는다.
-
-| Kind | Production boundary |
-|---|---|
-| `C` | durable submission → authenticated Control → Application |
-| `Q` | bounded authenticated query |
-| `S` | subscription/cursor stream |
-| `H` | Runtime Host control |
-| `H/Q` | Host/query diagnostic |
-
-#### 제약
-
-- 새 generic RPC/IDL 금지
-- endpoint/authentication은 Runtime owner 계약 재사용
-- response identity 검증 유지
-- provider-specific route를 CLI/Application에 추가하지 않음
-
-#### Gate
-
-- production `not_wired` = 0
-- fake success transport = 0
-- kind별 owner 없는 dispatch = 0
-
-### C4 — Durable Journal / Submission Convergence
-
-**목적:** 파일 journal과 submission/replay protocol을 하나의 production 흐름으로 연결한다.
-
-책임은 다음처럼 유지한다.
-
-- local durable journal 파일/retention/lock/hash-chain 의미: CLI
-- submission/replay identity protocol: control-client
-- canonical operation/result: Runtime/Application
-
-#### 구현 제약
-
-- `JournalStore`는 test fixture로 유지한다.
-- production submission은 durable journal adapter를 사용한다.
-- exact Rust trait/callback 형태는 private implementation detail이다.
-- 동일 state dual-write 금지.
-- `Prepared` 이후 CommandId/OperationId/IdempotencyKey/RequestDigest 재생성 금지.
-
-#### crash window
-
-1. identity materialization 전
-2. Prepared append 전
-3. Prepared fsync 직후
-4. Dispatching append 전
-5. Dispatching fsync 직후 / first network byte 전
-6. server commit 직후 / client response 전
-7. Observed append 전
-8. Observed 후 / Terminal 전
-9. Terminal 후 process kill
-10. restart + takeover/recovery
-
-#### Gate
-
-- production in-memory-only journal = 0
-- dual canonical journal = 0
-- response loss 후 duplicate mutation = 0
-- crash/restart 후 operation identity drift = 0
-
-### C5 — 63 Operation Executability Closure
-
-각 command는 아래 적용 가능 column을 evidence로 채운다.
-
-| Column | 판정 |
-|---|---|
-| Path | user-facing path → registry key |
-| Parse | typed input validation |
-| Select | Instance/authentication context |
-| Preflight | selector/CAS materialization |
-| Dispatch | kind별 production boundary |
-| Owner | Application/Runtime/Provider owner 실제 처리 |
-| Result | output schema/exit semantics |
-| Recovery | mutation/stream recovery |
-| Binary | 실제 `dxb` subprocess evidence |
-
-#### 63-command inventory
-
-```text
-runtime-start
-runtime-status
-runtime-stop-graceful
-runtime-stop-host
-runtime-doctor
-version
-
-bot-create
-bot-list
-bot-show
-bot-activate
-bot-deactivate
-bot-archive
-bot-restore
-
-conversation-show
-conversation-send
-conversation-history
-
-thread-create
-thread-list
-thread-show
-thread-send
-thread-history
-thread-branch
-
-task-submit
-task-list
-task-show
-task-watch
-task-cancel
-task-suspend
-task-resume
-task-redirect
-task-result
-
-memory-get
-memory-search
-memory-history
-memory-propose
-memory-promote
-
-project-create
-project-list
-project-show
-project-archive
-project-restore
-project-member-set
-project-member-remove
-project-member-list
-
-channel-create
-channel-list
-channel-show
-channel-member-set
-channel-member-remove
-channel-member-list
-channel-send
-channel-history
-
-process-show
-process-watch
-
-operation-show
-operation-reconcile
-
-approval-list
-approval-show
-approval-approve
-approval-deny
-
-provider-list
-provider-show
-
-side-effect-reconcile
-```
-
-#### Gate
-
-- inventory count = 63
-- registered-but-unreachable = 0
-- reachable-but-unregistered = 0
-- owner 없는 operation = 0
-- unsupported path success rendering = 0
-
-### C6 — Rendering / Automation Closure
-
-검증 모드:
-
-```text
-human × TTY
-human × non-TTY
-json × TTY
-json × non-TTY
-jsonl × TTY
-jsonl × non-TTY
-```
-
-failure matrix:
-
-- runtime unavailable
-- provider unavailable
-- permission denied
-- approval required
-- CAS conflict
-- ambiguous target
-- recovery required
-- version incompatible
-- stream cursor gap
-- local timeout
-- SIGINT/SIGTERM
-- broken pipe/pager exit
-- `--all` local ceiling
-- destination already exists
-- disk full/write failure
-- corrupt local journal
-
-각 case에서 `exit code`, `stdout schema`, `stderr contamination`, `typed next action`, `secret redaction`, `operation continuity`를 함께 검증한다.
-
-#### Gate
-
-- machine stdout human contamination = 0
-- schema-bearing stderr payload = 0
-- nonzero exit에서 unparsable machine error = 0
-- local interrupt implicit Runtime cancel = 0
-
-### C7 — UJ-001~UJ-010 Binary Journey 승격
-
-새 journey를 만들지 않고 [DXB-IFC-043](../40-interfaces/43-cli-user-journeys.md)의 기존 UJ-001~UJ-010을 실제 subprocess E2E로 승격한다.
-
-최소 first-use chain:
-
-```text
-dxb runtime start
-dxb bot create alpha
-dxb conversation send alpha --stdin
-dxb task submit --owner alpha --stdin
-dxb task show <selector>
-dxb task result <selector>
-```
-
-| Journey | 최소 Binary evidence |
-|---|---|
-| UJ-001 | fresh state help/version/runtime start/selection |
-| UJ-002 | bot create → Main Conversation send |
-| UJ-003 | selector mutation + stale CAS conflict + safe guidance |
-| UJ-004 | non-TTY json/jsonl automation |
-| UJ-005 | approval-required → show → approve/deny |
-| UJ-006 | provider unavailable → doctor provider |
-| UJ-007 | ambiguity → visible exact candidate 선택 |
-| UJ-008 | process crash/interrupt → journal scan → original operation recovery |
-| UJ-009 | pagination/`--all`/safe output/partial resume |
-| UJ-010 | multi-instance exact selection + compatibility |
-
-#### Gate
-
-- UJ L5 PASS = 10/10
-- journey 중 fixture-only backdoor = 0
-
-### C8 — Adversarial Fault/Concurrency Review
-
-sleep 길이에 의존하는 race test를 금지하고 barrier/failpoint/fake clock/process crash를 우선한다.
-
-| 공격 | 기대 invariant |
-|---|---|
-| 두 CLI가 동일 command를 동시에 recover/replay | 하나의 operation identity |
-| Dispatching fsync 직후 kill | restart 후 binding lookup |
-| server commit 후 response loss | duplicate mutation 없음 |
-| corrupt middle journal record | fail closed |
-| truncated final journal record | 마지막 완전 record까지만 허용 |
-| Runtime generation 교체 | stale generation fencing |
-| stale CAS | 자동 retry 금지 |
-| local timeout | observation만 종료, continuity 표시 |
-| SIGINT during wait | implicit cancel 없음 |
-| stream cursor future/gap | explicit resync |
-| huge page/`--all` | item/byte ceiling |
-| huge stdin/input-file | Prepared 전 bounded materialization |
-| malicious output path/symlink | overwrite/follow 금지 |
-| disk full during journal append | network send 전 fail closed |
-| auth principal mismatch | owner mutation 전 거부 |
-| provider connection reset | typed provider failure |
-| shutdown under load | new admission/drain 경계 보존 |
-
-#### Gate
-
-- probabilistic-only race evidence = 0
-- unbounded queue/buffer/scan = 0
-- unknown side effect를 transient retry로 숨김 = 0
-
-### C9 — Removal / Provenance Review와 Final Hardening
-
-완료 직전 임시 구조와 stale provenance를 제거한다.
-
-검사 대상:
-
-```text
-production not_wired call
-hardcoded default Instance
-hardcoded authenticated Principal
-duplicate command semantic registry
-fixture-only transport in production
-in-memory-only production journal
-success-like unsupported path
-dead compatibility shim
-orphan config/dependency
-unused recovery fallback
-unclassified ahead branch
-superseded validation/import branch mistaken as product source
-```
-
-`CoreCommands` 등 convenience projection이 canonical parser/executor와 의미를 중복하면 축소 또는 제거한다. test 편의를 위해 남길 경우 production policy source가 아님을 검증한다.
-
-#### Gate
-
-- 위 항목 모두 0 또는 명시적 test-only/temporary provenance 근거 존재
-- active product branch 미병합 변경 = 0
-- branch audit 재실행 PASS
-
-## 8. 구현 Wave
-
-```text
-Wave 0 — baseline
-C0 evidence + branch/provenance audit
-
-Wave 1 — execution spine
-C2 Instance/Auth
-  ↓
-C3 Control/Host/Query/Stream boundary
-  ↓
-C4 durable journal + submission convergence
-
-Wave 2 — full surface
-C1 parser/help/registry convergence
-  ↓
-C5 63-operation owner closure
-
-Wave 3 — user-facing completion
-C6 rendering/automation
-  ↓
-C7 10 binary journeys
-
-Wave 4 — release closure
-C8 adversarial fault/concurrency
-  ↓
-C9 removal/provenance review
-  ↓
-Final two rechecks
-```
-
-C3/C4가 닫히기 전에 command별 wrapper를 대량 추가하지 않는다. execution spine 확정 전에 63개 dispatch wrapper를 먼저 만들면 transport/recovery 중복이 확산될 위험이 크다.
-
-## 9. 예상 영향 범위
-
-```text
-crates/cli/
-crates/application-contract/
-crates/control-client/
-crates/control-server/
-crates/application/
-crates/runtime-bootstrap/
-crates/runtime-host/
-crates/runtime-security/
-crates/runtime-audit/
-crates/provider-host/          # 기존 provider query/diagnostic 연결 범위만
-docs/plan/20260823-1310-v0-8-10-detailed-development-plan/
-```
-
-새 crate는 기본안이 아니다. 기존 Canonical Owner에서 닫을 수 없다는 증거가 생길 때만 별도 ADR/plan 변경을 요구한다.
-
-## 10. Test Architecture
-
-```text
-deterministic unit/state
-→ contract/golden
-→ component
-→ local transport integration
-→ binary subprocess
-→ process crash/restart
-→ adversarial concurrency/fault
-→ optional real Provider canary
-```
-
-외부 Provider 비결정성은 CLI correctness acceptance로 사용하지 않는다.
-
-Binary harness는 temporary state root, deterministic Instance, authenticated local endpoint, Runtime host lifecycle, fake/reference Provider, failpoint/crash point, stdout/stderr capture, TTY/non-TTY, process kill/restart, persisted journal/runtime state를 격리할 수 있어야 한다.
-
-harness가 production 경계를 우회해 Domain API를 직접 호출하면 해당 test는 L4/L5 evidence가 아니다.
-
-## 11. Completion Metrics
-
-최종 보고에는 최소 다음 값을 기록한다.
-
-```text
-registered_operations = 63
-binary_reachable_operations = 63
-user_journeys = 10
-binary_passed_user_journeys = 10
-
-production_not_wired = 0
-production_hardcoded_instance = 0
-production_hardcoded_authenticated_principal = 0
-production_fixture_transport = 0
-production_in_memory_only_journal = 0
-unreachable_registered_command = 0
-unregistered_success_path = 0
-
-unclassified_ahead_branches = 0
-active_product_branches_with_unmerged_changes = 0
-```
-
-테스트 개수 자체는 완료 지표가 아니다. invariant/path/provenance coverage가 완료 지표다.
-
-## 12. Verification Commands
-
-구현 환경에서 다음을 모두 수행한다.
-
-```bash
-cargo fmt --check
-cargo check --workspace
-cargo clippy --workspace
-cargo test --workspace
-
-python3 scripts/plan-validator.py --active
-python3 scripts/plan-validator.py --self-test
-```
-
-추가 closeout suite는 최소 다음 목적을 독립적으로 식별 가능해야 한다.
-
-```text
-cli-binary-contract
-cli-binary-journeys
-cli-binary-recovery
-cli-binary-automation
-cli-binary-fault
-```
-
-정확한 Cargo test target 이름은 기존 fixture layout에 맞춰 구현하며 public contract로 고정하지 않는다.
-
-## 13. Final Recheck 1 — Structural / Consistency
-
-다음을 전부 검토한다.
-
-1. 63 command registry와 binary path 1:1 coverage
-2. duplicate parser/help/wait/security/output policy
-3. CLI/Control/Application/Runtime Canonical Owner 중복
-4. CLI journal과 submission fixture state 중복
-5. crate dependency direction과 cycle
-6. public schema의 불필요한 확대
-7. docs/registry/golden/test 관계
-8. unused feature/dependency/config
-9. lowercase kebab-case / Rust snake_case
-10. 기존 v0.8.10 비범위 위반
-11. non-main branch 분류와 provenance, superseded/temporary branch의 재병합 위험
-
-발견 사항을 수정한 후 동일 범위를 다시 검수한다.
-
-## 14. Final Recheck 2 — Cross-Layer Executability
-
-실제 binary evidence로 다음 흐름을 추적한다.
-
-```text
-Input/Command
-→ Instance/Auth
-→ Preflight
-→ Durable Journal
-→ Control/Host/Query/Stream
-→ Application/Runtime Owner
-→ Persistence/Receipt
-→ Provider/Process where applicable
-→ Crash/Restart Recovery
-→ Projection
-→ CLI Renderer
-```
-
-각 적용 가능 command에 runtime/provider unavailable, permission/approval, cancel/timeout, crash/restart, duplicate/partial success, stale revision/generation, journal corruption, resource pressure, shutdown/drain을 대입한다.
-
-발견 사항 수정 후 해당 binary journey와 workspace regression을 다시 수행한다.
-
-## 15. CLI Complete 최종 Gate
-
-아래 조건을 하나라도 만족하지 못하면 `CLI Complete`를 선언하지 않는다.
-
-### Contract / Surface
-
-- 63/63 operation path verified
-- command/input/golden registry drift 없음
-- 신규 command 0
-
-### Production Wiring
-
-- verified Instance selection
-- trusted authenticated Principal
-- authenticated local transport
-- durable journal/submission convergence
-- production `not_wired` 0
-
-### Correctness / Recovery
-
-- Prepared/Dispatching/Observed/Terminal crash window 검증
-- response-loss duplicate 방지
-- original replay identity 보존
-- stale generation/CAS fail closed
-- corrupt/unknown journal auto-replay 금지
-
-### UX / Automation
-
-- UJ-001~UJ-010 binary PASS
-- human/json/jsonl contract PASS
-- non-TTY prompt 없음
-- machine stdout/stderr 분리
-- typed next action 유지
-- safe output/partial resume PASS
-
-### Repository Provenance
-
-- all non-main branches classified
-- unclassified ahead branch = 0
-- active product branch의 미병합 변경 = 0
-- validation/import/CI diagnostic branch를 product source로 재병합하지 않음
-
-### Quality
-
-- workspace fmt/check/clippy/test PASS
-- active plan validator/self-test PASS
-- Final Recheck 1 PASS
-- Final Recheck 2 PASS
-- 발견 사항 수정 후 재검증 PASS
-
-## 16. 중단 조건
-
-다음 상황이 발생하면 구현을 중단하고 plan/ADR 재검토를 먼저 수행한다.
-
-1. CLI 완료를 위해 신규 command/public workflow가 필요함
-2. generic RPC/IDL/framework가 선행 조건으로 변함
-3. CLI가 Authority/Domain canonical state를 소유해야 한다는 설계가 등장함
-4. durable journal을 두 owner가 동시에 canonical로 유지하려 함
-5. Provider-specific branch가 CLI/Application에 유출됨
-6. recovery를 위해 새로운 operation identity를 만들어야 한다고 판단함
-7. 63-operation contract 자체 의미 변경이 필요함
-8. binary journey를 통과시키기 위해 fixture-only bypass가 production path에 들어감
-9. stale validation/import branch를 병합해야만 최신 기능을 얻을 수 있다고 판단됨 — 먼저 convergence/provenance를 재검증한다.
-
-## 17. 작업 단위와 Evidence
-
-각 change set은 가능한 한 다음 단위를 유지한다.
-
-```text
-blocking finding
-+ owner 확인
-+ 최소 production wiring
-+ deterministic component test
-+ binary/integration evidence
-+ failure/recovery evidence
-+ 관련 문서 갱신
-+ branch/provenance impact
-+ review finding 수정
-```
-
-각 PR/commit 또는 main change에는 최소 다음을 기록한다.
-
-```text
-- closeout stage: Cx
-- blocking finding IDs
-- affected command keys
-- Canonical Owner
-- public contract impact: none/changed
-- binary evidence
-- fault/recovery evidence
-- resource bound
-- branch/provenance impact
-- remaining blockers
-- Recheck 1 result
-- Recheck 2 result
-```
-
-## 18. 최종 판정 원칙
-
-CLI 개발 종료는 “파일이 존재한다”, “63 command가 registry에 있다”, “component test가 많다”, “workspace test가 한 번 통과했다”, “branch가 main보다 ahead로 보인다” 같은 단일 신호로 판정하지 않는다.
-
-최종 판정은 오직 다음 명제로 한다.
-
-> **기존 v0.8.10 P0 surface를 확장하지 않고, 실제 `dxb` binary가 모든 등록 operation을 올바른 Canonical Owner까지 전달하며, 실패·중단·재시작·부분 성공에서도 identity와 recovery semantics를 보존하고, 10개 사용자 여정을 human/machine interface로 재현 가능하며, repository provenance에도 미분류 제품 변경이 남아 있지 않다.**
-
-이 명제가 executable evidence로 증명되면 CLI closeout을 완료한다.
+최종 ledger에는 문서 갱신 이후의 최종 head와 실제 실행 결과를 추가한다.
