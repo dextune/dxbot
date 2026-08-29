@@ -63,6 +63,7 @@ fn validate_argv_bounds(args: &[String]) -> Result<(), DxbotError> {
 fn bind_positionals(input: &mut CliInput, metadata: CommandMetadata) -> Result<(), DxbotError> {
     normalize_field_names(&mut input.fields)?;
     let specs = parse_field_specs(metadata.typed_fields);
+    let primary_selector = primary_selector_name(&specs);
     let positionals = take_positionals(&mut input.fields)?;
     if positionals.is_empty() {
         return Ok(());
@@ -70,7 +71,9 @@ fn bind_positionals(input: &mut CliInput, metadata: CommandMetadata) -> Result<(
 
     let mut next = 0usize;
     for value in positionals {
-        while next < specs.len() && !can_bind_positional(input, &specs[next]) {
+        while next < specs.len()
+            && !can_bind_positional(input, &specs[next], primary_selector.as_deref())
+        {
             next += 1;
         }
         let Some(spec) = specs.get(next) else {
@@ -79,17 +82,21 @@ fn bind_positionals(input: &mut CliInput, metadata: CommandMetadata) -> Result<(
                 input.command_key
             )));
         };
-        bind_one(input, spec, value)?;
+        bind_one(input, spec, primary_selector.as_deref(), value)?;
         next += 1;
     }
     Ok(())
 }
 
-fn can_bind_positional(input: &CliInput, spec: &FieldSpec) -> bool {
+fn can_bind_positional(
+    input: &CliInput,
+    spec: &FieldSpec,
+    primary_selector: Option<&str>,
+) -> bool {
     if !is_user_source(&spec.source) || is_cas_field(&spec.name) {
         return false;
     }
-    if is_selector_type(&spec.type_name) {
+    if is_primary_selector(spec, primary_selector) {
         return input.selector.is_none();
     }
     if is_content_type(&spec.type_name) {
@@ -98,8 +105,13 @@ fn can_bind_positional(input: &CliInput, spec: &FieldSpec) -> bool {
     !field_present(&input.fields, &spec.name)
 }
 
-fn bind_one(input: &mut CliInput, spec: &FieldSpec, value: String) -> Result<(), DxbotError> {
-    if is_selector_type(&spec.type_name) {
+fn bind_one(
+    input: &mut CliInput,
+    spec: &FieldSpec,
+    primary_selector: Option<&str>,
+    value: String,
+) -> Result<(), DxbotError> {
+    if is_primary_selector(spec, primary_selector) {
         input.selector = Some(json!({
             "kind": selector_kind(spec),
             "value": value,
@@ -121,11 +133,13 @@ fn validate_required_fields(
     input: &CliInput,
     metadata: CommandMetadata,
 ) -> Result<(), DxbotError> {
-    for spec in parse_field_specs(metadata.typed_fields) {
+    let specs = parse_field_specs(metadata.typed_fields);
+    let primary_selector = primary_selector_name(&specs);
+    for spec in specs {
         if !spec.required || !is_user_source(&spec.source) {
             continue;
         }
-        let present = if is_selector_type(&spec.type_name) {
+        let present = if is_primary_selector(&spec, primary_selector.as_deref()) {
             input.selector.is_some()
         } else if is_content_type(&spec.type_name) {
             input.content.is_some()
@@ -187,6 +201,17 @@ fn field_present(fields: &Value, name: &str) -> bool {
     fields
         .as_object()
         .is_some_and(|object| object.contains_key(name))
+}
+
+fn primary_selector_name(specs: &[FieldSpec]) -> Option<String> {
+    specs
+        .iter()
+        .find(|spec| is_user_source(&spec.source) && is_selector_type(&spec.type_name))
+        .map(|spec| spec.name.clone())
+}
+
+fn is_primary_selector(spec: &FieldSpec, primary_selector: Option<&str>) -> bool {
+    primary_selector.is_some_and(|name| name == spec.name) && is_selector_type(&spec.type_name)
 }
 
 fn cas_field_present(input: &CliInput, name: &str) -> bool {
@@ -346,13 +371,22 @@ mod tests {
     }
 
     #[test]
-    fn local_fields_do_not_consume_positionals() {
+    fn secondary_semantic_selector_binds_as_a_field() {
         let input = parse_bound_input(&args(&[
-            "bot-list",
-            "50",
-            "cursor-a",
+            "task-submit",
+            "project-a",
+            "do work",
+            "bot-a",
         ]))
-        .expect("bot-list page arguments must skip local all flag");
+        .expect("task-submit must retain delegated bot as semantic field");
+        assert_eq!(input.selector_value().as_deref(), Some("project-a"));
+        assert_eq!(input.fields["delegate_to_bot"], "bot-a");
+    }
+
+    #[test]
+    fn local_fields_do_not_consume_positionals() {
+        let input = parse_bound_input(&args(&["bot-list", "50", "cursor-a"]))
+            .expect("bot-list page arguments must skip local all flag");
         assert_eq!(input.fields["page_size"], "50");
         assert_eq!(input.fields["cursor"], "cursor-a");
     }
