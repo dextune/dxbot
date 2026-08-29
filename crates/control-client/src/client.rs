@@ -209,7 +209,7 @@ impl SubmissionClient {
         command_id: &CommandId,
         key: &IdempotencyKey,
     ) -> Result<Option<OperationResult>, ClientError> {
-        match self.bind(command_id, key) {
+        match self.bind(command_id, key)? {
             None => Ok(None),
             Some((_record, Some(result))) => Ok(Some(result)),
             Some((record, None)) => Ok(Some(recoverable_result(command_id, &record))),
@@ -222,7 +222,7 @@ impl SubmissionClient {
     ) -> Result<OperationResult, ClientError> {
         self.validate_request(request)?;
         let command_id = request.command_id.clone();
-        match self.bind(&command_id, &request.idempotency_key) {
+        match self.bind(&command_id, &request.idempotency_key)? {
             Some((record, Some(result))) => {
                 ensure_replay_identity(&record, request)?;
                 validate_result_identity(request, &result)?;
@@ -250,7 +250,7 @@ impl SubmissionClient {
         self.validate_request(request)?;
         let command_id = request.command_id.clone();
 
-        if let Some((record, result)) = self.bind(&command_id, &request.idempotency_key) {
+        if let Some((record, result)) = self.bind(&command_id, &request.idempotency_key)? {
             ensure_replay_identity(&record, request)?;
             return match result {
                 Some(result) => {
@@ -261,7 +261,7 @@ impl SubmissionClient {
             };
         }
 
-        if self.journal.borrow().lookup(&command_id).is_some() {
+        if self.journal.borrow().lookup(&command_id)?.is_some() {
             return Err(ClientError::IdempotencyKeyConflict(command_id));
         }
 
@@ -321,7 +321,7 @@ impl SubmissionClient {
         &self,
         command_id: &CommandId,
         key: &IdempotencyKey,
-    ) -> Option<(JournalRecord, Option<OperationResult>)> {
+    ) -> Result<Option<(JournalRecord, Option<OperationResult>)>, ClientError> {
         self.journal.borrow().find_binding(command_id, key)
     }
 
