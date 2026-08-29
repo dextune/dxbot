@@ -27,6 +27,7 @@ use crate::server::ControlServer;
 
 const SOCKET_MODE: u32 = 0o600;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_WATCH_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Debug)]
 pub struct LocalControlServer {
@@ -198,6 +199,33 @@ impl LocalControlServer {
                     Err(error) => write_error(&mut stream, error.to_dxbot_error()),
                 }
             }
+            LocalControlRequest::WatchNext {
+                payload,
+                cursor,
+                timeout_ms,
+            } => {
+                if timeout_ms == 0 || timeout_ms > MAX_WATCH_TIMEOUT_MS {
+                    return write_error(
+                        &mut stream,
+                        protocol_error(format!(
+                            "watch timeout must be 1..={MAX_WATCH_TIMEOUT_MS}ms"
+                        )),
+                    );
+                }
+                match self.control.watch_next(
+                    &authenticated_principal,
+                    &payload,
+                    cursor.as_deref(),
+                    Duration::from_millis(timeout_ms),
+                ) {
+                    Ok(value) => write_local_control_frame(
+                        &mut stream,
+                        &LocalControlResponse::Data { value },
+                    )
+                    .map_err(codec_io),
+                    Err(error) => write_error(&mut stream, error.to_dxbot_error()),
+                }
+            }
             LocalControlRequest::Submit { request } => {
                 if request.payload.instance_id != self.instance_id {
                     return write_error(
@@ -211,8 +239,6 @@ impl LocalControlServer {
                 {
                     Ok(result) => {
                         if request.payload.command_key == "runtime-stop-graceful" {
-                            // Commit is authoritative. Even if the response is lost,
-                            // the host must honor the committed shutdown request.
                             self.shutdown_requested.store(true, Ordering::Release);
                         }
                         write_local_control_frame(
