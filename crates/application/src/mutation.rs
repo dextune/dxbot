@@ -527,7 +527,11 @@ fn submit_task(
 ) -> Result<Option<serde_json::Value>, AppError> {
     let scope = scope_from_target(&payload.canonical_target)?;
     ensure_scope_exists(state, &scope)?;
-    validate_optional_scope_revision(state, &scope, payload.cas.as_ref().and_then(|cas| cas.if_scope_revision))?;
+    validate_optional_scope_revision(
+        state,
+        &scope,
+        payload.cas.as_ref().and_then(|cas| cas.if_scope_revision),
+    )?;
     let id = TaskId(format!("task:{}", identity.operation_id.0));
     state.tasks.insert(
         id.clone(),
@@ -730,6 +734,7 @@ fn create_project(
             member_bot: member,
             role: "owner".to_owned(),
             generation: 1,
+            active: true,
             created_at: now_secs(),
         },
     );
@@ -798,6 +803,7 @@ fn mutate_membership(
                 member_bot: member_bot.clone(),
                 role: required_field(payload, "role_ref")?.to_owned(),
                 generation,
+                active: true,
                 created_at: state
                     .memberships
                     .get(&key)
@@ -815,19 +821,25 @@ fn mutate_membership(
             let expected = expected_generation.ok_or_else(|| {
                 AppError::Conflict("membership remove requires generation CAS".to_owned())
             })?;
-            let current = state.memberships.get(&key).ok_or_else(|| {
+            let current = state.memberships.get_mut(&key).ok_or_else(|| {
                 AppError::NotFound(format!("membership {key} does not exist"))
             })?;
+            if !current.active {
+                return Err(AppError::NotFound(format!("membership {key} is not active")));
+            }
             if current.generation != expected {
                 return Err(AppError::Conflict(format!(
                     "membership generation mismatch: expected {expected}, current {}",
                     current.generation
                 )));
             }
-            state.memberships.remove(&key);
+            current.generation = next_revision(current.generation, "membership generation")?;
+            current.active = false;
+            let generation = current.generation;
             bump_scope_revision(state, scope)?;
             Ok(Some(serde_json::json!({
                 "membership_ref": key,
+                "generation": generation,
                 "removed": true
             })))
         }
@@ -1132,9 +1144,10 @@ fn target_exists(state: &DomainState, target: &CanonicalTarget) -> bool {
         CanonicalTarget::Operation { operation_id, .. } => state.results.contains_key(operation_id),
         CanonicalTarget::Memory { id, .. } => state.memories.contains_key(id),
         CanonicalTarget::SideEffect { id, .. } => state.side_effects.contains_key(id),
-        CanonicalTarget::Membership { scope, member_bot } => {
-            state.memberships.contains_key(&membership_key(scope, member_bot))
-        }
+        CanonicalTarget::Membership { scope, member_bot } => state
+            .memberships
+            .get(&membership_key(scope, member_bot))
+            .is_some_and(|row| row.active),
         CanonicalTarget::Approval { .. }
         | CanonicalTarget::Provider { .. }
         | CanonicalTarget::Process { .. } => true,
