@@ -45,7 +45,10 @@ pub fn project_for_execution(
     payload.principal_ref = context.principal_ref.clone();
 
     // Instance-targeted operations must bind exactly to the verified Instance.
-    if matches!(payload.canonical_target, dxbot_core::types::CanonicalTarget::Instance(_)) {
+    if matches!(
+        &payload.canonical_target,
+        dxbot_core::types::CanonicalTarget::Instance(_)
+    ) {
         payload.canonical_target =
             dxbot_core::types::CanonicalTarget::Instance(context.instance_id.clone());
     }
