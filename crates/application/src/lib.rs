@@ -23,8 +23,8 @@ pub use query::{
 pub use state::{
     BotState, ChannelState, ConversationOwner, ConversationState, DomainState,
     IdempotencyBindingState, LifecycleState, MemoryAssertionStatus, MemoryRevisionState,
-    MemoryState, MessageState, ProjectLifecycle, ProjectState, SideEffectState, SideEffectStatus,
-    TaskState, TaskStatus, ThreadState,
+    MemoryState, MessageState, ProcessLifecycle, ProcessState, ProjectLifecycle, ProjectState,
+    SideEffectState, SideEffectStatus, TaskState, TaskStatus, ThreadState,
 };
 pub use subscription::{
     MAX_EVENTS_PER_STREAM, StreamEvent, Subscription, SubscriptionManager, TaskResult,
