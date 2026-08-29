@@ -14,6 +14,7 @@ use crate::{CliInput, CommandMetadata, metadata_for_key};
 
 pub const MAX_CLI_TOKENS: usize = 4096;
 pub const MAX_CLI_TOKEN_BYTES: usize = 1024 * 1024;
+const MAX_PAGE_SIZE: u64 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FieldSpec {
@@ -25,8 +26,9 @@ struct FieldSpec {
 }
 
 /// Parse canonical command-key argv and bind remaining user positionals to the
-/// registry's typed field order. Unknown fields, illegal duplicates and an
-/// unsupported wait policy fail before any target preflight or durable journal.
+/// registry's typed field order. Unknown fields, illegal duplicates, malformed
+/// primitive values and unsupported wait policies fail before target preflight
+/// or durable journal publication.
 pub fn parse_bound_input(args: &[String]) -> Result<CliInput, DxbotError> {
     validate_argv_bounds(args)?;
     let mut input = CliInput::parse(args)?;
@@ -131,7 +133,10 @@ fn bind_one(
         util::invariant("CliInput fields must be an object before positional binding")
     })?;
     if spec.multiple {
-        match fields.entry(spec.name.clone()).or_insert_with(|| Value::Array(Vec::new())) {
+        match fields
+            .entry(spec.name.clone())
+            .or_insert_with(|| Value::Array(Vec::new()))
+        {
             Value::Array(values) => values.push(Value::String(value)),
             _ => {
                 return Err(util::input_error(format!(
@@ -174,6 +179,7 @@ fn validate_fields(input: &CliInput, metadata: CommandMetadata) -> Result<(), Dx
                 spec.name
             )));
         }
+        validate_typed_value(spec, value)?;
     }
 
     for spec in &specs {
@@ -197,6 +203,102 @@ fn validate_fields(input: &CliInput, metadata: CommandMetadata) -> Result<(), Dx
         }
     }
     Ok(())
+}
+
+fn validate_typed_value(spec: &FieldSpec, value: &Value) -> Result<(), DxbotError> {
+    if spec.multiple {
+        let values = value.as_array().ok_or_else(|| {
+            util::input_error(format!("field '{}' requires repeated values", spec.name))
+        })?;
+        if spec.required && values.is_empty() {
+            return Err(util::input_error(format!(
+                "field '{}' requires at least one value",
+                spec.name
+            )));
+        }
+        for value in values {
+            validate_scalar(spec, value)?;
+        }
+        return Ok(());
+    }
+    validate_scalar(spec, value)
+}
+
+fn validate_scalar(spec: &FieldSpec, value: &Value) -> Result<(), DxbotError> {
+    match spec.type_name.as_str() {
+        "True" => {
+            if value == &Value::Bool(true) {
+                Ok(())
+            } else {
+                Err(util::input_error(format!(
+                    "field '{}' is a presence flag and cannot take a false/value argument",
+                    spec.name
+                )))
+            }
+        }
+        "Bool" => match value {
+            Value::Bool(_) => Ok(()),
+            Value::String(value) if matches!(value.as_str(), "true" | "false") => Ok(()),
+            _ => Err(util::input_error(format!(
+                "field '{}' expects true or false",
+                spec.name
+            ))),
+        },
+        "PageSize" => {
+            let size = numeric_string(value, &spec.name)?;
+            let size = size.parse::<u64>().map_err(|_| {
+                util::input_error(format!("field '{}' expects a page size", spec.name))
+            })?;
+            if (1..=MAX_PAGE_SIZE).contains(&size) {
+                Ok(())
+            } else {
+                Err(util::input_error(format!(
+                    "field '{}' must be in 1..={MAX_PAGE_SIZE}",
+                    spec.name
+                )))
+            }
+        }
+        type_name if is_numeric_contract_type(type_name) => {
+            let raw = numeric_string(value, &spec.name)?;
+            let parsed = raw.parse::<i64>().map_err(|_| {
+                util::input_error(format!("field '{}' expects an integer", spec.name))
+            })?;
+            if parsed < 0 {
+                return Err(util::input_error(format!(
+                    "field '{}' must be non-negative",
+                    spec.name
+                )));
+            }
+            Ok(())
+        }
+        _ => match value {
+            Value::String(value) if !value.is_empty() => Ok(()),
+            Value::Bool(_) if spec.source == "local" => Ok(()),
+            _ => Err(util::input_error(format!(
+                "field '{}' expects one non-empty {} value",
+                spec.name, spec.type_name
+            ))),
+        },
+    }
+}
+
+fn numeric_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, DxbotError> {
+    value.as_str().ok_or_else(|| {
+        util::input_error(format!("field '{field}' expects a numeric string value"))
+    })
+}
+
+fn is_numeric_contract_type(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "Revision"
+            | "Generation"
+            | "HostGeneration"
+            | "Sequence"
+            | "Limit"
+            | "Count"
+            | "Percent"
+    )
 }
 
 fn validate_wait(input: &CliInput, metadata: CommandMetadata) -> Result<(), DxbotError> {
@@ -468,7 +570,13 @@ mod tests {
     #[test]
     fn repeated_field_remains_bounded_typed_array() {
         let input = parse_bound_input(&args(&[
-            "memory-propose", "scope-a", "statement", "--evidence", "a", "--evidence", "b",
+            "memory-propose",
+            "scope-a",
+            "statement",
+            "--evidence",
+            "a",
+            "--evidence",
+            "b",
         ]))
         .expect("repeatable evidence is allowed");
         assert_eq!(input.fields["evidence"], json!(["a", "b"]));
@@ -490,5 +598,23 @@ mod tests {
         ]))
         .expect("runtime-start flag must normalize");
         assert_eq!(input.fields["ready_at"], "control");
+    }
+
+    #[test]
+    fn true_presence_flag_rejects_explicit_false_value() {
+        let error = parse_bound_input(&args(&[
+            "runtime-stop-host",
+            "--host-stop",
+            "false",
+        ]))
+        .expect_err("True field cannot accept false");
+        assert!(error.message.contains("presence flag"));
+    }
+
+    #[test]
+    fn page_size_is_bounded_before_remote_preflight() {
+        let error = parse_bound_input(&args(&["bot-list", "--page-size", "1001"]))
+            .expect_err("oversized page must fail locally");
+        assert!(error.message.contains("1..=1000"));
     }
 }
