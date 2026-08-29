@@ -3,8 +3,9 @@
 //! The binary delegates here so every invocation follows one reusable path:
 //! registry path resolution -> typed argv binding -> local content materialize ->
 //! verified Instance discovery -> authenticated local Principal handshake ->
-//! preflight -> durable Prepared/Dispatching -> Runtime submission -> rendering.
+//! bounded preflight -> durable Prepared/Dispatching -> Runtime owner -> render.
 
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use application_contract::{
-    ExecutionContext, PreflightPlan, cli_path_tokens, commands_in_group, metadata_for_key,
+    ExecutionContext, TargetMaterialization, cli_path_tokens, commands_in_group, metadata_for_key,
     parse_bound_input, project_for_execution, resolve_cli_path,
 };
 use control_client::{ClientError, LocalControlClient, SubmissionClient};
@@ -28,6 +29,7 @@ use crate::{
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const START_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliOutput {
@@ -47,9 +49,9 @@ impl CliOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PrefixScan {
+struct NormalizedInvocation {
     global_tokens: Vec<String>,
-    path_start: usize,
+    command_tokens: Vec<String>,
     root_help: bool,
     root_version: bool,
 }
@@ -90,40 +92,41 @@ fn execute_inner(args: &[String]) -> Result<CliOutput, DxbotError> {
         return Ok(CliOutput::success(Discovery::show_help()));
     }
 
-    let prefix = scan_global_prefix(args)?;
-    if prefix.root_help {
+    let normalized = normalize_invocation(args)?;
+    if normalized.root_help && normalized.command_tokens.is_empty() {
         return Ok(CliOutput::success(Discovery::show_help()));
     }
-    if prefix.root_version && prefix.path_start >= args.len() {
-        return Ok(render_version(format_from_tokens(&prefix.global_tokens)?));
+    if normalized.root_version && normalized.command_tokens.is_empty() {
+        return Ok(render_version(format_from_tokens(&normalized.global_tokens)?));
     }
-    if prefix.path_start >= args.len() {
+    if normalized.command_tokens.is_empty() {
         return Err(usage_error("missing command"));
     }
 
-    let path_tokens = &args[prefix.path_start..];
-    let group = &path_tokens[0];
-    if commands_in_group(group).is_empty() {
-        return resolve_command(prefix, path_tokens);
-    }
-    if path_tokens.len() == 1 || path_tokens.get(1).is_some_and(|token| is_help(token)) {
+    let group = &normalized.command_tokens[0];
+    if !commands_in_group(group).is_empty()
+        && (normalized.command_tokens.len() == 1
+            || normalized.command_tokens.get(1).is_some_and(|token| is_help(token)))
+    {
         return Ok(CliOutput::success(render_group_help(group)));
     }
-    resolve_command(prefix, path_tokens)
+
+    resolve_command(normalized)
 }
 
-fn resolve_command(prefix: PrefixScan, path_tokens: &[String]) -> Result<CliOutput, DxbotError> {
-    let resolved = resolve_cli_path(path_tokens)?;
+fn resolve_command(normalized: NormalizedInvocation) -> Result<CliOutput, DxbotError> {
+    let resolved = resolve_cli_path(&normalized.command_tokens)?;
     let metadata = metadata_for_key(resolved.command_key)
         .ok_or_else(|| internal_error("resolved command has no registry metadata"))?;
-    let command_args = &path_tokens[resolved.consumed_path_tokens..];
+    let command_args = &normalized.command_tokens[resolved.consumed_path_tokens..];
     if command_args.iter().any(|token| is_help(token)) {
         return Ok(CliOutput::success(render_command_help(metadata.command_key)));
     }
 
-    let mut canonical_args = Vec::with_capacity(1 + prefix.global_tokens.len() + command_args.len());
+    let mut canonical_args =
+        Vec::with_capacity(1 + normalized.global_tokens.len() + command_args.len());
     canonical_args.push(metadata.command_key.to_owned());
-    canonical_args.extend(prefix.global_tokens);
+    canonical_args.extend(normalized.global_tokens);
     canonical_args.extend_from_slice(command_args);
     let mut input = parse_bound_input(&canonical_args)?;
     let format = input.global_options.format;
@@ -145,9 +148,9 @@ fn start_runtime(
     #[cfg(not(unix))]
     {
         let _ = (input, format);
-        return Err(incompatible_error(
+        Err(incompatible_error(
             "P0 local Runtime start requires a Unix-domain control endpoint",
-        ));
+        ))
     }
     #[cfg(unix)]
     {
@@ -158,7 +161,10 @@ fn start_runtime(
         let timeout = parse_timeout(input.global_options.timeout.as_deref())?;
 
         if let Ok(selected) = discovery.select_endpoint(profile, explicit_instance) {
-            if connect_selected(&selected, timeout).and_then(|client| client.handshake()).is_ok() {
+            if connect_selected(&selected, START_CONNECT_TIMEOUT)
+                .and_then(|client| client.handshake())
+                .is_ok()
+            {
                 return Ok(render_value(
                     json!({
                         "status": "already-running",
@@ -172,20 +178,11 @@ fn start_runtime(
             }
         }
         if explicit_instance.is_some() {
-            return Err(DxbotError {
-                code: ErrorCode::NotFound,
-                category: ErrorCategory::Input,
-                message: "runtime start cannot create an explicitly requested unknown InstanceId"
-                    .to_owned(),
-                retryable: false,
-                operation_ref: None,
-                target_refs: Vec::new(),
-                field_violations: Vec::new(),
-                current_revision: None,
-                current_generation: None,
-                resume_cursor: None,
-                next_actions: Vec::new(),
-            });
+            return Err(error_with(
+                ErrorCode::NotFound,
+                ErrorCategory::Input,
+                "runtime start cannot create an explicitly requested unknown InstanceId",
+            ));
         }
 
         let executable = std::env::current_exe()
@@ -210,7 +207,7 @@ fn start_runtime(
         let deadline = Instant::now() + timeout;
         loop {
             if let Ok(selected) = discovery.select_endpoint(profile, None) {
-                if let Ok(client) = connect_selected(&selected, timeout.min(DEFAULT_TIMEOUT)) {
+                if let Ok(client) = connect_selected(&selected, START_CONNECT_TIMEOUT) {
                     if client.handshake().is_ok() {
                         return Ok(render_value(
                             json!({
@@ -249,9 +246,9 @@ fn runtime_status(
     #[cfg(not(unix))]
     {
         let _ = (input, format);
-        return Err(incompatible_error(
+        Err(incompatible_error(
             "P0 local Runtime status requires a Unix-domain control endpoint",
-        ));
+        ))
     }
     #[cfg(unix)]
     {
@@ -291,9 +288,9 @@ fn runtime_doctor(
     #[cfg(not(unix))]
     {
         let _ = (input, format);
-        return Err(incompatible_error(
+        Err(incompatible_error(
             "P0 Runtime doctor requires a Unix-domain control endpoint",
-        ));
+        ))
     }
     #[cfg(unix)]
     {
@@ -338,9 +335,9 @@ fn submit_command(
     #[cfg(not(unix))]
     {
         let _ = (input, command_key, format);
-        return Err(incompatible_error(
+        Err(incompatible_error(
             "P0 command submission requires a Unix-domain control endpoint",
-        ));
+        ))
     }
     #[cfg(unix)]
     {
@@ -375,11 +372,12 @@ fn submit_command(
             }
         }
 
-        let preflight = PreflightPlan::from_cli_input(input)?;
-        if !preflight.steps.is_empty() {
+        let target = TargetMaterialization::from_cli_input(input)?;
+        let preflight = target.plan_preflight(input);
+        if !preflight.queries.is_empty() {
             return Err(input_error(format!(
                 "{command_key} requires remote preflight before execution: {:?}",
-                preflight.steps
+                preflight.queries
             )));
         }
 
@@ -388,7 +386,7 @@ fn submit_command(
             handshake.principal_ref.clone(),
         );
         let payload = project_for_execution(input, &context)?;
-        let request = build_operation_request(payload)?;
+        let request = build_operation_request(input, payload)?;
         let journal = LocalJournal::open(handshake.instance_id.clone(), &paths.journal_root)
             .map_err(|error| storage_error(format!("cannot open local journal: {error:?}")))?;
         let client = SubmissionClient::builder(handshake.instance_id)
@@ -500,45 +498,66 @@ fn render_error(error: DxbotError, format: OutputFormat) -> CliOutput {
     }
 }
 
-fn scan_global_prefix(args: &[String]) -> Result<PrefixScan, DxbotError> {
+fn normalize_invocation(args: &[String]) -> Result<NormalizedInvocation, DxbotError> {
     let mut global_tokens = Vec::new();
-    let mut index = 0usize;
+    let mut command_tokens = Vec::new();
+    let mut seen = HashSet::new();
     let mut root_help = false;
     let mut root_version = false;
+    let mut after_separator = false;
+    let mut index = 0usize;
+
     while index < args.len() {
         let token = &args[index];
+        if after_separator {
+            command_tokens.push(token.clone());
+            index += 1;
+            continue;
+        }
+        if token == "--" {
+            after_separator = true;
+            command_tokens.push(token.clone());
+            index += 1;
+            continue;
+        }
+
         match token.as_str() {
             "--profile" | "--instance" | "--format" | "--color" | "--wait" | "--timeout" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    usage_error(format!("{token} requires a value"))
-                })?;
+                if !seen.insert(token.clone()) {
+                    return Err(usage_error(format!("duplicate global option: {token}")));
+                }
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| usage_error(format!("{token} requires a value")))?;
                 global_tokens.push(token.clone());
                 global_tokens.push(value.clone());
                 index += 2;
             }
             "-y" | "--yes" => {
-                global_tokens.push(token.clone());
+                if !seen.insert("--yes".to_owned()) {
+                    return Err(usage_error("duplicate global option: --yes"));
+                }
+                global_tokens.push("--yes".to_owned());
                 index += 1;
             }
-            "-h" | "--help" => {
+            "-h" | "--help" if command_tokens.is_empty() => {
                 root_help = true;
                 index += 1;
             }
-            "--version" => {
+            "--version" if command_tokens.is_empty() => {
                 root_version = true;
                 index += 1;
             }
-            value if value.starts_with('-') => {
-                return Err(usage_error(format!(
-                    "unknown global option before command path: {value}"
-                )));
+            _ => {
+                command_tokens.push(token.clone());
+                index += 1;
             }
-            _ => break,
         }
     }
-    Ok(PrefixScan {
+
+    Ok(NormalizedInvocation {
         global_tokens,
-        path_start: index,
+        command_tokens,
         root_help,
         root_version,
     })
@@ -604,7 +623,10 @@ fn render_group_help(group: &str) -> String {
     let mut output = format!("dxb {group} commands:\n");
     for metadata in commands {
         let path = cli_path_tokens(metadata.command_key).join(" ");
-        output.push_str(&format!("  dxb {path:<32} kind={} wait={}\n", metadata.kind, metadata.wait_default));
+        output.push_str(&format!(
+            "  dxb {path:<32} kind={} wait={}\n",
+            metadata.kind, metadata.wait_default
+        ));
     }
     output
 }
@@ -672,9 +694,7 @@ fn owner_unavailable(command_key: &str, kind: &str) -> DxbotError {
     error_with(
         ErrorCode::InternalInvariant,
         ErrorCategory::Internal,
-        format!(
-            "registry command {command_key} ({kind}) has no connected production owner"
-        ),
+        format!("registry command {command_key} ({kind}) has no connected production owner"),
     )
 }
 
@@ -740,7 +760,7 @@ fn error_with(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
 
@@ -764,6 +784,21 @@ mod tests {
     }
 
     #[test]
+    fn global_options_are_order_independent_around_command_path() {
+        let output = execute(&args(&["bot", "--format", "json", "--help"]));
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("dxb bot commands"));
+    }
+
+    #[test]
+    fn duplicate_global_option_is_rejected() {
+        let output = execute(&args(&[
+            "--format", "json", "bot", "--format", "human", "list",
+        ]));
+        assert_eq!(output.exit_code, ErrorCode::Usage.exit_code());
+    }
+
+    #[test]
     fn version_json_uses_same_protocol_constants_as_transport() {
         let output = execute(&args(&["--format", "json", "--version"]));
         assert_eq!(output.exit_code, 0);
@@ -773,14 +808,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_leading_global_option_is_usage_error() {
-        let output = execute(&args(&["--wat", "bot", "list"]));
-        assert_eq!(output.exit_code, ErrorCode::Usage.exit_code());
-    }
-
-    #[test]
     fn timeout_parser_is_bounded() {
-        assert_eq!(parse_timeout(Some("250ms")).unwrap(), Duration::from_millis(250));
+        assert_eq!(
+            parse_timeout(Some("250ms")).expect("timeout parses"),
+            Duration::from_millis(250)
+        );
         assert!(parse_timeout(Some("11m")).is_err());
         assert!(parse_timeout(Some("0s")).is_err());
     }
