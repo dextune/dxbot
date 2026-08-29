@@ -8,12 +8,13 @@
 use std::sync::{Arc, Mutex};
 
 use dxbot_core::types::{BotSelector, ChannelSelector, ProjectSelector, ScopeSelector};
+use serde::{Deserialize, Serialize};
 
 use crate::mutation::AppError;
 use crate::query::{Page, paginate};
 use crate::state::DomainState;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipRecord {
     pub id: String,
     pub scope: ScopeSelector,
@@ -126,32 +127,23 @@ impl MembershipManager {
         cursor: Option<String>,
     ) -> Result<Page<MembershipSummary>, AppError> {
         let guard = self.lock()?;
-        let memberships: Vec<MembershipRecord> = guard
+        let rows = guard
             .memberships
             .values()
             .filter(|membership| membership.scope == *scope)
             .cloned()
-            .collect();
+            .collect::<Vec<_>>();
         Ok(paginate(
-            memberships,
+            rows,
             |membership| membership.id.clone(),
-            to_membership_summary,
+            |membership| MembershipSummary {
+                member_bot: membership.member_bot,
+                role: membership.role,
+                generation: membership.generation,
+            },
             page_size,
             cursor.as_deref(),
         ))
-    }
-
-    pub fn is_member(&self, scope: &ScopeSelector, bot: &BotSelector) -> bool {
-        self.role_of(scope, bot).is_some()
-    }
-
-    pub fn role_of(&self, scope: &ScopeSelector, bot: &BotSelector) -> Option<String> {
-        self.state.lock().ok().and_then(|guard| {
-            guard
-                .memberships
-                .get(&membership_key(scope, bot))
-                .map(|membership| membership.role.clone())
-        })
     }
 
     pub fn require_member(
@@ -159,43 +151,28 @@ impl MembershipManager {
         scope: &ScopeSelector,
         bot: &BotSelector,
     ) -> Result<MembershipRecord, AppError> {
-        self.lock()?
+        let guard = self.lock()?;
+        guard
             .memberships
             .get(&membership_key(scope, bot))
             .cloned()
-            .ok_or_else(|| {
-                AppError::PermissionDenied(format!(
-                    "bot {bot:?} is not a member of scope {scope:?}"
-                ))
-            })
+            .ok_or_else(|| AppError::PermissionDenied("bot is not a scope member".to_owned()))
     }
 
-    /// Capability-local role gate for delegation only; this is not general
-    /// runtime authority and does not replace Security AuthorityBinding.
     pub fn require_delegation_authority(
         &self,
         scope: &ScopeSelector,
         bot: &BotSelector,
     ) -> Result<String, AppError> {
         let membership = self.require_member(scope, bot)?;
-        if !Self::can_delegate(&membership.role) {
-            return Err(AppError::PermissionDenied(format!(
-                "bot {bot:?} with role {:?} is not authorized to delegate in scope {scope:?}",
+        if matches!(membership.role.as_str(), "owner" | "admin" | "delegate") {
+            Ok(membership.role)
+        } else {
+            Err(AppError::PermissionDenied(format!(
+                "membership role {} cannot delegate",
                 membership.role
-            )));
+            )))
         }
-        Ok(membership.role)
-    }
-
-    pub fn can_delegate(role: &str) -> bool {
-        matches!(
-            role.trim().to_ascii_lowercase().as_str(),
-            "owner" | "admin" | "manager" | "coordinator" | "lead"
-        )
-    }
-
-    pub fn snapshot(&self) -> Result<DomainState, AppError> {
-        self.lock().map(|guard| guard.clone())
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, DomainState>, AppError> {
@@ -205,46 +182,28 @@ impl MembershipManager {
     }
 }
 
-fn membership_key(scope: &ScopeSelector, member_bot: &BotSelector) -> String {
-    format!(
-        "membership:{}{}",
-        component("scope", &scope_key(scope)),
-        component("member", &bot_key(member_bot))
-    )
-}
-
-fn component(kind: &str, value: &str) -> String {
-    format!("{kind}:{}:{value};", value.len())
-}
-
-fn bot_key(bot: &BotSelector) -> String {
-    match bot {
-        BotSelector::CanonicalId(id) => component("bot-id", &id.0),
-        BotSelector::ScopedExact(name) => component("bot-exact", name),
-    }
+fn membership_key(scope: &ScopeSelector, bot: &BotSelector) -> String {
+    format!("{}|{}", scope_key(scope), bot_key(bot))
 }
 
 fn scope_key(scope: &ScopeSelector) -> String {
     match scope {
-        ScopeSelector::Bot(bot) => component("bot-scope", &bot_key(bot)),
-        ScopeSelector::Project(ProjectSelector::CanonicalId(id)) => component("project-id", &id.0),
+        ScopeSelector::Bot(selector) => format!("bot:{}", bot_key(selector)),
+        ScopeSelector::Project(ProjectSelector::CanonicalId(id)) => format!("project:{}", id.0),
         ScopeSelector::Project(ProjectSelector::VisibleExact(name)) => {
-            component("project-exact", name)
+            format!("project:exact:{name}")
         }
-        ScopeSelector::Channel(ChannelSelector::CanonicalId(id)) => component("channel-id", &id.0),
-        ScopeSelector::Channel(ChannelSelector::ProjectExact { project, name }) => format!(
-            "channel-project:{}{}",
-            component("project", project),
-            component("name", name)
-        ),
+        ScopeSelector::Channel(ChannelSelector::CanonicalId(id)) => format!("channel:{}", id.0),
+        ScopeSelector::Channel(ChannelSelector::ProjectExact { project, name }) => {
+            format!("channel:{project}:{name}")
+        }
     }
 }
 
-fn to_membership_summary(record: MembershipRecord) -> MembershipSummary {
-    MembershipSummary {
-        member_bot: record.member_bot,
-        role: record.role,
-        generation: record.generation,
+fn bot_key(bot: &BotSelector) -> String {
+    match bot {
+        BotSelector::CanonicalId(id) => id.0.clone(),
+        BotSelector::ScopedExact(name) => format!("exact:{name}"),
     }
 }
 
@@ -252,5 +211,5 @@ fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+        .unwrap_or_default()
 }
