@@ -60,6 +60,41 @@ impl TargetMaterialization {
     }
 }
 
+/// Server-side guard proving that a mutable payload crossed the preflight
+/// boundary with every operation-owned CAS field materialized. A custom client
+/// may not bypass optimistic concurrency by omitting guards that the CLI would
+/// normally resolve automatically.
+pub fn validate_materialized_cas(
+    payload: &dxbot_core::types::CommandPayload,
+) -> Result<(), DxbotError> {
+    let cas = payload.cas.unwrap_or_else(util::empty_cas);
+    if required_revision_missing(&payload.command_key, &cas) {
+        return Err(util::input_error(format!(
+            "{} is missing required materialized CAS",
+            payload.command_key
+        )));
+    }
+    if matches!(payload.command_key.as_str(), "task-cancel" | "task-suspend")
+        && cas.if_execution_generation.is_none()
+    {
+        return Err(util::input_error(format!(
+            "{} requires materialized execution generation",
+            payload.command_key
+        )));
+    }
+    if matches!(
+        payload.command_key.as_str(),
+        "project-member-remove" | "channel-member-remove"
+    ) && cas.if_membership_generation.is_none()
+    {
+        return Err(util::input_error(format!(
+            "{} requires materialized membership generation",
+            payload.command_key
+        )));
+    }
+    Ok(())
+}
+
 fn canonical_target(
     command: &str,
     input: &CliInput,
@@ -79,8 +114,12 @@ fn canonical_target(
         | "bot-list"
         | "project-create"
         | "project-list"
-        | "approval-list"
         | "provider-list" => CanonicalTarget::Instance(input.instance_id()),
+
+        "approval-list" if !selector.is_empty() => {
+            scope_target(&selector, cas.if_scope_revision.unwrap_or(0))
+        }
+        "approval-list" => CanonicalTarget::Instance(input.instance_id()),
 
         "bot-show" | "bot-activate" | "bot-deactivate" | "bot-archive" | "bot-restore" => {
             CanonicalTarget::Bot {
@@ -263,6 +302,11 @@ fn preflight_queries(command: &str, input: &CliInput, cas: &CasConditions) -> Ve
     {
         queries.push(format!("resolve-execution-generation:{command}:{selector}"));
     }
+    if matches!(command, "project-member-remove" | "channel-member-remove")
+        && cas.if_membership_generation.is_none()
+    {
+        queries.push(format!("resolve-membership-generation:{command}:{selector}"));
+    }
     queries.sort();
     queries.dedup();
     queries
@@ -275,9 +319,10 @@ fn is_canonical_like(value: &str) -> bool {
 fn required_revision_missing(command: &str, cas: &CasConditions) -> bool {
     match command {
         "bot-activate" | "bot-deactivate" | "bot-archive" | "bot-restore"
-        | "conversation-send" | "thread-send" | "thread-branch" | "task-cancel"
+        | "conversation-send" | "thread-create" | "thread-send" | "task-cancel"
         | "task-suspend" | "task-resume" | "task-redirect" | "approval-approve"
         | "approval-deny" | "side-effect-reconcile" => cas.if_revision.is_none(),
+        "thread-branch" => cas.if_source_revision.is_none(),
         "task-submit" | "memory-propose" => cas.if_scope_revision.is_none(),
         "memory-promote" => {
             cas.if_proposal_revision.is_none() || cas.if_target_scope_revision.is_none()
@@ -298,6 +343,7 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+    use crate::parse_bound_input;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
@@ -305,25 +351,79 @@ mod tests {
 
     #[test]
     fn project_create_targets_instance_not_unborn_project() {
-        let input = CliInput::parse(&args(&["project-create", "--name", "alpha", "--owner-bot", "bot-a"]))
-            .expect("input parses");
+        let input = parse_bound_input(&args(&[
+            "project-create",
+            "--name",
+            "alpha",
+            "--owner-bot",
+            "bot-a",
+        ]))
+        .expect("input parses");
         let target = TargetMaterialization::from_cli_input(&input).expect("target projects");
         assert!(matches!(target.canonical_target, CanonicalTarget::Instance(_)));
     }
 
     #[test]
-    fn task_submit_targets_owner_scope() {
-        let input = CliInput::parse(&args(&["task-submit", "--scope", "project:alpha", "--text", "x"]))
-            .expect("input parses");
+    fn task_submit_named_owner_targets_owner_scope() {
+        let input = parse_bound_input(&args(&[
+            "task-submit",
+            "--owner",
+            "project:alpha",
+            "--text",
+            "x",
+        ]))
+        .expect("input parses");
         let target = TargetMaterialization::from_cli_input(&input).expect("target projects");
         assert!(matches!(target.canonical_target, CanonicalTarget::Project { .. }));
     }
 
     #[test]
     fn scoped_selector_forces_preflight_query() {
-        let input = CliInput::parse(&args(&["task-cancel", "--task", "tasks/alpha"])).expect("input parses");
+        let input = parse_bound_input(&args(&["task-cancel", "--task", "tasks/alpha"]))
+            .expect("input parses");
         let target = TargetMaterialization::from_cli_input(&input).expect("target projects");
         let plan = target.plan_preflight(&input);
-        assert!(plan.queries.iter().any(|query| query.starts_with("resolve-target:")));
+        assert!(plan
+            .queries
+            .iter()
+            .any(|query| query.starts_with("resolve-target:")));
+    }
+
+    #[test]
+    fn thread_create_requires_materialized_conversation_revision() {
+        let payload = dxbot_core::types::CommandPayload {
+            command_key: "thread-create".to_owned(),
+            principal_ref: PrincipalRef("p".to_owned()),
+            instance_id: InstanceId("i".to_owned()),
+            canonical_target: CanonicalTarget::Conversation {
+                id: ConversationId("c".to_owned()),
+                revision: 1,
+            },
+            cas: Some(util::empty_cas()),
+            content: None,
+            semantic_options: serde_json::json!({}),
+        };
+        assert!(validate_materialized_cas(&payload).is_err());
+    }
+
+    #[test]
+    fn member_remove_requires_generation_in_addition_to_scope_revision() {
+        let mut cas = util::empty_cas();
+        cas.if_project_revision = Some(1);
+        let payload = dxbot_core::types::CommandPayload {
+            command_key: "project-member-remove".to_owned(),
+            principal_ref: PrincipalRef("p".to_owned()),
+            instance_id: InstanceId("i".to_owned()),
+            canonical_target: CanonicalTarget::Membership {
+                scope: ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
+                    "project-a".to_owned(),
+                ))),
+                member_bot: BotSelector::CanonicalId(BotId("bot-a".to_owned())),
+            },
+            cas: Some(cas),
+            content: None,
+            semantic_options: serde_json::json!({}),
+        };
+        assert!(validate_materialized_cas(&payload).is_err());
     }
 }
