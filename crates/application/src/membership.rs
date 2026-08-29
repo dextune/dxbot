@@ -3,7 +3,8 @@
 //!
 //! This module owns membership facts only. Runtime AuthorityBinding is owned by
 //! `runtime-security`; duplicating it here would create two canonical security
-//! states that can diverge.
+//! states that can diverge. Removed rows remain inactive generation tombstones
+//! so stale pre-removal CAS cannot recreate an ABA-equivalent membership.
 
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +22,8 @@ pub struct MembershipRecord {
     pub member_bot: BotSelector,
     pub role: String,
     pub generation: i64,
+    #[serde(default = "default_active")]
+    pub active: bool,
     pub created_at: i64,
 }
 
@@ -86,6 +89,7 @@ impl MembershipManager {
                 generation: existing.generation.checked_add(1).ok_or_else(|| {
                     AppError::Internal(format!("membership {key} generation exhausted"))
                 })?,
+                active: true,
                 created_at: existing.created_at,
             },
             None => MembershipRecord {
@@ -94,6 +98,7 @@ impl MembershipManager {
                 member_bot: member_bot.clone(),
                 role: role.to_owned(),
                 generation: 1,
+                active: true,
                 created_at: now,
             },
         };
@@ -110,18 +115,24 @@ impl MembershipManager {
     ) -> Result<(), AppError> {
         let mut guard = self.lock()?;
         let key = membership_key(scope, member_bot);
-        match guard.memberships.get(&key).map(|membership| membership.generation) {
-            None => Err(AppError::NotFound(format!("membership {key} does not exist"))),
-            Some(current) if current != if_membership_generation => Err(AppError::Conflict(
-                format!(
-                    "membership {key} generation mismatch: expected {if_membership_generation}, current {current}"
-                ),
-            )),
-            Some(_) => {
-                guard.memberships.remove(&key);
-                Ok(())
-            }
+        let membership = guard
+            .memberships
+            .get_mut(&key)
+            .ok_or_else(|| AppError::NotFound(format!("membership {key} does not exist")))?;
+        if !membership.active {
+            return Err(AppError::NotFound(format!("membership {key} is not active")));
         }
+        if membership.generation != if_membership_generation {
+            return Err(AppError::Conflict(format!(
+                "membership {key} generation mismatch: expected {if_membership_generation}, current {}",
+                membership.generation
+            )));
+        }
+        membership.generation = membership.generation.checked_add(1).ok_or_else(|| {
+            AppError::Internal(format!("membership {key} generation exhausted"))
+        })?;
+        membership.active = false;
+        Ok(())
     }
 
     pub fn list_memberships(
@@ -134,7 +145,7 @@ impl MembershipManager {
         let rows = guard
             .memberships
             .values()
-            .filter(|membership| membership.scope == *scope)
+            .filter(|membership| membership.active && membership.scope == *scope)
             .cloned()
             .collect::<Vec<_>>();
         Ok(paginate(
@@ -159,6 +170,7 @@ impl MembershipManager {
         guard
             .memberships
             .get(&membership_key(scope, bot))
+            .filter(|membership| membership.active)
             .cloned()
             .ok_or_else(|| AppError::PermissionDenied("bot is not a scope member".to_owned()))
     }
@@ -221,9 +233,58 @@ fn bot_key(bot: &BotSelector) -> String {
     }
 }
 
+fn default_active() -> bool {
+    true
+}
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use dxbot_core::types::{BotId, ProjectId};
+
+    use super::*;
+
+    fn fixture() -> (MembershipManager, ScopeSelector, BotSelector) {
+        let state = Arc::new(Mutex::new(DomainState::new()));
+        let scope = ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(
+            "project-a".to_owned(),
+        )));
+        let bot = BotSelector::CanonicalId(BotId("bot-a".to_owned()));
+        (MembershipManager::new(state), scope, bot)
+    }
+
+    #[test]
+    fn remove_and_readd_never_reuses_generation() {
+        let (mut manager, scope, bot) = fixture();
+        let created = manager
+            .set_membership(&scope, &bot, "member", None)
+            .expect("create membership");
+        manager
+            .remove_membership(&scope, &bot, created.generation)
+            .expect("remove membership");
+        let snapshot = manager.snapshot().expect("snapshot");
+        let tombstone = snapshot
+            .memberships
+            .get(&membership_key(&scope, &bot))
+            .expect("tombstone retained");
+        assert!(!tombstone.active);
+        assert_eq!(tombstone.generation, 2);
+
+        let stale = manager.set_membership(&scope, &bot, "member", Some(1));
+        assert!(matches!(stale, Err(AppError::Conflict(_))));
+
+        let restored = manager
+            .set_membership(&scope, &bot, "member", Some(2))
+            .expect("re-add with current generation");
+        assert!(restored.active);
+        assert_eq!(restored.generation, 3);
+    }
 }
