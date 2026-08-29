@@ -1,30 +1,25 @@
-//! Generated contract: `CommandPayload`, `PreflightPlan` and target materialization.
+//! `CliInput` to canonical payload / bounded preflight projection.
 //!
-//! This is the wire-side projection (per `DXB-IFC-040`/`DXB-IFC-042`): it turns a
-//! `CliInput` into a canonical `dxbot_core::types::CommandPayload`. Canonical target and
-//! required CAS are materialized from the user selector; a `PreflightPlan` records which
-//! revision/generation queries must run *before* the payload can be fully committed.
+//! This layer owns interface projection only. Scoped names may still require a
+//! Runtime preflight; no local alias or profile hint becomes canonical identity.
 
-use dxbot_core::types::*;
 use dxbot_core::DxbotError;
+use dxbot_core::types::*;
 
 use crate::cli_input::CliInput;
 use crate::util;
 
-/// The canonical wire payload projected from a `CliInput`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandPayload {
     pub inner: dxbot_core::types::CommandPayload,
 }
 
-/// The bounded preflight needed before a `CommandPayload` can be fully materialized.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreflightPlan {
     pub queries: Vec<String>,
     pub required_cas: CasConditions,
 }
 
-/// Resolved canonical target plus the CAS required to write it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TargetMaterialization {
     pub canonical_target: CanonicalTarget,
@@ -32,16 +27,15 @@ pub struct TargetMaterialization {
 }
 
 impl CommandPayload {
-    /// Project the canonical `CommandPayload` from a parsed `CliInput`.
     pub fn from_cli_input(input: &CliInput) -> Result<CommandPayload, DxbotError> {
-        let tm = TargetMaterialization::from_cli_input(input)?;
+        let target = TargetMaterialization::from_cli_input(input)?;
         Ok(CommandPayload {
             inner: dxbot_core::types::CommandPayload {
                 command_key: input.command_key.clone(),
                 principal_ref: input.principal_ref(),
                 instance_id: input.instance_id(),
-                canonical_target: tm.canonical_target,
-                cas: Some(tm.cas),
+                canonical_target: target.canonical_target,
+                cas: Some(target.cas),
                 content: input.content.clone(),
                 semantic_options: input.fields.clone(),
             },
@@ -50,21 +44,14 @@ impl CommandPayload {
 }
 
 impl TargetMaterialization {
-    /// Resolve the canonical target and required CAS for a `CliInput`.
-    ///
-    /// Without a runtime we can only materialize canonically-addressable selectors
-    /// directly; scoped-exact selectors or missing revisions surface as preflight queries
-    /// via [`Self::plan_preflight`].
     pub fn from_cli_input(input: &CliInput) -> Result<TargetMaterialization, DxbotError> {
-        let user_cas = input.cas.unwrap_or_else(util::empty_cas);
-        let target = canonical_target(&input.command_key, input, &user_cas)?;
+        let cas = input.cas.unwrap_or_else(util::empty_cas);
         Ok(TargetMaterialization {
-            canonical_target: target,
-            cas: user_cas,
+            canonical_target: canonical_target(&input.command_key, input, &cas)?,
+            cas,
         })
     }
 
-    /// Describe the queries needed before this payload can be fully materialized.
     pub fn plan_preflight(&self, input: &CliInput) -> PreflightPlan {
         PreflightPlan {
             queries: preflight_queries(&input.command_key, input, &self.cas),
@@ -74,16 +61,14 @@ impl TargetMaterialization {
 }
 
 fn canonical_target(
-    cmd: &str,
+    command: &str,
     input: &CliInput,
     cas: &CasConditions,
 ) -> Result<CanonicalTarget, DxbotError> {
-    let id = input.selector_value().unwrap_or_default();
+    let selector = input.selector_value().unwrap_or_default();
     let revision = cas.if_revision.unwrap_or(0);
-    let generated = cas.if_generation.unwrap_or(0);
-
-    let target = match cmd {
-        // Created/listed namespaces address the instance directly.
+    let generation = cas.if_generation.unwrap_or(0);
+    let target = match command {
         "runtime-start"
         | "runtime-status"
         | "runtime-stop-graceful"
@@ -92,192 +77,253 @@ fn canonical_target(
         | "version"
         | "bot-create"
         | "bot-list"
+        | "project-create"
         | "project-list"
-        | "provider-list"
-        | "task-list" => CanonicalTarget::Instance(input.instance_id()),
+        | "approval-list"
+        | "provider-list" => CanonicalTarget::Instance(input.instance_id()),
 
-        "bot-activate" | "bot-deactivate" | "bot-archive" | "bot-restore" | "bot-show" => {
+        "bot-show" | "bot-activate" | "bot-deactivate" | "bot-archive" | "bot-restore" => {
             CanonicalTarget::Bot {
-                id: BotId(id_for(inst(input), &id)),
+                id: BotId(selector_id(&selector)),
                 revision,
             }
         }
-        "conversation-send" | "conversation-show" | "conversation-history" => {
+        "conversation-show" | "conversation-send" | "conversation-history" | "thread-create" => {
             CanonicalTarget::Conversation {
-                id: ConversationId(id_for(inst(input), &id)),
+                id: ConversationId(selector_id(&selector)),
                 revision,
             }
         }
-        "thread-create" => CanonicalTarget::Conversation {
-            id: ConversationId(id_for(inst(input), &id)),
+        "thread-list" => CanonicalTarget::Conversation {
+            id: ConversationId(selector_id(&selector)),
             revision,
         },
-        "thread-send" | "thread-show" | "thread-history" | "thread-branch" => {
+        "thread-show" | "thread-send" | "thread-history" | "thread-branch" => {
             CanonicalTarget::Thread {
-                id: ThreadId(id_for(inst(input), &id)),
+                id: ThreadId(selector_id(&selector)),
                 parent_id: None,
                 revision,
             }
         }
-        "task-submit" | "task-show" | "task-watch" | "task-cancel" | "task-suspend"
-        | "task-resume" | "task-redirect" | "task-result" => CanonicalTarget::Task {
-            id: TaskId(id_for(inst(input), &id)),
+        "task-submit" | "task-list" => scope_target(&selector, cas.if_scope_revision.unwrap_or(0)),
+        "task-show" | "task-watch" | "task-cancel" | "task-suspend" | "task-resume"
+        | "task-redirect" | "task-result" => CanonicalTarget::Task {
+            id: TaskId(selector_id(&selector)),
             revision,
             execution_generation: cas.if_execution_generation,
         },
-        "memory-get" | "memory-history" | "memory-search" | "memory-propose"
-        | "memory-promote" => CanonicalTarget::Memory {
-            id: MemoryId(id_for(inst(input), &id)),
-            revision,
+        "memory-search" | "memory-propose" => {
+            scope_target(&selector, cas.if_scope_revision.unwrap_or(0))
+        }
+        "memory-get" | "memory-history" | "memory-promote" => CanonicalTarget::Memory {
+            id: MemoryId(selector_id(&selector)),
+            revision: cas.if_proposal_revision.or(cas.if_revision).unwrap_or(0),
         },
-        "project-create" | "project-show" | "project-archive" | "project-restore"
-        | "project-member-set" | "project-member-remove" | "project-member-list" => {
+        "project-show" | "project-archive" | "project-restore" | "project-member-list" => {
             CanonicalTarget::Project {
-                id: ProjectId(id_for(inst(input), &id)),
-                revision,
+                id: ProjectId(selector_id(&selector)),
+                revision: cas.if_project_revision.or(cas.if_revision).unwrap_or(0),
             }
         }
-        "channel-create" | "channel-list" => CanonicalTarget::Project {
-            id: ProjectId(id_for(inst(input), &id)),
-            revision,
+        "project-member-set" | "project-member-remove" => CanonicalTarget::Membership {
+            scope: ScopeSelector::Project(ProjectSelector::CanonicalId(ProjectId(selector_id(
+                &selector,
+            )))),
+            member_bot: BotSelector::CanonicalId(BotId(field_string(input, "member_bot")?)),
         },
-        "channel-show" | "channel-member-set" | "channel-member-remove"
-        | "channel-member-list" | "channel-send" | "channel-history" => CanonicalTarget::Channel {
-            id: ChannelId(id_for(inst(input), &id)),
-            project_id: ProjectId(".".to_string()),
-            revision,
+        "channel-create" | "channel-list" => CanonicalTarget::Project {
+            id: ProjectId(selector_id(&selector)),
+            revision: cas.if_project_revision.unwrap_or(0),
+        },
+        "channel-show" | "channel-send" | "channel-history" | "channel-member-list" => {
+            CanonicalTarget::Channel {
+                id: ChannelId(selector_id(&selector)),
+                project_id: ProjectId(field_string_or(input, "project", ".")),
+                revision: cas.if_channel_revision.or(cas.if_revision).unwrap_or(0),
+            }
+        }
+        "channel-member-set" | "channel-member-remove" => CanonicalTarget::Membership {
+            scope: ScopeSelector::Channel(ChannelSelector::CanonicalId(ChannelId(selector_id(
+                &selector,
+            )))),
+            member_bot: BotSelector::CanonicalId(BotId(field_string(input, "member_bot")?)),
         },
         "process-show" | "process-watch" => CanonicalTarget::Process {
-            id: ProcessId(id_for(inst(input), &id)),
+            id: ProcessId(selector_id(&selector)),
         },
         "operation-show" | "operation-reconcile" => CanonicalTarget::Operation {
-            operation_id: OperationId(id_for(inst(input), &id)),
-            command_id: CommandId(".".to_string()),
+            operation_id: OperationId(selector_id(&selector)),
+            command_id: CommandId(field_string_or(input, "command_id", ".")),
         },
-        "approval-list" | "approval-show" | "approval-approve" | "approval-deny" => {
-            CanonicalTarget::Approval {
-                id: ApprovalId(id_for(inst(input), &id)),
-                revision,
-            }
-        }
+        "approval-show" | "approval-approve" | "approval-deny" => CanonicalTarget::Approval {
+            id: ApprovalId(selector_id(&selector)),
+            revision,
+        },
         "provider-show" => CanonicalTarget::Provider {
-            id: ProviderId(id_for(inst(input), &id)),
-            generation: generated,
+            id: ProviderId(selector_id(&selector)),
+            generation,
         },
         "side-effect-reconcile" => CanonicalTarget::SideEffect {
-            id: id_for(inst(input), &id),
+            id: selector_id(&selector),
             revision,
         },
         other => {
             return Err(util::invariant(format!(
-                "no canonical target defined for command '{other}'"
+                "no canonical target projection for command '{other}'"
             )));
         }
     };
     Ok(target)
 }
 
-fn inst(input: &CliInput) -> String {
-    input.instance_id().0
-}
-
-/// Use the selector value when provided, otherwise fall back to the instance id so the
-/// target is always deterministically addressable during projection.
-fn id_for(instance: String, id: &str) -> String {
-    if id.is_empty() {
-        instance
+fn scope_target(value: &str, revision: i64) -> CanonicalTarget {
+    if let Some(id) = value.strip_prefix("project:") {
+        CanonicalTarget::Project {
+            id: ProjectId(id.to_owned()),
+            revision,
+        }
+    } else if let Some(id) = value.strip_prefix("channel:") {
+        CanonicalTarget::Channel {
+            id: ChannelId(id.to_owned()),
+            project_id: ProjectId(".".to_owned()),
+            revision,
+        }
+    } else if let Some(id) = value.strip_prefix("bot:") {
+        CanonicalTarget::Bot {
+            id: BotId(id.to_owned()),
+            revision,
+        }
     } else {
-        id.to_string()
+        CanonicalTarget::Bot {
+            id: BotId(value.to_owned()),
+            revision,
+        }
     }
 }
 
-fn preflight_queries(cmd: &str, input: &CliInput, cas: &CasConditions) -> Vec<String> {
-    let id = input.selector_value().unwrap_or_default();
+fn selector_id(value: &str) -> String {
+    [
+        "bot:",
+        "conversation:",
+        "thread:",
+        "task:",
+        "project:",
+        "channel:",
+        "memory:",
+        "operation:",
+        "approval:",
+        "provider:",
+        "process:",
+        "side-effect:",
+    ]
+    .iter()
+    .find_map(|prefix| value.strip_prefix(prefix))
+    .unwrap_or(value)
+    .to_owned()
+}
+
+fn field_string(input: &CliInput, name: &str) -> Result<String, DxbotError> {
+    input
+        .fields
+        .get(name)
+        .and_then(ValueExt::as_string)
+        .ok_or_else(|| util::input_error(format!("{} requires field '{name}'", input.command_key)))
+}
+
+fn field_string_or(input: &CliInput, name: &str, default: &str) -> String {
+    input
+        .fields
+        .get(name)
+        .and_then(ValueExt::as_string)
+        .unwrap_or(default)
+        .to_owned()
+}
+
+trait ValueExt {
+    fn as_string(&self) -> Option<&str>;
+}
+
+impl ValueExt for serde_json::Value {
+    fn as_string(&self) -> Option<&str> {
+        self.as_str()
+    }
+}
+
+fn preflight_queries(command: &str, input: &CliInput, cas: &CasConditions) -> Vec<String> {
+    let selector = input.selector_value().unwrap_or_default();
     let mut queries = Vec::new();
-
-    // Scoped/exact selectors must be resolved to a canonical id before commit.
-    if !id.is_empty() && !is_canonical_like(&id) {
-        queries.push(format!("resolve-target:{cmd} {id}"));
+    if !selector.is_empty() && !is_canonical_like(&selector) {
+        queries.push(format!("resolve-target:{command}:{selector}"));
     }
-
-    // Revision-guarded mutations need the "current" revision if the user did not supply one.
-    if needs_revision(cmd) && cas.if_revision.is_none() {
-        queries.push(format!("resolve-revision:{cmd} {id}"));
+    if required_revision_missing(command, cas) {
+        queries.push(format!("resolve-revision:{command}:{selector}"));
     }
-    if matches!(cmd, "task-cancel" | "task-suspend") && cas.if_execution_generation.is_none() {
-        queries.push(format!("resolve-execution-generation:{cmd} {id}"));
+    if matches!(command, "task-cancel" | "task-suspend")
+        && cas.if_execution_generation.is_none()
+    {
+        queries.push(format!("resolve-execution-generation:{command}:{selector}"));
     }
-
     queries.sort();
     queries.dedup();
     queries
 }
 
-/// Heuristic: canonical ids are stable tokens; anything with a `/` scope separator or a
-/// space is treated as a scoped-exact name that requires resolution.
-fn is_canonical_like(id: &str) -> bool {
-    !id.contains('/') && !id.contains(' ') && !id.is_empty()
+fn is_canonical_like(value: &str) -> bool {
+    !value.is_empty() && !value.contains('/') && !value.contains(' ')
 }
 
-fn needs_revision(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        "bot-activate"
-            | "bot-deactivate"
-            | "bot-archive"
-            | "bot-restore"
-            | "conversation-send"
-            | "thread-send"
-            | "thread-branch"
-            | "task-submit"
-            | "task-cancel"
-            | "task-suspend"
-            | "task-resume"
-            | "task-redirect"
-            | "memory-propose"
-            | "memory-promote"
-            | "project-archive"
-            | "project-restore"
-            | "project-member-set"
-            | "project-member-remove"
-            | "channel-create"
-            | "channel-member-set"
-            | "channel-member-remove"
-            | "channel-send"
-            | "operation-reconcile"
-            | "approval-approve"
-            | "approval-deny"
-            | "side-effect-reconcile"
-    )
+fn required_revision_missing(command: &str, cas: &CasConditions) -> bool {
+    match command {
+        "bot-activate" | "bot-deactivate" | "bot-archive" | "bot-restore"
+        | "conversation-send" | "thread-send" | "thread-branch" | "task-cancel"
+        | "task-suspend" | "task-resume" | "task-redirect" | "approval-approve"
+        | "approval-deny" | "side-effect-reconcile" => cas.if_revision.is_none(),
+        "task-submit" | "memory-propose" => cas.if_scope_revision.is_none(),
+        "memory-promote" => {
+            cas.if_proposal_revision.is_none() || cas.if_target_scope_revision.is_none()
+        }
+        "project-archive" | "project-restore" => cas.if_revision.is_none(),
+        "project-member-set" | "project-member-remove" | "channel-create" => {
+            cas.if_project_revision.is_none()
+        }
+        "channel-member-set" | "channel-member-remove" => cas.if_channel_revision.is_none(),
+        "channel-send" => cas.if_revision.is_none(),
+        "operation-reconcile" => cas.if_receipt_revision.is_none(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
-    fn sl(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
     }
 
     #[test]
-    fn projects_bot_command_payload() {
-        let input = CliInput::parse(&sl(&["bot-show", "--bot", "bot-42"])).unwrap();
-        let payload = CommandPayload::from_cli_input(&input).unwrap();
-        assert_eq!(payload.inner.command_key, "bot-show");
-        match &payload.inner.canonical_target {
-            CanonicalTarget::Bot { id, .. } => assert_eq!(id.0, "bot-42"),
-            other => panic!("expected Bot target, got {other:?}"),
-        }
-        assert!(payload.inner.cas.is_some());
+    fn project_create_targets_instance_not_unborn_project() {
+        let input = CliInput::parse(&args(&["project-create", "--name", "alpha", "--owner-bot", "bot-a"]))
+            .expect("input parses");
+        let target = TargetMaterialization::from_cli_input(&input).expect("target projects");
+        assert!(matches!(target.canonical_target, CanonicalTarget::Instance(_)));
+    }
+
+    #[test]
+    fn task_submit_targets_owner_scope() {
+        let input = CliInput::parse(&args(&["task-submit", "--scope", "project:alpha", "--text", "x"]))
+            .expect("input parses");
+        let target = TargetMaterialization::from_cli_input(&input).expect("target projects");
+        assert!(matches!(target.canonical_target, CanonicalTarget::Project { .. }));
     }
 
     #[test]
     fn scoped_selector_forces_preflight_query() {
-        let input = CliInput::parse(&sl(&["task-cancel", "--task", "tasks/alpha"])).unwrap();
-        let tm = TargetMaterialization::from_cli_input(&input).unwrap();
-        let plan = tm.plan_preflight(&input);
-        assert!(!plan.queries.is_empty());
-        assert!(plan.queries.iter().any(|q| q.starts_with("resolve-target:")));
+        let input = CliInput::parse(&args(&["task-cancel", "--task", "tasks/alpha"])).expect("input parses");
+        let target = TargetMaterialization::from_cli_input(&input).expect("target projects");
+        let plan = target.plan_preflight(&input);
+        assert!(plan.queries.iter().any(|query| query.starts_with("resolve-target:")));
     }
 }
