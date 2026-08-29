@@ -6,15 +6,17 @@
 //! chosen before dispatch are preserved through the authoritative mutation
 //! boundary. Missing ownership relationships are never fabricated.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use dxbot_core::receipt::{ReceiptDisposition, ReceiptRecord};
 use dxbot_core::types::{
-    CanonicalTarget, CasConditions, CommandId, CommandPayload, ConversationId, InstanceId,
-    OperationId, OperationRequest, OperationResult, RequestDigest, ThreadId,
+    CanonicalTarget, CasConditions, CommandId, CommandPayload, ConversationId, IdempotencyKey,
+    InstanceId, OperationId, OperationRequest, OperationResult, RequestDigest, ThreadId,
 };
 
 use crate::outcome::{DomainOutcome, resolve_outcome};
+use crate::persistence::ApplicationStateStore;
 use crate::state::{
     BotState, ConversationState, DomainState, IdempotencyBindingState, LifecycleState, ThreadState,
 };
@@ -40,6 +42,7 @@ struct OperationIdentity {
 #[derive(Debug)]
 pub struct ApplicationMutator {
     state: Arc<Mutex<DomainState>>,
+    persistence: Option<Arc<ApplicationStateStore>>,
 }
 
 impl Default for ApplicationMutator {
@@ -56,13 +59,29 @@ impl ApplicationMutator {
     pub fn with_state(state: DomainState) -> Self {
         Self {
             state: Arc::new(Mutex::new(state)),
+            persistence: None,
         }
+    }
+
+    /// Load canonical Application state from a versioned owner-only snapshot.
+    /// Every later successful mutation is durably published before success is
+    /// returned to Control.
+    pub fn with_persistent_state(path: PathBuf) -> Result<Self, AppError> {
+        let (store, state) = ApplicationStateStore::open(path)?;
+        Ok(Self {
+            state: Arc::new(Mutex::new(state)),
+            persistence: Some(Arc::new(store)),
+        })
     }
 
     pub fn snapshot(&self) -> Result<DomainState, AppError> {
         self.lock()
             .map(|guard| guard.clone())
             .map_err(AppError::Internal)
+    }
+
+    pub(crate) fn state_handle(&self) -> Arc<Mutex<DomainState>> {
+        self.state.clone()
     }
 
     pub fn mutate(&self, request: &OperationRequest) -> Result<OperationResult, AppError> {
@@ -81,34 +100,7 @@ impl ApplicationMutator {
             guard.idempotency_bindings.get(&idempotency_binding),
         ) {
             (Some(operation_id), Some(bound_binding)) => {
-                if bound_binding.command_id != request.command_id {
-                    return Err(AppError::Conflict(
-                        "idempotency key is already bound to another command".to_string(),
-                    ));
-                }
-                if bound_binding.expires_at != request.idempotency_key.expires_at {
-                    return Err(AppError::Conflict(
-                        "idempotency key expiry does not match durable binding".to_string(),
-                    ));
-                }
-                if operation_id != &request.new_operation_id {
-                    return Err(AppError::Conflict(
-                        "command binding operation id mismatch".to_string(),
-                    ));
-                }
-                let stored_digest = guard
-                    .command_request_digests
-                    .get(&request.command_id)
-                    .ok_or_else(|| {
-                        AppError::Internal(
-                            "command binding exists without request digest".to_string(),
-                        )
-                    })?;
-                if stored_digest != &request.request_digest {
-                    return Err(AppError::Conflict(
-                        "command binding request digest mismatch".to_string(),
-                    ));
-                }
+                validate_existing_binding(&guard, operation_id, bound_binding, request)?;
                 let result = guard.results.get(operation_id).cloned().ok_or_else(|| {
                     AppError::Internal(
                         "committed command binding exists without operation result".to_string(),
@@ -133,6 +125,7 @@ impl ApplicationMutator {
             ));
         }
 
+        let rollback = self.persistence.as_ref().map(|_| guard.clone());
         self.validate_target_against(&guard, &payload.canonical_target, &payload.cas)?;
         let outcome = resolve_outcome(&guard, &payload.canonical_target, &payload.cas);
         let identity = OperationIdentity {
@@ -157,7 +150,49 @@ impl ApplicationMutator {
                 expires_at: request.idempotency_key.expires_at,
             },
         );
+
+        if let Some(store) = &self.persistence {
+            if let Err(error) = store.persist(&guard) {
+                if let Some(previous) = rollback {
+                    *guard = previous;
+                }
+                return Err(error);
+            }
+        }
         Ok(result)
+    }
+
+    /// Lookup the canonical result for a durable command/idempotency binding.
+    /// This is used by recovery after a CLI Dispatching record survives response
+    /// loss or a Runtime restart.
+    pub fn lookup_binding(
+        &self,
+        command_id: &CommandId,
+        key: &IdempotencyKey,
+    ) -> Result<Option<OperationResult>, AppError> {
+        let guard = self.lock().map_err(AppError::Internal)?;
+        let binding_key = (key.principal_ref.0.clone(), key.key_digest.clone());
+        let Some(bound) = guard.idempotency_bindings.get(&binding_key) else {
+            return Ok(None);
+        };
+        if bound.command_id != *command_id || bound.expires_at != key.expires_at {
+            return Err(AppError::Conflict(
+                "idempotency binding does not match command lookup".to_owned(),
+            ));
+        }
+        let Some(operation_id) = guard.command_bindings.get(command_id) else {
+            return Err(AppError::Internal(
+                "idempotency binding exists without command binding".to_owned(),
+            ));
+        };
+        guard
+            .results
+            .get(operation_id)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                AppError::Internal("command binding exists without operation result".to_owned())
+            })
     }
 
     pub fn validate_target(
@@ -421,6 +456,41 @@ impl ApplicationMutator {
             "conversation_ref": format!("conversation:{}", conversation_id.0),
         })))
     }
+}
+
+fn validate_existing_binding(
+    guard: &DomainState,
+    operation_id: &OperationId,
+    bound_binding: &IdempotencyBindingState,
+    request: &OperationRequest,
+) -> Result<(), AppError> {
+    if bound_binding.command_id != request.command_id {
+        return Err(AppError::Conflict(
+            "idempotency key is already bound to another command".to_string(),
+        ));
+    }
+    if bound_binding.expires_at != request.idempotency_key.expires_at {
+        return Err(AppError::Conflict(
+            "idempotency key expiry does not match durable binding".to_string(),
+        ));
+    }
+    if operation_id != &request.new_operation_id {
+        return Err(AppError::Conflict(
+            "command binding operation id mismatch".to_string(),
+        ));
+    }
+    let stored_digest = guard
+        .command_request_digests
+        .get(&request.command_id)
+        .ok_or_else(|| {
+            AppError::Internal("command binding exists without request digest".to_string())
+        })?;
+    if stored_digest != &request.request_digest {
+        return Err(AppError::Conflict(
+            "command binding request digest mismatch".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_request_identity(request: &OperationRequest) -> Result<(), AppError> {
