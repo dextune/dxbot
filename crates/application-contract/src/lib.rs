@@ -11,6 +11,8 @@ pub mod contract;
 pub mod command;
 /// Verified Instance/authenticated Principal projection for production execution.
 pub mod execution;
+/// Registry-driven user path/positional invocation binding.
+pub mod invocation;
 /// Versioned bounded local control protocol shared by client/server.
 pub mod local_control;
 /// Golden-file contract test support.
@@ -27,6 +29,7 @@ pub use command::{
 pub use contract::{CommandPayload, PreflightPlan, TargetMaterialization};
 pub use execution::{ExecutionContext, project_for_execution};
 pub use golden::GoldenContract;
+pub use invocation::{MAX_CLI_TOKEN_BYTES, MAX_CLI_TOKENS, parse_bound_input};
 pub use local_control::{
     LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_VERSION, LocalControlCodecError,
     LocalControlHandshake, LocalControlHello, LocalControlRequest, LocalControlResponse,
