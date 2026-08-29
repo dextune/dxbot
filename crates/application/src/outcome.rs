@@ -96,7 +96,7 @@ pub fn cas_if_revision(revision: i64) -> CasConditions {
 
 #[cfg(test)]
 mod tests {
-    use dxbot_core::types::{ThreadId, ThreadSelector};
+    use dxbot_core::types::ThreadId;
 
     use super::*;
     use crate::state::ThreadState;
@@ -123,7 +123,9 @@ mod tests {
         };
         let mut cas = cas_if_revision(99);
         cas.if_source_revision = Some(7);
-        assert_eq!(resolve_outcome(&state, &target, &Some(cas)), DomainOutcome::Updated);
-        let _ = ThreadSelector::CanonicalId(ThreadId("unused".to_owned()));
+        assert_eq!(
+            resolve_outcome(&state, &target, &Some(cas)),
+            DomainOutcome::Updated
+        );
     }
 }
