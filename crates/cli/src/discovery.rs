@@ -14,6 +14,10 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+use application_contract::{LOCAL_CONTROL_PROTOCOL_VERSION, LOCAL_CONTROL_SCHEMA_VERSION};
 use dxbot_core::error::{DxbotError, ErrorCategory, ErrorCode};
 use dxbot_core::types::{InstanceId, VersionInfo};
 use serde::{Deserialize, Serialize};
@@ -29,6 +33,31 @@ pub struct DiscoveryEndpoint {
     pub host_generation: i64,
     pub provider_id: String,
     pub provider_ready: bool,
+}
+
+impl DiscoveryEndpoint {
+    #[cfg(unix)]
+    pub fn unix_socket_path(&self) -> Result<PathBuf, DiscoveryError> {
+        let path = self.endpoint.strip_prefix("unix://").ok_or_else(|| {
+            DiscoveryError::InvalidEndpoint {
+                message: format!("unsupported local endpoint scheme: {}", self.endpoint),
+            }
+        })?;
+        if path.is_empty() {
+            return Err(DiscoveryError::InvalidEndpoint {
+                message: "Unix endpoint path is empty".to_owned(),
+            });
+        }
+        Ok(PathBuf::from(path))
+    }
+}
+
+/// Selected descriptor plus the UID that owns the durable discovery record.
+/// The transport must verify that the live endpoint has the same owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedEndpoint {
+    pub descriptor: DiscoveryEndpoint,
+    pub state_owner_uid: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +85,7 @@ impl DiscoveryState {
             }
             Err(error) => return Err(DiscoveryError::state_io(&path, error)),
         };
+        validate_state_file(&path)?;
         serde_json::from_slice(&data).map_err(|error| DiscoveryError::StateIo {
             path,
             message: error.to_string(),
@@ -67,6 +97,7 @@ impl DiscoveryState {
     pub fn save_state(&self, base_path: &Path) -> Result<(), DiscoveryError> {
         fs::create_dir_all(base_path)
             .map_err(|error| DiscoveryError::state_io(base_path, error))?;
+        harden_directory(base_path)?;
         let path = base_path.join(DISCOVERY_STATE_FILE);
         let tmp = base_path.join(format!("{DISCOVERY_STATE_FILE}.tmp"));
         let bytes = serde_json::to_vec(self).map_err(|error| DiscoveryError::StateIo {
@@ -76,12 +107,15 @@ impl DiscoveryState {
         {
             let mut file = File::create(&tmp)
                 .map_err(|error| DiscoveryError::state_io(&tmp, error))?;
+            harden_file(&tmp)?;
             file.write_all(&bytes)
                 .map_err(|error| DiscoveryError::state_io(&tmp, error))?;
             file.sync_all()
                 .map_err(|error| DiscoveryError::state_io(&tmp, error))?;
         }
         fs::rename(&tmp, &path).map_err(|error| DiscoveryError::state_io(&tmp, error))?;
+        sync_directory(base_path)?;
+        validate_state_file(&path)?;
         Ok(())
     }
 }
@@ -93,6 +127,7 @@ pub enum DiscoveryError {
     NotFound { instance_id: InstanceId },
     StateIo { path: PathBuf, message: String },
     BootstrapConflict { existing: Vec<InstanceId> },
+    InvalidEndpoint { message: String },
 }
 
 impl DiscoveryError {
@@ -136,6 +171,11 @@ impl DiscoveryError {
                     format!("first-run bootstrap refused: Instances already exist ({names:?})"),
                 )
             }
+            Self::InvalidEndpoint { message } => dxbot_error(
+                ErrorCode::Incompatible,
+                ErrorCategory::Conflict,
+                message.clone(),
+            ),
         }
     }
 }
@@ -188,6 +228,10 @@ impl Discovery {
         Self { base_path }
     }
 
+    pub fn base_path(&self) -> &Path {
+        &self.base_path
+    }
+
     pub fn show_help() -> String {
         "\
 dxb — DXBOT command line interface
@@ -222,6 +266,7 @@ Command groups:
   provider      List, show.
   operation     Show, reconcile.
   process       Show, watch.
+  side-effect   Reconcile.
   version       Show client version and protocol compatibility.
 
 Instance selection:
@@ -240,8 +285,8 @@ Runtime bootstrap:
     pub fn show_version() -> VersionInfo {
         VersionInfo {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
-            supported_protocol_versions: vec!["1".to_string()],
-            supported_schema_versions: vec!["v1".to_string()],
+            supported_protocol_versions: vec![LOCAL_CONTROL_PROTOCOL_VERSION.to_owned()],
+            supported_schema_versions: vec![LOCAL_CONTROL_SCHEMA_VERSION.to_owned()],
             remote_compatibility: None,
         }
     }
@@ -251,12 +296,23 @@ Runtime bootstrap:
         profile: Option<&str>,
         instance: Option<&str>,
     ) -> Result<InstanceId, DiscoveryError> {
+        self.select_endpoint(profile, instance)
+            .map(|selected| selected.descriptor.instance_id)
+    }
+
+    pub fn select_endpoint(
+        &self,
+        profile: Option<&str>,
+        instance: Option<&str>,
+    ) -> Result<SelectedEndpoint, DiscoveryError> {
         let state = DiscoveryState::load_state(&self.base_path)?;
-        let mut candidates: Vec<InstanceId> = if let Some(name) = instance {
+        let state_file = self.base_path.join(DISCOVERY_STATE_FILE);
+        let owner_uid = discovery_owner_uid(&state_file)?;
+        let mut candidates: Vec<DiscoveryEndpoint> = if let Some(name) = instance {
             state
                 .instance_endpoints
-                .keys()
-                .filter(|id| id.0 == name)
+                .values()
+                .filter(|endpoint| endpoint.instance_id.0 == name)
                 .cloned()
                 .collect()
         } else if let Some(profile) = profile {
@@ -264,16 +320,21 @@ Runtime bootstrap:
                 .instance_endpoints
                 .values()
                 .filter(|endpoint| endpoint.profile.as_deref() == Some(profile))
-                .map(|endpoint| endpoint.instance_id.clone())
+                .cloned()
                 .collect()
         } else {
-            state.instance_endpoints.keys().cloned().collect()
+            state.instance_endpoints.values().cloned().collect()
         };
-        candidates.sort_by(|a, b| a.0.cmp(&b.0));
-        candidates.dedup();
+        candidates.sort_by(|a, b| a.instance_id.0.cmp(&b.instance_id.0));
+        candidates.dedup_by(|a, b| a.instance_id == b.instance_id);
 
         if candidates.len() == 1 {
-            return Ok(candidates.remove(0));
+            let descriptor = candidates.remove(0);
+            validate_descriptor(&descriptor)?;
+            return Ok(SelectedEndpoint {
+                descriptor,
+                state_owner_uid: owner_uid,
+            });
         }
         if candidates.is_empty() {
             let wanted = match (profile, instance) {
@@ -285,7 +346,12 @@ Runtime bootstrap:
                 message: format!("no Runtime Instance found matching {wanted}"),
             });
         }
-        Err(DiscoveryError::Ambiguous { candidates })
+        Err(DiscoveryError::Ambiguous {
+            candidates: candidates
+                .into_iter()
+                .map(|endpoint| endpoint.instance_id)
+                .collect(),
+        })
     }
 
     /// Refuses to synthesize first-run state in the CLI layer. The Runtime Host
@@ -336,4 +402,83 @@ impl Default for Discovery {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn validate_descriptor(descriptor: &DiscoveryEndpoint) -> Result<(), DiscoveryError> {
+    if descriptor.instance_id.0.trim().is_empty() {
+        return Err(DiscoveryError::InvalidEndpoint {
+            message: "discovery descriptor has an empty InstanceId".to_owned(),
+        });
+    }
+    if descriptor.host_generation <= 0 {
+        return Err(DiscoveryError::InvalidEndpoint {
+            message: format!(
+                "discovery descriptor has invalid HostGeneration {}",
+                descriptor.host_generation
+            ),
+        });
+    }
+    #[cfg(unix)]
+    descriptor.unix_socket_path()?;
+    Ok(())
+}
+
+fn validate_state_file(path: &Path) -> Result<(), DiscoveryError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| DiscoveryError::state_io(path, error))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(DiscoveryError::StateIo {
+            path: path.to_path_buf(),
+            message: "discovery state must be a direct regular file".to_owned(),
+        });
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(DiscoveryError::StateIo {
+            path: path.to_path_buf(),
+            message: "discovery state permissions must be owner-only".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn discovery_owner_uid(path: &Path) -> Result<u32, DiscoveryError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| DiscoveryError::state_io(path, error))?;
+    Ok(metadata.uid())
+}
+
+#[cfg(not(unix))]
+fn discovery_owner_uid(_path: &Path) -> Result<u32, DiscoveryError> {
+    Err(DiscoveryError::InvalidEndpoint {
+        message: "P0 local control discovery requires a Unix platform".to_owned(),
+    })
+}
+
+#[cfg(unix)]
+fn harden_directory(path: &Path) -> Result<(), DiscoveryError> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| DiscoveryError::state_io(path, error))
+}
+
+#[cfg(not(unix))]
+fn harden_directory(_path: &Path) -> Result<(), DiscoveryError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_file(path: &Path) -> Result<(), DiscoveryError> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| DiscoveryError::state_io(path, error))
+}
+
+#[cfg(not(unix))]
+fn harden_file(_path: &Path) -> Result<(), DiscoveryError> {
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), DiscoveryError> {
+    let directory = File::open(path).map_err(|error| DiscoveryError::state_io(path, error))?;
+    directory
+        .sync_all()
+        .map_err(|error| DiscoveryError::state_io(path, error))
 }
