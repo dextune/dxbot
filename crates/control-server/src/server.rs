@@ -251,9 +251,12 @@ impl ControlServer {
             .lookup_binding(&request.command_id, &request.idempotency_key)
             .map_err(map_app_error)?
         {
+            validate_exact_retry(&result, request)?;
             return Ok(result);
         }
 
+        application_contract::validate_materialized_cas(&request.payload)
+            .map_err(|error| ServerError::Conflict(error.message))?;
         self.require_provider_admission(&request.payload)?;
         let delta = self.security_delta(authenticated_principal, request)?;
         if delta.is_empty() {
@@ -636,10 +639,12 @@ impl ControlServer {
                     .get("state")
                     .and_then(Value::as_str)
                     .map(str::to_ascii_lowercase);
-                let scope_filter = payload
+                let target_scope = target_scope_label(&payload.canonical_target);
+                let semantic_scope = payload
                     .semantic_options
                     .get("scope")
                     .and_then(Value::as_str);
+                let scope_filter = semantic_scope.or(target_scope.as_deref());
                 let records = security
                     .approvals
                     .list_approvals()
@@ -787,6 +792,23 @@ impl ControlServer {
     }
 }
 
+fn validate_exact_retry(
+    result: &OperationResult,
+    request: &OperationRequest,
+) -> Result<(), ServerError> {
+    if result.command_id != request.command_id
+        || result.operation_id != request.new_operation_id
+        || result.instance_id != request.payload.instance_id
+        || result.receipt.operation_id != request.new_operation_id.0
+        || result.receipt.resolved_binding_digest != request.request_digest.0
+    {
+        return Err(ServerError::Conflict(
+            "existing command binding does not match exact retry identity".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_local_operator(
     security: &mut SecurityState,
     principal: &PrincipalRef,
@@ -884,6 +906,15 @@ fn approval_state_name(state: ApprovalState) -> &'static str {
         ApprovalState::Denied => "denied",
         ApprovalState::Expired => "expired",
         ApprovalState::Revoked => "revoked",
+    }
+}
+
+fn target_scope_label(target: &CanonicalTarget) -> Option<String> {
+    match target {
+        CanonicalTarget::Bot { id, .. } => Some(format!("bot:{}", id.0)),
+        CanonicalTarget::Project { id, .. } => Some(format!("project:{}", id.0)),
+        CanonicalTarget::Channel { id, .. } => Some(format!("channel:{}", id.0)),
+        _ => None,
     }
 }
 
