@@ -16,8 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use dxbot_core::receipt::ReceiptRecord;
 use dxbot_core::types::{
-    BotId, BotSelector, CommandId, ConversationId, MessageId, OperationId, OperationResult,
-    RequestDigest, ScopeSelector, TaskId, ThreadId,
+    CommandId, OperationId, OperationResult, RequestDigest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,11 +24,11 @@ use crate::delegation::{DelegationRecord, DelegationStatus};
 use crate::membership::MembershipRecord;
 use crate::mutation::AppError;
 use crate::state::{
-    BotState, ConversationState, DomainState, IdempotencyBindingState, LifecycleState, TaskState,
-    TaskStatus, ThreadState,
+    BotState, ChannelState, ConversationState, DomainState, IdempotencyBindingState, MemoryState,
+    MessageState, ProjectState, SideEffectState, TaskState, ThreadState,
 };
 
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 2;
 const OWNER_DIRECTORY_MODE: u32 = 0o700;
 const OWNER_FILE_MODE: u32 = 0o600;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -49,10 +48,9 @@ impl ApplicationStateStore {
             Ok(metadata) => {
                 validate_snapshot_file(&path, &metadata)?;
                 let bytes = fs::read(&path).map_err(io_error)?;
-                let snapshot: SnapshotV1 = serde_json::from_slice(&bytes)
-                    .map_err(|error| AppError::Internal(format!(
-                        "application snapshot is corrupt: {error}"
-                    )))?;
+                let snapshot: SnapshotV2 = serde_json::from_slice(&bytes).map_err(|error| {
+                    AppError::Internal(format!("application snapshot is corrupt: {error}"))
+                })?;
                 snapshot.into_state()?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => DomainState::new(),
@@ -68,8 +66,7 @@ impl ApplicationStateStore {
         fs::create_dir_all(parent).map_err(io_error)?;
         harden_directory(parent)?;
 
-        let snapshot = SnapshotV1::from_state(state);
-        let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
+        let bytes = serde_json::to_vec(&SnapshotV2::from_state(state)).map_err(|error| {
             AppError::Internal(format!("cannot serialize application snapshot: {error}"))
         })?;
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -106,35 +103,46 @@ impl ApplicationStateStore {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotV1 {
+struct SnapshotV2 {
     version: u32,
-    bots: Vec<BotSnapshot>,
-    conversations: Vec<ConversationSnapshot>,
-    threads: Vec<ThreadSnapshot>,
-    tasks: Vec<TaskSnapshot>,
+    bots: Vec<BotState>,
+    conversations: Vec<ConversationState>,
+    messages: Vec<MessageState>,
+    threads: Vec<ThreadState>,
+    tasks: Vec<TaskState>,
+    projects: Vec<ProjectState>,
+    channels: Vec<ChannelState>,
+    memories: Vec<MemoryState>,
+    side_effects: Vec<SideEffectState>,
     receipts: Vec<(OperationId, ReceiptRecord)>,
     results: Vec<(OperationId, OperationResult)>,
     command_bindings: Vec<(CommandId, OperationId)>,
     command_request_digests: Vec<(CommandId, RequestDigest)>,
     idempotency_bindings: Vec<IdempotencySnapshot>,
-    memberships: Vec<MembershipSnapshot>,
+    memberships: Vec<(String, MembershipRecord)>,
     delegations: Vec<DelegationSnapshot>,
 }
 
-impl SnapshotV1 {
+impl SnapshotV2 {
     fn from_state(state: &DomainState) -> Self {
-        let mut bots: Vec<_> = state.bots.values().map(BotSnapshot::from).collect();
+        let mut bots: Vec<_> = state.bots.values().cloned().collect();
         bots.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-        let mut conversations: Vec<_> = state
-            .conversations
-            .values()
-            .map(ConversationSnapshot::from)
-            .collect();
+        let mut conversations: Vec<_> = state.conversations.values().cloned().collect();
         conversations.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-        let mut threads: Vec<_> = state.threads.values().map(ThreadSnapshot::from).collect();
+        let mut messages: Vec<_> = state.messages.values().cloned().collect();
+        messages.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        let mut threads: Vec<_> = state.threads.values().cloned().collect();
         threads.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-        let mut tasks: Vec<_> = state.tasks.values().map(TaskSnapshot::from).collect();
+        let mut tasks: Vec<_> = state.tasks.values().cloned().collect();
         tasks.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        let mut projects: Vec<_> = state.projects.values().cloned().collect();
+        projects.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        let mut channels: Vec<_> = state.channels.values().cloned().collect();
+        channels.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        let mut memories: Vec<_> = state.memories.values().cloned().collect();
+        memories.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        let mut side_effects: Vec<_> = state.side_effects.values().cloned().collect();
+        side_effects.sort_by(|left, right| left.id.cmp(&right.id));
 
         let mut receipts: Vec<_> = state
             .receipts
@@ -160,7 +168,6 @@ impl SnapshotV1 {
             .map(|(command, digest)| (command.clone(), digest.clone()))
             .collect();
         command_request_digests.sort_by(|left, right| left.0.0.cmp(&right.0.0));
-
         let mut idempotency_bindings: Vec<_> = state
             .idempotency_bindings
             .iter()
@@ -174,13 +181,12 @@ impl SnapshotV1 {
         idempotency_bindings.sort_by(|left, right| {
             (&left.principal, &left.key_digest).cmp(&(&right.principal, &right.key_digest))
         });
-
         let mut memberships: Vec<_> = state
             .memberships
             .iter()
-            .map(|(key, record)| MembershipSnapshot::from_pair(key, record))
+            .map(|(key, membership)| (key.clone(), membership.clone()))
             .collect();
-        memberships.sort_by(|left, right| left.key.cmp(&right.key));
+        memberships.sort_by(|left, right| left.0.cmp(&right.0));
         let delegations = state
             .delegations
             .iter()
@@ -191,8 +197,13 @@ impl SnapshotV1 {
             version: SNAPSHOT_VERSION,
             bots,
             conversations,
+            messages,
             threads,
             tasks,
+            projects,
+            channels,
+            memories,
+            side_effects,
             receipts,
             results,
             command_bindings,
@@ -211,21 +222,32 @@ impl SnapshotV1 {
             )));
         }
         let mut state = DomainState::new();
-        for snapshot in self.bots {
-            let record = snapshot.into_state()?;
-            state.bots.insert(record.id.clone(), record);
+        for row in self.bots {
+            state.bots.insert(row.id.clone(), row);
         }
-        for snapshot in self.conversations {
-            let record = snapshot.into_state();
-            state.conversations.insert(record.id.clone(), record);
+        for row in self.conversations {
+            state.conversations.insert(row.id.clone(), row);
         }
-        for snapshot in self.threads {
-            let record = snapshot.into_state();
-            state.threads.insert(record.id.clone(), record);
+        for row in self.messages {
+            state.messages.insert(row.id.clone(), row);
         }
-        for snapshot in self.tasks {
-            let record = snapshot.into_state()?;
-            state.tasks.insert(record.id.clone(), record);
+        for row in self.threads {
+            state.threads.insert(row.id.clone(), row);
+        }
+        for row in self.tasks {
+            state.tasks.insert(row.id.clone(), row);
+        }
+        for row in self.projects {
+            state.projects.insert(row.id.clone(), row);
+        }
+        for row in self.channels {
+            state.channels.insert(row.id.clone(), row);
+        }
+        for row in self.memories {
+            state.memories.insert(row.id.clone(), row);
+        }
+        for row in self.side_effects {
+            state.side_effects.insert(row.id.clone(), row);
         }
         state.receipts.extend(self.receipts);
         state.results.extend(self.results);
@@ -233,146 +255,20 @@ impl SnapshotV1 {
         state
             .command_request_digests
             .extend(self.command_request_digests);
-        for snapshot in self.idempotency_bindings {
+        for row in self.idempotency_bindings {
             state.idempotency_bindings.insert(
-                (snapshot.principal, snapshot.key_digest),
+                (row.principal, row.key_digest),
                 IdempotencyBindingState {
-                    command_id: snapshot.command_id,
-                    expires_at: snapshot.expires_at,
+                    command_id: row.command_id,
+                    expires_at: row.expires_at,
                 },
             );
         }
-        for snapshot in self.memberships {
-            let (key, record) = snapshot.into_pair();
-            state.memberships.insert(key, record);
-        }
-        for snapshot in self.delegations {
-            state.delegations.push(snapshot.into_record()?);
+        state.memberships.extend(self.memberships);
+        for row in self.delegations {
+            state.delegations.push(row.into_record()?);
         }
         Ok(state)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BotSnapshot {
-    id: BotId,
-    name: String,
-    revision: i64,
-    lifecycle: String,
-}
-
-impl From<&BotState> for BotSnapshot {
-    fn from(state: &BotState) -> Self {
-        Self {
-            id: state.id.clone(),
-            name: state.name.clone(),
-            revision: state.revision,
-            lifecycle: lifecycle_name(state.lifecycle).to_owned(),
-        }
-    }
-}
-
-impl BotSnapshot {
-    fn into_state(self) -> Result<BotState, AppError> {
-        Ok(BotState {
-            id: self.id,
-            name: self.name,
-            revision: self.revision,
-            lifecycle: parse_lifecycle(&self.lifecycle)?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ConversationSnapshot {
-    id: ConversationId,
-    bot_id: BotId,
-    revision: i64,
-    messages: Vec<MessageId>,
-}
-
-impl From<&ConversationState> for ConversationSnapshot {
-    fn from(state: &ConversationState) -> Self {
-        Self {
-            id: state.id.clone(),
-            bot_id: state.bot_id.clone(),
-            revision: state.revision,
-            messages: state.messages.clone(),
-        }
-    }
-}
-
-impl ConversationSnapshot {
-    fn into_state(self) -> ConversationState {
-        ConversationState {
-            id: self.id,
-            bot_id: self.bot_id,
-            revision: self.revision,
-            messages: self.messages,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ThreadSnapshot {
-    id: ThreadId,
-    conversation_id: ConversationId,
-    revision: i64,
-    parent_message_id: Option<MessageId>,
-}
-
-impl From<&ThreadState> for ThreadSnapshot {
-    fn from(state: &ThreadState) -> Self {
-        Self {
-            id: state.id.clone(),
-            conversation_id: state.conversation_id.clone(),
-            revision: state.revision,
-            parent_message_id: state.parent_message_id.clone(),
-        }
-    }
-}
-
-impl ThreadSnapshot {
-    fn into_state(self) -> ThreadState {
-        ThreadState {
-            id: self.id,
-            conversation_id: self.conversation_id,
-            revision: self.revision,
-            parent_message_id: self.parent_message_id,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TaskSnapshot {
-    id: TaskId,
-    owner: String,
-    revision: i64,
-    execution_generation: i64,
-    status: String,
-}
-
-impl From<&TaskState> for TaskSnapshot {
-    fn from(state: &TaskState) -> Self {
-        Self {
-            id: state.id.clone(),
-            owner: state.owner.clone(),
-            revision: state.revision,
-            execution_generation: state.execution_generation,
-            status: task_status_name(state.status).to_owned(),
-        }
-    }
-}
-
-impl TaskSnapshot {
-    fn into_state(self) -> Result<TaskState, AppError> {
-        Ok(TaskState {
-            id: self.id,
-            owner: self.owner,
-            revision: self.revision,
-            execution_generation: self.execution_generation,
-            status: parse_task_status(&self.status)?,
-        })
     }
 }
 
@@ -385,49 +281,12 @@ struct IdempotencySnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct MembershipSnapshot {
-    key: String,
-    id: String,
-    scope: ScopeSelector,
-    member_bot: BotSelector,
-    role: String,
-    generation: i64,
-    created_at: i64,
-}
-
-impl MembershipSnapshot {
-    fn from_pair(key: &str, record: &MembershipRecord) -> Self {
-        Self {
-            key: key.to_owned(),
-            id: record.id.clone(),
-            scope: record.scope.clone(),
-            member_bot: record.member_bot.clone(),
-            role: record.role.clone(),
-            generation: record.generation,
-            created_at: record.created_at,
-        }
-    }
-
-    fn into_pair(self) -> (String, MembershipRecord) {
-        let record = MembershipRecord {
-            id: self.id,
-            scope: self.scope,
-            member_bot: self.member_bot,
-            role: self.role,
-            generation: self.generation,
-            created_at: self.created_at,
-        };
-        (self.key, record)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DelegationSnapshot {
     id: String,
-    task_id: TaskId,
-    from_bot: BotSelector,
-    to_bot: BotSelector,
-    scope: ScopeSelector,
+    task_id: dxbot_core::types::TaskId,
+    from_bot: dxbot_core::types::BotSelector,
+    to_bot: dxbot_core::types::BotSelector,
+    scope: dxbot_core::types::ScopeSelector,
     role: String,
     status: String,
     created_at: i64,
@@ -463,50 +322,6 @@ impl DelegationSnapshot {
             created_at: self.created_at,
             resolved_at: self.resolved_at,
         })
-    }
-}
-
-fn lifecycle_name(value: LifecycleState) -> &'static str {
-    match value {
-        LifecycleState::Active => "active",
-        LifecycleState::Inactive => "inactive",
-        LifecycleState::Degraded => "degraded",
-        LifecycleState::Terminated => "terminated",
-    }
-}
-
-fn parse_lifecycle(value: &str) -> Result<LifecycleState, AppError> {
-    match value {
-        "active" => Ok(LifecycleState::Active),
-        "inactive" => Ok(LifecycleState::Inactive),
-        "degraded" => Ok(LifecycleState::Degraded),
-        "terminated" => Ok(LifecycleState::Terminated),
-        other => Err(AppError::Internal(format!(
-            "unknown persisted bot lifecycle: {other}"
-        ))),
-    }
-}
-
-fn task_status_name(value: TaskStatus) -> &'static str {
-    match value {
-        TaskStatus::Pending => "pending",
-        TaskStatus::Running => "running",
-        TaskStatus::Succeeded => "succeeded",
-        TaskStatus::Failed => "failed",
-        TaskStatus::Rejected => "rejected",
-    }
-}
-
-fn parse_task_status(value: &str) -> Result<TaskStatus, AppError> {
-    match value {
-        "pending" => Ok(TaskStatus::Pending),
-        "running" => Ok(TaskStatus::Running),
-        "succeeded" => Ok(TaskStatus::Succeeded),
-        "failed" => Ok(TaskStatus::Failed),
-        "rejected" => Ok(TaskStatus::Rejected),
-        other => Err(AppError::Internal(format!(
-            "unknown persisted task status: {other}"
-        ))),
     }
 }
 
