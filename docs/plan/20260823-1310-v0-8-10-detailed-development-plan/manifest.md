@@ -5,8 +5,8 @@ version: "0.8.10"
 status: "Accepted"
 normative: true
 priority: "P0"
-last_updated: "2026-08-29"
-depends_on: ["DXB-BASE-000", "DXB-GOV-005", "DXB-IFC-043", "DXB-DEL-061", "DXB-DEL-062", "DXB-DEL-065", "DXB-DEL-066", "DXB-DEL-067", "DXB-ARC-019", "DXB-PRV-001", "DXB-ENG-052", "DXB-ENG-054"]
+last_updated: "2026-08-30"
+depends_on: ["DXB-BASE-000", "DXB-GOV-005", "DXB-IFC-043", "DXB-DEL-061", "DXB-DEL-062", "DXB-DEL-065", "DXB-DEL-066", "DXB-DEL-067", "DXB-DEL-068", "DXB-ARC-019", "DXB-PRV-001", "DXB-ENG-052", "DXB-ENG-054"]
 review_revision: 12
 adversarial_review_rounds: 5
 final_rechecks: 2
@@ -19,7 +19,7 @@ plan_version: 0.8.10
 review_revision: 10
 adversarial_review_rounds: 5
 final_rechecks: 2
-markdown_count: 56
+markdown_count: 57
 parent_plan_commit: 4f42cfa9e413aa306dc9bcfc7538f00e6763b3e6
 source_baseline_commit: 5b55b67fbaaf0f3192c126865e8b665ff26fc5aa
 <!-- manifest-machine:end -->
@@ -50,3 +50,9 @@ source_baseline_commit: 5b55b67fbaaf0f3192c126865e8b665ff26fc5aa
 GitHub `main` post-closeout 재감사에서 다시 열린 CLI 사용자 표면 결함과 production Provider/Execution/Context/Scheduler/Core/Memory/Multi-Bot/운영 복구의 후속 개발 순서는 [DXB-DEL-067](60-delivery/67-operational-runtime-readiness-adversarial-plan.md)이 소유한다.
 
 `DXB-DEL-066`의 과거 PASS만으로 현재 `CLI Contract Complete` 또는 `DXBOT Operational Ready`를 자동 선언하지 않는다. 현재 판정은 `DXB-DEL-067`의 reopened finding과 Operational Ready Gate를 우선 확인한다.
+
+## Harness 모듈화 후속 계획
+
+고정된 `MiniMax-M3`와 공식 DeepSeek Harness ACP subprocess adapter를 전제로, canary 정리·공통 Execute 계약·per-provider binding·static factory registry·production composition·drain/replace/unregister·공통 Conformance·adapter-removal build를 닫는 후속 단계는 [DXB-DEL-068](60-delivery/68-modular-harness-adoption-plan.md)이 소유한다.
+
+`DXB-DEL-067`의 local P0 Operational Ready는 direct compatible Provider 경로의 역사적 evidence다. `DXB-DEL-068`의 checklist가 PASS하기 전 `Harness Modularization Complete`를 선언하지 않는다.

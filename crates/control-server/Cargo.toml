@@ -15,9 +15,19 @@ application-contract = { path = "../application-contract" }
 dxbot-core = { path = "../dxbot-core" }
 runtime-security = { path = "../runtime-security" }
 application = { path = "../application" }
-provider-host = { path = "../provider-host" }
+# control-server uses only the Common provider contract (ProviderHost, status,
+# error types) and no concrete adapter, so it must not force any production
+# adapter feature on. Removal builds then actually remove the adapter slice
+# instead of having it pulled back in by feature unification (`DXB-DEL-068` H11).
+provider-host = { path = "../provider-host", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["socket"] }
+
+[dev-dependencies]
+# Tests use only the Common contract and the testkit reference/canary, never a
+# concrete production adapter, so they must not force a production adapter
+# feature (which would defeat removal builds via feature unification).
+provider-host = { path = "../provider-host", default-features = false, features = ["testkit"] }

@@ -18,9 +18,10 @@ use runtime_audit::{
     SafeAttribute, SafeAttributeKey,
 };
 
+use crate::cancellation::{CancellationToken, UsageInfo};
 use crate::protocol::{
-    CancellationToken, ChatCompletionProtocol, ChatMessage, ProviderError, ProviderEvent,
-    ProviderExecuteConfig, ProviderRequest, UsageInfo,
+    ChatCompletionProtocol, ChatMessage, ProviderError, ProviderEvent, ProviderExecuteConfig,
+    ProviderRequest,
 };
 use crate::transport::{HttpTransport, TransportBuildError};
 

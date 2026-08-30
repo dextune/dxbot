@@ -17,13 +17,18 @@ use application::{ApplicationMutator, ExecutionStatus, TaskStatus};
 use control_server::{ControlServer, LocalControlServer, SecurityCoordinationStore, SecurityState};
 use dxbot_core::types::InstanceId;
 use fs2::FileExt;
-use provider_host::ProviderStatus;
+use provider_host::{ProviderHost, ProviderStatus};
 use runtime_audit::AuditOutbox;
 use runtime_bootstrap::bootstrap::Error as BootstrapError;
-use runtime_bootstrap::{DiscoveryEndpoint, DiscoveryState, RuntimeBootstrap};
+use runtime_bootstrap::{DiscoveryEndpoint, RuntimeBootstrap};
 use runtime_security::SecurityStateStore;
 
 use crate::audit_projection::AuditProjection;
+use crate::composition::{ExtensionReadiness, RuntimeComposition};
+use crate::production_graph::{
+    self, ControlEndpointExtension, DiscoveryExtension, OwnerExtension, PidArtifactExtension,
+    PublicationLedger,
+};
 use crate::provider_config::load_provider_composition;
 use crate::scheduler::ExecutionCoordinator;
 
@@ -48,6 +53,17 @@ const OWNER_FILE_MODE: u32 = 0o600;
 const HOST_LOCK_HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
 const HOST_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
+/// Bounded deadline for the all-provider drain during graceful shutdown
+/// (`DXB-DEL-068` H8/H9). The Execution coordinator has already joined its
+/// worker threads, so in the normal path in-flight leases are zero and this
+/// returns immediately; this deadline only bounds the wait for a provider call
+/// that is still unwinding.
+const PROVIDER_SHUTDOWN_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+/// Bounded reap window after cancellation is fired at the drain deadline, giving
+/// parked provider calls time to observe cancellation and release their leases
+/// before shutdown verifies quiescence.
+const PROVIDER_SHUTDOWN_REAP_DEADLINE: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownReport {
     pub steps: Vec<String>,
@@ -62,11 +78,26 @@ pub struct LocalRuntimeHost {
     instance_id: InstanceId,
     host_generation: i64,
     endpoint_uri: String,
-    server: LocalControlServer,
+    server: Arc<LocalControlServer>,
+    /// The single production `RuntimeComposition` (`DXB-DEL-068` H8). It owns
+    /// startup publication ordering and reverse-order rollback; every extension
+    /// is a thin lifecycle adapter over an already-constructed canonical owner.
+    composition: RuntimeComposition,
+    /// Shared record of which artifacts are currently published, read back to
+    /// drive idempotent unpublish on graceful shutdown.
+    publication: Arc<Mutex<production_graph::PublicationLedger>>,
     coordinator: ExecutionCoordinator,
+    /// The Provider host owner, retained for the bounded ProviderHost drain step
+    /// during graceful shutdown (`DXB-DEL-068` H8/H9).
+    providers: Arc<ProviderHost>,
     audit: Arc<AuditProjection>,
     application: Arc<ApplicationMutator>,
     security: Arc<Mutex<SecurityState>>,
+    /// Runtime-owned Tokio runtime backing provider async execution at the
+    /// scheduler boundary (`DXB-DEL-068` H8). The provider host holds only a
+    /// `Handle`; ownership and shutdown live here so there is no nested,
+    /// adapter-owned runtime.
+    provider_runtime: Option<tokio::runtime::Runtime>,
     shutdown_steps: Vec<String>,
     shutdown_complete: bool,
 }
@@ -144,7 +175,18 @@ impl LocalRuntimeHost {
             })?,
         );
         let audit = AuditProjection::new(audit_outbox);
-        let provider_composition = load_provider_composition(&runtime_root)?;
+        // Runtime Host owns the Tokio runtime that backs provider async
+        // execution (`DXB-DEL-068` H8). The provider host receives only a
+        // `Handle`; there is no nested adapter-owned runtime.
+        let provider_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_io()
+            .enable_time()
+            .thread_name("dxbot-provider-runtime")
+            .build()
+            .map_err(|error| io::Error::other(format!("cannot build provider runtime: {error}")))?;
+        let provider_handle = provider_runtime.handle().clone();
+        let provider_composition = load_provider_composition(&runtime_root, provider_handle)?;
         let provider_id = provider_composition.provider_id.clone();
         let provider_generation = provider_composition.provider_generation;
         let provider_ready = provider_composition.provider_ready;
@@ -193,6 +235,7 @@ impl LocalRuntimeHost {
                         "capability": provider.capability,
                         "status": match provider.status {
                             ProviderStatus::Ready => "ready",
+                            ProviderStatus::Draining => "draining",
                             ProviderStatus::Unavailable => "unavailable",
                         },
                     })
@@ -251,32 +294,117 @@ impl LocalRuntimeHost {
                 io::Error::other(format!("cannot recover Control coordination: {error}"))
             })?,
         );
-        let server = LocalControlServer::bind_with_diagnostics(
+        let server = Arc::new(LocalControlServer::bind_with_diagnostics(
             endpoint_path.clone(),
             instance_id.clone(),
             host_generation,
             control,
             diagnostics,
-        )?;
+        )?);
         let endpoint_uri = endpoint_uri(&endpoint_path)?;
-
         let pid_path = runtime_root.join(HOST_PID_FILE);
-        write_pid_file(&pid_path)?;
-        if let Err(error) = publish_discovery(
-            &discovery_root,
-            DiscoveryEndpoint {
-                instance_id: instance_id.clone(),
-                profile,
-                endpoint: endpoint_uri.clone(),
+
+        // Build the single production RuntimeComposition (`DXB-DEL-068` H8).
+        // Every extension is a thin lifecycle adapter over an owner that is
+        // already constructed and verified above; none constructs a new
+        // instance. The Application/Security/Audit/Provider/Execution owners are
+        // no-op-ready adapters (their teardown is the graceful shutdown order,
+        // and on a startup-rollback path the owners built above are dropped,
+        // which reaps the Tokio runtime and joins the coordinator). The
+        // terminal control-endpoint → PID → discovery extensions perform the
+        // only real publication, so `RuntimeComposition::start`'s reverse-order
+        // rollback guarantees zero published endpoint/PID/discovery on any
+        // failure at or after the first publication step.
+        let publication = PublicationLedger::boxed();
+        let mut composition = RuntimeComposition::new();
+        composition
+            .register(OwnerExtension::boxed(
+                "application-owner",
+                &[],
+                ExtensionReadiness::Ready,
+                Box::new(|| {}),
+            ))
+            .map_err(composition_io)?;
+        composition
+            .register(OwnerExtension::boxed(
+                "security-owner",
+                &["application-owner"],
+                ExtensionReadiness::Ready,
+                Box::new(|| {}),
+            ))
+            .map_err(composition_io)?;
+        composition
+            .register(OwnerExtension::boxed(
+                "audit-owner",
+                &["application-owner", "security-owner"],
+                ExtensionReadiness::Ready,
+                Box::new(|| {}),
+            ))
+            .map_err(composition_io)?;
+        composition
+            .register(OwnerExtension::optional(
+                "provider-runtime",
+                &["audit-owner"],
+                if provider_ready {
+                    ExtensionReadiness::Ready
+                } else {
+                    // An unconfigured/unavailable provider is a non-mandatory
+                    // degraded readiness, not a start failure: the Runtime still
+                    // publishes so doctor/status can report the provider gap.
+                    ExtensionReadiness::Degraded
+                },
+                Box::new(|| {}),
+            ))
+            .map_err(composition_io)?;
+        composition
+            .register(OwnerExtension::boxed(
+                "execution-coordinator",
+                &["provider-runtime"],
+                ExtensionReadiness::Ready,
+                Box::new(|| {}),
+            ))
+            .map_err(composition_io)?;
+        composition
+            .register(ControlEndpointExtension::boxed(
+                Arc::clone(&server),
+                Arc::clone(&publication),
+                &["execution-coordinator"],
+            ))
+            .map_err(composition_io)?;
+        composition
+            .register(PidArtifactExtension::boxed(
+                pid_path.clone(),
+                Arc::clone(&publication),
+                write_pid_file,
+                remove_owned_pid_file,
+                &["control-endpoint"],
+            ))
+            .map_err(composition_io)?;
+        composition
+            .register(DiscoveryExtension::boxed(
+                discovery_root.clone(),
+                instance_id.clone(),
                 host_generation,
-                provider_id,
-                provider_generation,
-                provider_ready,
-            },
-        ) {
-            remove_owned_pid_file(&pid_path);
-            return Err(error);
-        }
+                endpoint_uri.clone(),
+                DiscoveryEndpoint {
+                    instance_id: instance_id.clone(),
+                    profile,
+                    endpoint: endpoint_uri.clone(),
+                    host_generation,
+                    provider_id,
+                    provider_generation,
+                    provider_ready,
+                },
+                Arc::clone(&publication),
+                &["pid-artifact"],
+            ))
+            .map_err(composition_io)?;
+
+        // Drive startup through the single composition. On any failure the
+        // reverse-order rollback has already unpublished the endpoint, removed
+        // the PID artifact, and removed the discovery entry; the coordinator and
+        // provider runtime are dropped with this stack frame, releasing permits.
+        composition.start().map_err(composition_io)?;
 
         Ok(Self {
             _host_lock: host_lock,
@@ -287,10 +415,14 @@ impl LocalRuntimeHost {
             host_generation,
             endpoint_uri,
             server,
+            composition,
+            publication,
             coordinator,
+            providers,
             audit,
             application,
             security,
+            provider_runtime: Some(provider_runtime),
             shutdown_steps: Vec::new(),
             shutdown_complete: false,
         })
@@ -310,6 +442,14 @@ impl LocalRuntimeHost {
 
     pub fn runtime_root(&self) -> &Path {
         &self.runtime_root
+    }
+
+    /// The single production composition's readiness snapshot (`DXB-DEL-068`
+    /// H8). `dxb runtime status`/`doctor` observe this one composition rather
+    /// than a parallel startup path, so mandatory-ready counts and any degraded
+    /// extension ids reflect the real owner graph.
+    pub fn composition_readiness(&self) -> crate::composition::RuntimeReadiness {
+        self.composition.readiness()
     }
 
     pub fn audit_healthy(&self) -> bool {
@@ -343,6 +483,53 @@ impl LocalRuntimeHost {
         }
         self.shutdown_steps.push("activity-drained".to_owned());
 
+        // ProviderHost bounded all-provider drain (`DXB-DEL-068` H8/H9). The
+        // host is shared with the control server as an `Arc<ProviderHost>`, so
+        // this drives the real shared drain directly through `&self` — no
+        // `Arc::get_mut` and no no-op. Every generation stops admitting new
+        // activity, the drain waits a bounded deadline for in-flight leases to
+        // reach zero, and any call still parked at the deadline has its tracked
+        // cancellation token fired so it can unwind. The coordinator has already
+        // joined its worker threads above, so in the normal path leases are
+        // zero and this returns immediately; the bounded cancel/reap window only
+        // matters if a provider call is still unwinding.
+        let provider_drained = self
+            .providers
+            .drain_all_to_quiescence(PROVIDER_SHUTDOWN_DRAIN_DEADLINE);
+        if provider_drained {
+            self.shutdown_steps.push("provider-drained".to_owned());
+        } else {
+            // Cancellation has been fired for every tracked token; give the
+            // parked calls a bounded reap window to observe it and release their
+            // leases, then verify quiescence. Only report provider-drained after
+            // verified zero leases; otherwise fail closed with a shutdown error
+            // rather than claiming a drain that did not happen.
+            let reaped = self
+                .providers
+                .drain_all_to_quiescence(PROVIDER_SHUTDOWN_REAP_DEADLINE);
+            if reaped {
+                self.shutdown_steps.push("provider-drained".to_owned());
+            } else {
+                self.shutdown_steps
+                    .push("provider-drain-incomplete".to_owned());
+                if first_error.is_none() {
+                    first_error = Some(io::Error::other(
+                        "Provider host did not reach zero in-flight leases within the bounded shutdown drain/cancel/reap window",
+                    ));
+                }
+            }
+        }
+
+        // The Execution coordinator has joined all worker threads, so no
+        // provider `block_on` is in flight. Shut the Runtime-owned Tokio
+        // runtime down without blocking the caller thread indefinitely on any
+        // lingering background task (`DXB-DEL-068` H8).
+        if let Some(runtime) = self.provider_runtime.take() {
+            runtime.shutdown_timeout(Duration::from_secs(5));
+        }
+        self.shutdown_steps
+            .push("provider-runtime-stopped".to_owned());
+
         if let Err(error) = self.audit.drain(&self.application, &self.security) {
             if first_error.is_none() {
                 first_error = Some(io::Error::other(error));
@@ -355,29 +542,26 @@ impl LocalRuntimeHost {
                 first_error = Some(error);
             }
         }
+        if let Ok(mut ledger) = self.publication.lock() {
+            ledger.endpoint_published = false;
+        }
         self.shutdown_steps.push("endpoint-unpublished".to_owned());
 
-        if let Ok(mut state) = DiscoveryState::load_state(&self.discovery_root) {
-            let should_remove =
-                state
-                    .instance_endpoints
-                    .get(&self.instance_id)
-                    .is_some_and(|endpoint| {
-                        endpoint.host_generation == self.host_generation
-                            && endpoint.endpoint == self.endpoint_uri
-                    });
-            if should_remove {
-                state.instance_endpoints.remove(&self.instance_id);
-                if let Err(error) = state.save_state(&self.discovery_root) {
-                    if first_error.is_none() {
-                        first_error = Some(bootstrap_io(error));
-                    }
-                }
-            }
+        production_graph::remove_owned_discovery_entry(
+            &self.discovery_root,
+            &self.instance_id,
+            self.host_generation,
+            &self.endpoint_uri,
+        );
+        if let Ok(mut ledger) = self.publication.lock() {
+            ledger.discovery_published = false;
         }
         self.shutdown_steps.push("discovery-unpublished".to_owned());
 
         remove_owned_pid_file(&self.pid_path);
+        if let Ok(mut ledger) = self.publication.lock() {
+            ledger.pid_published = false;
+        }
         self.shutdown_steps.push("pid-removed".to_owned());
         self.shutdown_complete = true;
 
@@ -533,14 +717,6 @@ fn register_owner_principal(
     Ok(())
 }
 
-fn publish_discovery(root: &Path, endpoint: DiscoveryEndpoint) -> Result<(), io::Error> {
-    let mut state = DiscoveryState::load_state(root).map_err(bootstrap_io)?;
-    state
-        .instance_endpoints
-        .insert(endpoint.instance_id.clone(), endpoint);
-    state.save_state(root).map_err(bootstrap_io)
-}
-
 fn replace_bootstrap_or_stale_endpoint(path: &Path) -> Result<(), io::Error> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -577,7 +753,11 @@ fn endpoint_uri(path: &Path) -> Result<String, io::Error> {
     Ok(format!("unix://{path}"))
 }
 
-fn bootstrap_io(error: BootstrapError) -> io::Error {
+fn composition_io(error: crate::composition::CompositionError) -> io::Error {
+    io::Error::other(format!("runtime composition failed: {error:?}"))
+}
+
+pub(crate) fn bootstrap_io(error: BootstrapError) -> io::Error {
     match error {
         BootstrapError::AlreadyBootstrapped => io::Error::new(
             io::ErrorKind::AlreadyExists,

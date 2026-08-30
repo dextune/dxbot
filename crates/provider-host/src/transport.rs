@@ -4,7 +4,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 
 /// Stable transport-construction failure that never echoes credential bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +42,29 @@ impl HttpTransport {
             base_url: base_url.to_string(),
             timeout,
         }
+    }
+
+    /// Rebuilds the Common-owned client for an Anthropic-compatible endpoint.
+    /// The API key is scoped to this client and omitted from errors and `Debug`.
+    pub fn with_anthropic_key(&self, secret: &str) -> Result<Self, TransportBuildError> {
+        let key =
+            HeaderValue::from_str(secret).map_err(|_| TransportBuildError::InvalidCredential)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(HeaderName::from_static("x-api-key"), key);
+        headers.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
+        let client = reqwest::Client::builder()
+            .timeout(self.timeout)
+            .default_headers(headers)
+            .build()
+            .map_err(|_| TransportBuildError::ClientBuild)?;
+        Ok(Self {
+            client,
+            base_url: self.base_url.clone(),
+            timeout: self.timeout,
+        })
     }
 
     /// Rebuilds the Common-owned client with one scoped bearer credential.

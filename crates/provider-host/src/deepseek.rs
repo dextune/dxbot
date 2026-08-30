@@ -2,7 +2,7 @@
 
 use dxbot_core::types::ProviderId;
 
-use crate::harness::TaskDescription;
+use crate::execute::ExecuteRequest;
 use crate::protocol::{ChatMessage, ProviderEvent, ProviderRequest};
 use crate::real_provider::RealProvider;
 
@@ -44,14 +44,14 @@ impl RealProvider for DeepSeekFlashAdapter {
         self.generation
     }
 
-    fn build_request(&self, task: &TaskDescription) -> ProviderRequest {
+    fn build_request(&self, request: &ExecuteRequest) -> ProviderRequest {
         ProviderRequest {
             model: self.model.clone(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
-                content: format!("{}\n\nContext: {}", task.intent, task.context),
+                content: format!("{}\n\nContext: {}", request.intent, request.context),
             }],
-            max_tokens: task
+            max_tokens: request
                 .budget
                 .map(|budget| u32::try_from(budget).unwrap_or(u32::MAX)),
             temperature: Some(0.0),

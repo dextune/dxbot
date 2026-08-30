@@ -51,12 +51,12 @@ depends_on: ["DXB-DEL-060", "DXB-ENG-052", "DXB-IFC-040", "DXB-IFC-041", "DXB-IF
 | AT-PROVIDER-INFRA-004 | Deadline exceeded → DeadlineExceeded error | DXB-ARC-019 | short deadline fixture | M5 | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
 | AT-PROVIDER-INFRA-005 | Output bounded → OutputExceeded | DXB-ARC-019 | low max_output_bytes | M5 | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
 | AT-PROVIDER-INFRA-006 | Transport unavailable → TransportUnavailable | DXB-ARC-019 | wrong port fixture | M5 | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
-| AT-PROVIDER-INFRA-007 | Real provider chain fallback to Reference | DXB-ARC-019 | unavailable real provider | M5 | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
-| AT-PROVIDER-INFRA-008 | 기존 canary test (AT-HARNESS-001) 회귀 없음 | DXB-ARC-019 | existing 4 tests | M5 | Executable | provider infra report | cargo test -p provider-host harness | local validation required |
+| AT-PROVIDER-INFRA-007 | Unknown/replaced provider fails closed (no fallback) | DXB-ARC-019 | exact id/generation selection | M5 | Executable | provider infra report | cargo test -p provider-host provider_infra | local validation required |
+| AT-PROVIDER-INFRA-008 | Test canary executes through canonical async contract | DXB-ARC-019 | testkit canary | M5 | Executable | provider infra report | cargo test -p provider-host harness | local validation required |
 | AT-DEEPSEEK-001 | DeepSeekFlashAdapter RealProvider trait 구현 | DXB-PRV-001 | build_request returns valid ProviderRequest | M5 | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
 | AT-DEEPSEEK-002 | 실제 프록시 호출 → non-empty response | DXB-PRV-001 | live proxy integration | M5 | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
 | AT-DEEPSEEK-003 | reasoning token 포함된 SSE parse | DXB-PRV-001 | deepseek chunk fixture | M5 | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
-| AT-DEEPSEEK-004 | Provider chain: real adapter 우선, Reference 폴백 | DXB-PRV-001 | unavailable adapter scenario | M5 | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
+| AT-DEEPSEEK-004 | Unknown/replaced selection fails closed (no Reference fallback) | DXB-PRV-001 | exact id/generation, transport-unavailable typed error | M5 | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
 | AT-DEEPSEEK-005 | temperature=0.0 → deterministic output (soft) | DXB-PRV-001 | repeated call fixture | M5 | Executable | deepseek adapter report | cargo test -p provider-host deepseek | local validation required |
 <!-- acceptance-registry:end -->
 

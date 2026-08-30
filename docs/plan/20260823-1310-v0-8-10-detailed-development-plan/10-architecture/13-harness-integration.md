@@ -35,26 +35,36 @@ ExecuteRequest {
   action_grant_refs,
   effective_deadline,
   cancellation_ref,
-  output_budget
+  output_budget,
+  permission_refs,          // immutable Context Plan permission refs (DXB-DEL-068 H10)
+  resource_refs,            // immutable Context Plan resource/budget refs
+  side_effect_ref,          // Application Side Effect ledger ref for attribution
+  core_lease_ref,           // Core lease held for this attempt
+  allow_once_grant          // Option: request-scoped allow-once authority (H10)
 }
 ```
 
 외부 Session/Agent/Subagent ID를 Bot/Thread/Core/Memory identity로 사용하지 않는다.
+
+`allow_once_grant`는 scheduler가 `Approved` runtime-security Approval(action `provider-tool-allow-once`, target 정확한 execution ref, positive policy generation)에서만 mint하는 request-scoped authority다. 존재하지 않으면 provider는 기본 reject한다. static `PermissionPolicy::AllowOnce`는 상한일 뿐이며 이 grant가 실제 권한 근거다. DSH/ambient approval은 결코 권한 근거가 아니다. `permission_refs`/`resource_refs`/`side_effect_ref`/`core_lease_ref`는 in-memory 전파 필드이며 persisted Canonical Contract를 바꾸지 않는다(ContextPlan은 이미 `permission_refs`/`resource_budget`을 소유).
 
 ## 3. Stream과 Result
 
 ```text
 ExecuteEvent = Started
              | OutputChunk(sequence, bytes)
-             | ToolActivity(activity_ref, state)
+             | ToolCallStarted(sequence, correlation, tool)        // DXB-DEL-068 H10
+             | PermissionRequested(sequence, correlation, tool)    // request, not grant
+             | ToolEffect(sequence, correlation, disposition)      // Prepared|Dispatched|Confirmed|Unknown|Rejected
              | Evidence(evidence_ref)
              | Progress(class, bounded_summary)
              | Terminal(Completed | Failed | Cancelled | Unknown)
 
 ExecuteResult = ResultRef + EvidenceRefs + UsageAccounting + ProviderTraceRef
+              + tool_effects[]   // bounded (correlation, disposition); Unknown → RecoveryRequired
 ```
 
-partial output은 terminal success가 아니다. output sink와 event buffer는 item+byte cap, slow-consumer, cancellation, cleanup을 가진다.
+tool/permission/effect event와 `tool_effects`는 bounded·provider-neutral이며 raw ACP/DSH payload·arg·path·secret을 담지 않고 그 자체로 authority를 부여하지 않는다. malformed/unattributed tool event는 protocol violation으로 실행되지 않는다. partial output은 terminal success가 아니다. output sink와 event buffer는 item+byte cap, slow-consumer, cancellation, cleanup을 가진다.
 
 ## 4. Stable error
 

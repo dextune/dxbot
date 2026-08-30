@@ -5,8 +5,8 @@ version: "0.8.10"
 status: "Accepted"
 normative: true
 priority: "P0"
-last_updated: "2026-08-29"
-depends_on: ["DXB-BASE-000", "DXB-GOV-005", "DXB-IFC-043", "DXB-DEL-060", "DXB-DEL-061", "DXB-DEL-062", "DXB-DEL-063", "DXB-DEL-066", "DXB-DEL-067"]
+last_updated: "2026-08-30"
+depends_on: ["DXB-BASE-000", "DXB-GOV-005", "DXB-IFC-043", "DXB-DEL-060", "DXB-DEL-061", "DXB-DEL-062", "DXB-DEL-063", "DXB-DEL-066", "DXB-DEL-067", "DXB-DEL-068"]
 package_path: "docs/plan/20260823-1310-v0-8-10-detailed-development-plan"
 review_revision: 10
 adversarial_review_rounds: 5
@@ -36,7 +36,7 @@ v0.8.10은 기능 확장이 아니라 v0.8.9를 실제 사용자 관점에서 �
 
 위 GO는 문서 계약 완결 판정이다. 실제 제품 판정은 최신 executable evidence와 post-closeout 적대적 재감사를 함께 적용한다.
 
-새 CLI command, wizard, auto-start, auto mutation retry, generic RPC/IDL/Workflow engine, DB/Harness 제품 고정, TUI/Web/Plugin/distributed scope는 추가하지 않는다.
+새 CLI command, wizard, auto-start, auto mutation retry, generic RPC/IDL/Workflow engine, DB 제품 고정, TUI/Web/dynamic Plugin/distributed scope는 추가하지 않는다. Harness 제품과 모델 결정은 이후 `MiniMax-M3` 및 공식 DeepSeek Harness로 고정됐으며 본 package의 후속 문서가 이를 추적한다.
 
 ## CLI 개발 종료 Gate
 
@@ -51,3 +51,9 @@ GitHub `main`을 CLI closeout 이후 다시 적대적으로 검토한 결과, ex
 현재 reopened CLI finding과 production Provider/Execution/Memory/Multi-Bot/운영 준비의 전체 순서 및 `DXBOT Operational Ready` Gate는 [CLI 이후 DXBOT 실운영 준비 적대적 개발 플랜](60-delivery/67-operational-runtime-readiness-adversarial-plan.md)을 따른다.
 
 `DXB-DEL-066`의 과거 실행 PASS만으로 현재 `CLI Contract Complete` 또는 전체 `DXBOT Operational Ready`를 자동 선언하지 않는다.
+
+## Harness 모듈화 후속 개발
+
+`DXB-DEL-067`의 local P0 direct Provider evidence를 범용 Harness framework 완료로 확대 해석하지 않는다. 고정된 `MiniMax-M3`와 공식 DeepSeek Harness의 pinned ACP v1 subprocess adapter를 전제로, 개선사항 1~9, H0~H11 gate, fault/resource/security matrix, adapter-removal build와 독립 재검수를 [MiniMax M3 기반 공식 DeepSeek Harness 모듈화 후속 개발 플랜](60-delivery/68-modular-harness-adoption-plan.md)이 소유한다.
+
+해당 checklist가 executable evidence로 닫히기 전 `Harness Modularization Complete`는 BLOCKED다.

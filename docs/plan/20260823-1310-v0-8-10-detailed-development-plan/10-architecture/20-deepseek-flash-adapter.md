@@ -5,7 +5,7 @@ version: "0.8.11"
 status: "Accepted"
 normative: true
 priority: "P0"
-last_updated: "2026-08-23"
+last_updated: "2026-08-30"
 depends_on: ["DXB-ARC-019", "DXB-ARC-013", "DXB-ARC-017"]
 ---
 # DeepSeek v4 Flash 0731 Adapter — 첫 Real Provider 구현
@@ -86,25 +86,32 @@ impl RealProvider for DeepSeekFlashAdapter {
 
 ### 3.3 ProviderHost 등록
 
+`DeepSeekFlashAdapter`(model adapter)는 Common `HttpExecuteProvider`가 감싸 canonical async Execute contract를 구현하고, immutable `ProviderRegistration`으로 등록된다. Runtime Host가 owner-only config에서 static `ProviderFactory`(`deepseek-flash`)로 이 registration을 구성한다. reference/canary fallback은 없다.
+
 ```rust
-let mut host = ProviderHost::new();
-
-// Common infrastructure
-host.set_transport(HttpTransport::new("http://localhost:10000", Duration::from_secs(30)));
-
-// Real provider
-host.register_real_provider(Box::new(DeepSeekFlashAdapter::new(
-    ProviderId("deepseek-flash".to_string()),
-    "text",
-    1,
-)));
-
-// ReferenceProvider (fallback)
-host.register_reference_provider(ReferenceProvider::new(
-    ProviderId("ref-1".to_string()),
-    "text",
-    1,
-));
+let binding = TransportBinding::new(
+    ProtocolKind::OpenAiChatCompletions,
+    HttpTransport::new("http://localhost:10000", Duration::from_secs(30)).with_bearer(&secret)?,
+    max_output_bytes,
+    max_output_items,
+);
+let provider = HttpExecuteProvider::new(
+    Box::new(DeepSeekFlashAdapter::new(
+        ProviderId("deepseek-flash".to_string()),
+        "llm-chat",
+        1,
+    )),
+    &binding,
+    max_output_bytes,
+    max_output_items,
+);
+let mut host = ProviderHost::new().with_runtime_handle(runtime_handle);
+host.register(ProviderRegistration::new(
+    provider,
+    ProtocolKind::OpenAiChatCompletions,
+    binding,
+    RegistrationLimits { max_output_bytes, max_output_items },
+))?;
 ```
 
 ---
@@ -157,7 +164,7 @@ Common handler (`DXB-ARC-019`)가 이를 파싱하여:
 | AT-DEEPSEEK-001 | `DeepSeekFlashAdapter`가 `RealProvider` trait 구현 | `build_request` returns valid `ProviderRequest` |
 | AT-DEEPSEEK-002 | 실제 프록시 호출 → non-empty response | `cargo test -p provider-host deepseek` |
 | AT-DEEPSEEK-003 | reasoning token 포함된 SSE parse | deepseek-specific chunk fixture |
-| AT-DEEPSEEK-004 | Provider chain: real adapter 우선, Reference 폴백 | real adapter unavailable scenario |
+| AT-DEEPSEEK-004 | Unknown/replaced selection fails closed (no Reference fallback) | exact id/generation, transport-unavailable typed error |
 | AT-DEEPSEEK-005 | `temperature=0.0` → deterministic output (soft) | repeated calls produce consistent output |
 
 ### Test Fixture
@@ -165,27 +172,22 @@ Common handler (`DXB-ARC-019`)가 이를 파싱하여:
 ```rust
 #[test]
 fn deepseek_flash_produces_non_empty_output() {
-    let mut host = ProviderHost::new();
-    host.set_transport(HttpTransport::new("http://localhost:10000", Duration::from_secs(30)));
-    host.register_real_provider(Box::new(DeepSeekFlashAdapter::new(
-        ProviderId("deepseek-flash".to_string()),
-        "text",
-        1,
-    )));
-    host.register_reference_provider(ReferenceProvider::new(
-        ProviderId("ref-1".to_string()),
-        "text",
-        1,
-    ));
-
+    let runtime = test_runtime();
+    let host = deepseek_host(runtime.handle().clone(), "http://localhost:10000");
     let task = TaskDescription {
         intent: "Say hello".to_string(),
         context: "".to_string(),
         budget: Some(50),
         deadline: None,
     };
-
-    let result = host.execute_task(&task).unwrap();
+    let result = host
+        .execute_task_with_cancel(
+            &ProviderId("deepseek-flash".to_string()),
+            1,
+            &task,
+            CancellationToken::new(),
+        )
+        .unwrap();
     assert!(!result.output.is_empty());
     assert_eq!(result.status, TaskStatus::Completed);
 }

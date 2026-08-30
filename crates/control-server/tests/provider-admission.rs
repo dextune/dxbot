@@ -125,13 +125,13 @@ fn ready_llm_provider_allows_activation_owner_path() {
     let application = Arc::new(ApplicationMutator::new());
     let security = Arc::new(Mutex::new(SecurityState::new()));
     let mut providers = ProviderHost::new();
-    providers
-        .register_reference_provider(ReferenceProvider::new(
-            dxbot_core::types::ProviderId("reference".to_owned()),
-            "llm-chat",
-            1,
-        ))
-        .expect("provider registration");
+    ReferenceProvider::new(
+        dxbot_core::types::ProviderId("reference".to_owned()),
+        "llm-chat",
+        1,
+    )
+    .register_into(&mut providers)
+    .expect("provider registration");
     let server = ControlServer::with_provider_host(security, application, providers);
     register_operator(&server);
     let instance = CanonicalTarget::Instance(InstanceId("instance-a".to_owned()));
@@ -207,13 +207,13 @@ fn operator_delegation_is_authorized_server_side_and_creates_recipient_execution
 
     let security = Arc::new(Mutex::new(SecurityState::new()));
     let mut providers = ProviderHost::new();
-    providers
-        .register_reference_provider(ReferenceProvider::new(
-            dxbot_core::types::ProviderId("reference".to_owned()),
-            "llm-chat",
-            4,
-        ))
-        .expect("test provider registration");
+    ReferenceProvider::new(
+        dxbot_core::types::ProviderId("reference".to_owned()),
+        "llm-chat",
+        4,
+    )
+    .register_into(&mut providers)
+    .expect("test provider registration");
     let server = ControlServer::with_provider_host(security, Arc::clone(&application), providers);
     register_operator(&server);
     let mut delegated = request(

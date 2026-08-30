@@ -1,13 +1,16 @@
 //! Acceptance tests for provider common infrastructure (AT-PROVIDER-INFRA-001..008).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(feature = "direct-deepseek")]
 
 use dxbot_core::types::ProviderId;
 use provider_host::{
-    CancellationToken, ChatCompletionProtocol, ChatMessage, DeepSeekFlashAdapter, HarnessAdapter,
-    HttpTransport, ProviderError, ProviderEvent, ProviderExecuteConfig, ProviderHost,
-    ProviderRequest, ReferenceProvider, TaskDescription, TaskStatus,
+    CancellationToken, ChatCompletionProtocol, ChatMessage, DeepSeekFlashAdapter,
+    HttpExecuteProvider, HttpTransport, ProtocolKind, ProviderError, ProviderEvent,
+    ProviderExecuteConfig, ProviderHost, ProviderRegistration, ProviderRequest, RegistrationLimits,
+    TaskDescription, TaskStatus, TestCanaryProvider, TransportBinding,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
 fn proxy_endpoint() -> String {
@@ -196,52 +199,75 @@ fn provider_infra_006_transport_unavailable() {
 }
 
 #[test]
-fn provider_infra_007_chain_fallback_to_reference() {
-    let mut host = ProviderHost::new();
-    host.set_transport(HttpTransport::new(
-        "http://localhost:19999",
-        Duration::from_secs(2),
-    ));
-    host.register_real_provider(Box::new(DeepSeekFlashAdapter::new(
-        ProviderId("deepseek-flash".to_string()),
-        "text",
-        1,
-    )))
-    .unwrap();
-    host.register_reference_provider(ReferenceProvider::new(
-        ProviderId("ref-1".to_string()),
-        "text",
-        1,
+fn provider_infra_007_transport_unavailable_fails_closed_without_fallback() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let transport = HttpTransport::new("http://localhost:19999", Duration::from_secs(2));
+    let binding = TransportBinding::new(
+        ProtocolKind::OpenAiChatCompletions,
+        transport,
+        1024 * 1024,
+        1000,
+    );
+    let provider = HttpExecuteProvider::new(
+        Box::new(DeepSeekFlashAdapter::new(
+            ProviderId("deepseek-flash".to_string()),
+            "llm-chat",
+            1,
+        )),
+        &binding,
+        1024 * 1024,
+        1000,
+    );
+    let host = ProviderHost::new().with_runtime_handle(runtime.handle().clone());
+    host.register(ProviderRegistration::new(
+        provider as Arc<_>,
+        ProtocolKind::OpenAiChatCompletions,
+        binding,
+        RegistrationLimits {
+            max_output_bytes: 1024 * 1024,
+            max_output_items: 1000,
+        },
     ))
     .unwrap();
-    let result = host.execute_task(&task("write a plan")).unwrap();
-    assert_eq!(result.output, "write a plan");
-    assert_eq!(result.status, TaskStatus::Completed);
-    assert!(
-        result
-            .evidence
-            .iter()
-            .any(|evidence| evidence.provider == ProviderId("ref-1".to_string()))
-    );
+    // Fails closed with a typed transport error; there is no reference fallback.
+    let error = host
+        .execute_task_with_cancel(
+            &ProviderId("deepseek-flash".to_string()),
+            1,
+            &task("write a plan"),
+            CancellationToken::new(),
+        )
+        .expect_err("must fail closed");
+    assert!(matches!(
+        error,
+        provider_host::HarnessError::TransportUnavailable { .. }
+    ));
 }
 
 #[test]
-fn provider_infra_008_existing_canary_still_works() {
-    let mut host = ProviderHost::new();
-    host.register_reference_provider(ReferenceProvider::new(
-        ProviderId("ref-1".to_string()),
-        "text",
-        1,
-    ))
-    .unwrap();
-    host.register_harness_adapter(HarnessAdapter::new(
-        ProviderId("adapter-1".to_string()),
-        "text",
-        2,
-    ))
-    .unwrap();
-    let result = host.execute_task(&task("write a plan")).unwrap();
-    assert_eq!(result.output, "adapter:write a plan");
+fn provider_infra_008_canary_executes_through_common_host() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut host = ProviderHost::new().with_runtime_handle(runtime.handle().clone());
+    TestCanaryProvider::new(ProviderId("canary-1".to_string()), "text", 2)
+        .register_into(&mut host)
+        .unwrap();
+    let result = host
+        .execute_task_with_cancel(
+            &ProviderId("canary-1".to_string()),
+            2,
+            &task("write a plan"),
+            CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(result.output, "canary:write a plan");
     assert_eq!(result.status, TaskStatus::Completed);
 }
 

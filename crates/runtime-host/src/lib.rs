@@ -8,6 +8,8 @@ pub mod local_runtime;
 #[cfg(unix)]
 pub mod offline_storage;
 #[cfg(unix)]
+mod production_graph;
+#[cfg(unix)]
 mod provider_config;
 pub mod scheduler;
 #[cfg(unix)]

@@ -61,6 +61,8 @@ fn host_registers_owner_principal_from_manifest() {
         [
             "admission-stopped",
             "activity-drained",
+            "provider-drained",
+            "provider-runtime-stopped",
             "audit-checkpointed",
             "endpoint-unpublished",
             "discovery-unpublished",
@@ -140,6 +142,58 @@ fn host_restart_preserves_instance_identity_and_advances_generation() {
             .principals
             .resolve_principal(&manifest.owner.principal_ref)
             .is_ok()
+    );
+}
+
+#[test]
+fn host_start_rolls_back_all_publication_on_discovery_failpoint() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let layout = temp_layout("discovery-failpoint");
+    fs::create_dir_all(&layout.runtime_root).expect("runtime root");
+    fs::set_permissions(&layout.runtime_root, fs::Permissions::from_mode(0o700))
+        .expect("runtime permissions");
+    // Inject a discovery-publish failpoint: the discovery root is a regular
+    // file, so the terminal discovery extension cannot persist its state and
+    // its `start` fails. This is the last publication step, so the composition
+    // must roll back the PID artifact and the bound control endpoint in reverse
+    // order, leaving zero published artifacts.
+    fs::write(&layout.discovery_root, b"not-a-directory").expect("discovery file");
+
+    let error = LocalRuntimeHost::start(
+        layout.runtime_root.clone(),
+        layout.discovery_root.clone(),
+        None,
+    )
+    .expect_err("discovery failpoint must fail startup closed");
+    assert!(
+        error.to_string().contains("runtime composition failed"),
+        "startup failure must surface as a composition rollback: {error}"
+    );
+
+    // Zero published PID artifact.
+    let pid_path = layout.runtime_root.join(".runtime-host.pid");
+    assert!(
+        !pid_path.exists(),
+        "failed start must leave no published PID artifact"
+    );
+    // Zero published control endpoint socket. Bootstrap binds the endpoint
+    // under `<runtime_root>/endpoints/`; assert no live socket remains there.
+    let mut live_sockets = 0_u32;
+    let endpoints_dir = layout.runtime_root.join("endpoints");
+    if let Ok(read_dir) = fs::read_dir(&endpoints_dir) {
+        for entry in read_dir.flatten() {
+            if let Ok(meta) = entry.path().symlink_metadata() {
+                use std::os::unix::fs::FileTypeExt;
+                if meta.file_type().is_socket() {
+                    live_sockets += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        live_sockets, 0,
+        "failed start must unpublish the control endpoint socket"
     );
 }
 

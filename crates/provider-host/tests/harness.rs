@@ -1,17 +1,36 @@
-//! Acceptance coverage for `AT-HARNESS-001`: Reference Provider plus one real
-//! Harness Adapter canary.
-#![allow(clippy::unwrap_used)]
+//! Provider host acceptance coverage (`DXB-DEL-068` H1–H4).
+//!
+//! Exercises the canonical async Execute contract, exact id+generation
+//! selection with no fallback, per-registration protocol/transport isolation,
+//! atomic replace/drain/unregister semantics, and the shared Conformance suite
+//! run over both the synthetic canary and the deterministic reference.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(all(feature = "direct-deepseek", feature = "direct-minimax"))]
+
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::Arc;
+use std::time::Duration;
 
 use dxbot_core::types::ProviderId;
 use provider_host::{
-    HarnessAdapter, HarnessError, ProviderHost, ProviderStatus, ReferenceProvider, TaskDescription,
-    TaskStatus,
+    CancellationToken, ConformanceCase, ConformanceSuite, DeepSeekFlashAdapter, HarnessError,
+    HttpExecuteProvider, HttpTransport, MiniMaxM3Adapter, ProtocolKind, ProviderHost, ProviderInfo,
+    ProviderRegistration, ProviderStatus, ReferenceProvider, RegistrationLimits, TaskDescription,
+    TaskStatus, TestCanaryProvider, TransportBinding,
 };
 
-/// Absolute wall-clock deadline (Unix epoch seconds) far enough in the future
-/// that the bounded task never expires while the suite runs. `deadline` is an
-/// absolute timestamp, not a relative budget, so a fixed past constant would
-/// spuriously trip `DeadlineExceeded`.
+const MAX_BYTES: usize = 1024 * 1024;
+const MAX_ITEMS: usize = 1000;
+
+fn test_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime")
+}
+
 fn future_deadline() -> i64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -29,246 +48,406 @@ fn task(intent: &str) -> TaskDescription {
 }
 
 #[test]
-fn harness_reference_provider_is_always_available() {
-    let mut host = ProviderHost::new();
-    host.register_reference_provider(ReferenceProvider::new(
-        ProviderId("ref-1".to_string()),
-        "text",
-        1,
-    ))
-    .unwrap();
+fn canary_executes_through_canonical_contract() {
+    let runtime = test_runtime();
+    let mut host = ProviderHost::new().with_runtime_handle(runtime.handle().clone());
+    TestCanaryProvider::new(ProviderId("canary-1".to_owned()), "text", 2)
+        .register_into(&mut host)
+        .unwrap();
 
-    // The Reference Provider is always available once registered and executes
-    // the bounded task even with no real adapter.
-    let result = host.execute_task(&task("write a plan")).unwrap();
-    assert_eq!(result.output, "write a plan");
+    let result = host
+        .execute_task_with_cancel(
+            &ProviderId("canary-1".to_owned()),
+            2,
+            &task("write a plan"),
+            CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(result.output, "canary:write a plan");
     assert_eq!(result.status, TaskStatus::Completed);
     assert!(
         result
             .evidence
             .iter()
-            .any(|e| e.provider == ProviderId("ref-1".to_string()))
+            .any(|evidence| evidence.provider == ProviderId("canary-1".to_owned()))
     );
 }
 
 #[test]
-fn harness_real_adapter_canary_executes_task() {
-    let mut host = ProviderHost::new();
-    host.register_reference_provider(ReferenceProvider::new(
-        ProviderId("ref-1".to_string()),
-        "text",
-        1,
-    ))
-    .unwrap();
-    host.register_harness_adapter(HarnessAdapter::new(
-        ProviderId("adapter-1".to_string()),
-        "text",
-        2,
-    ))
-    .unwrap();
-
-    // The real adapter canary is preferred and actually executes the task
-    // through the provider chain (its output marker differs from the fallback).
-    let result = host.execute_task(&task("write a plan")).unwrap();
-    assert_eq!(result.output, "adapter:write a plan");
-    assert_eq!(result.status, TaskStatus::Completed);
-    assert!(
-        result
-            .evidence
-            .iter()
-            .any(|e| e.provider == ProviderId("adapter-1".to_string())
-                && e.observation == "harness-adapter-canary")
-    );
-}
-
-#[test]
-fn harness_provider_chain_falls_back_to_reference() {
-    let mut host = ProviderHost::new();
-    host.register_reference_provider(ReferenceProvider::new(
-        ProviderId("ref-1".to_string()),
-        "text",
-        1,
-    ))
-    .unwrap();
-    host.register_harness_adapter(HarnessAdapter::unavailable(
-        ProviderId("adapter-1".to_string()),
-        "text",
-        2,
-    ))
-    .unwrap();
-
-    // The real canary is unavailable, so the chain falls back to the always
-    // available Reference Provider instead of failing the task.
-    let result = host.execute_task(&task("write a plan")).unwrap();
+fn reference_fixture_executes_through_canonical_contract() {
+    let runtime = test_runtime();
+    let mut host = ProviderHost::new().with_runtime_handle(runtime.handle().clone());
+    ReferenceProvider::new(ProviderId("ref-1".to_owned()), "text", 1)
+        .register_into(&mut host)
+        .unwrap();
+    let result = host
+        .execute_task_with_cancel(
+            &ProviderId("ref-1".to_owned()),
+            1,
+            &task("write a plan"),
+            CancellationToken::new(),
+        )
+        .unwrap();
     assert_eq!(result.output, "write a plan");
-    assert!(
-        result
-            .evidence
-            .iter()
-            .any(|e| e.provider == ProviderId("ref-1".to_string()))
-    );
+    assert_eq!(result.status, TaskStatus::Completed);
 }
 
 #[test]
-fn harness_list_providers_filters_by_capability() {
-    let mut host = ProviderHost::new();
-    host.register_reference_provider(ReferenceProvider::new(
-        ProviderId("ref-text".to_string()),
-        "text",
+fn unknown_or_replaced_provider_fails_closed_without_fallback() {
+    let runtime = test_runtime();
+    let mut host = ProviderHost::new().with_runtime_handle(runtime.handle().clone());
+    ReferenceProvider::new(ProviderId("ref-1".to_owned()), "text", 1)
+        .register_into(&mut host)
+        .unwrap();
+
+    // A different id is not silently substituted by the registered reference.
+    let unknown = host.execute_task_with_cancel(
+        &ProviderId("other".to_owned()),
         1,
-    ))
-    .unwrap();
-    host.register_harness_adapter(HarnessAdapter::new(
-        ProviderId("adapter-code".to_string()),
-        "code",
-        2,
-    ))
-    .unwrap();
+        &task("x"),
+        CancellationToken::new(),
+    );
+    assert!(matches!(
+        unknown,
+        Err(HarnessError::ProviderNotFound { .. })
+    ));
 
-    let all = host.list_providers(None);
-    assert_eq!(all.len(), 2);
+    // The wrong generation for a known id is fenced, not substituted.
+    let fenced = host.execute_task_with_cancel(
+        &ProviderId("ref-1".to_owned()),
+        99,
+        &task("x"),
+        CancellationToken::new(),
+    );
+    assert!(matches!(fenced, Err(HarnessError::GenerationFenced { .. })));
+}
 
+#[test]
+fn list_and_get_reflect_active_registrations() {
+    let runtime = test_runtime();
+    let mut host = ProviderHost::new().with_runtime_handle(runtime.handle().clone());
+    ReferenceProvider::new(ProviderId("ref-text".to_owned()), "text", 1)
+        .register_into(&mut host)
+        .unwrap();
+    TestCanaryProvider::new(ProviderId("canary-code".to_owned()), "code", 2)
+        .register_into(&mut host)
+        .unwrap();
+
+    assert_eq!(host.list_providers(None).len(), 2);
     let text = host.list_providers(Some("text"));
     assert_eq!(text.len(), 1);
-    assert_eq!(text[0].id, ProviderId("ref-text".to_string()));
-
+    assert_eq!(text[0].id, ProviderId("ref-text".to_owned()));
     let code = host.list_providers(Some("code"));
     assert_eq!(code.len(), 1);
-    assert_eq!(code[0].id, ProviderId("adapter-code".to_string()));
-
-    let none = host.list_providers(Some("vision"));
-    assert!(none.is_empty());
+    assert_eq!(code[0].id, ProviderId("canary-code".to_owned()));
+    assert!(host.list_providers(Some("vision")).is_empty());
 
     let info = host
-        .get_provider(&ProviderId("adapter-code".to_string()))
+        .get_provider(&ProviderId("canary-code".to_owned()))
         .unwrap();
     assert_eq!(info.capability, "code");
     assert_eq!(info.status, ProviderStatus::Ready);
     assert!(matches!(
-        host.get_provider(&ProviderId("missing".to_string())),
+        host.get_provider(&ProviderId("missing".to_owned())),
         Err(HarnessError::ProviderNotFound { .. })
     ));
 }
 
-#[cfg(unix)]
-fn real_host(endpoint: &str) -> ProviderHost {
-    let mut host = ProviderHost::new();
-    host.set_transport(provider_host::HttpTransport::new(
-        endpoint,
-        std::time::Duration::from_secs(2),
+#[test]
+fn replace_publishes_new_generation_and_drains_old() {
+    let runtime = test_runtime();
+    let mut host = ProviderHost::new().with_runtime_handle(runtime.handle().clone());
+    let id = ProviderId("canary".to_owned());
+    TestCanaryProvider::new(id.clone(), "text", 1)
+        .register_into(&mut host)
+        .unwrap();
+
+    let replacement = ProviderRegistration::detached(
+        Arc::new(TestCanaryProvider::new(id.clone(), "text", 2)),
+        ProtocolKind::OpenAiChatCompletions,
+        RegistrationLimits {
+            max_output_bytes: 64 * 1024,
+            max_output_items: 256,
+        },
+    );
+    host.replace(replacement).unwrap();
+
+    // Active generation is now 2 (Ready). New admission targets generation 2.
+    let active = host.get_provider(&id).unwrap();
+    assert_eq!(active.generation, 2);
+    assert_eq!(active.status, ProviderStatus::Ready);
+
+    // A replacement whose generation is not strictly greater is rejected.
+    let stale = ProviderRegistration::detached(
+        Arc::new(TestCanaryProvider::new(id.clone(), "text", 2)),
+        ProtocolKind::OpenAiChatCompletions,
+        RegistrationLimits {
+            max_output_bytes: 64 * 1024,
+            max_output_items: 256,
+        },
+    );
+    assert!(matches!(
+        host.replace(stale),
+        Err(HarnessError::InvalidProvider { .. })
     ));
-    host.register_real_provider(Box::new(provider_host::DeepSeekFlashAdapter::configured(
-        ProviderId("real-1".to_owned()),
-        "llm-chat",
-        1,
-        "test-model",
-    )))
-    .unwrap();
-    host
+
+    // The old generation was a zero-lease Draining slot, reclaimed on replace;
+    // a call beginning after replace against it is fenced (no new admission on a
+    // superseded generation). In-flight work admitted before replace keeps its
+    // captured provider+activity and may still finish, but a fresh call cannot
+    // re-enter generation 1.
+    let old = host.execute_task_with_cancel(&id, 1, &task("old"), CancellationToken::new());
+    assert!(matches!(old, Err(HarnessError::GenerationFenced { .. })));
 }
 
-#[cfg(unix)]
-fn execute_against_response(status: &str, headers: &str, body: String) -> HarnessError {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+#[test]
+fn unregister_captures_old_generation_and_fails_closed_afterwards() {
+    let runtime = test_runtime();
+    let mut host = ProviderHost::new().with_runtime_handle(runtime.handle().clone());
+    let id = ProviderId("canary".to_owned());
+    TestCanaryProvider::new(id.clone(), "text", 5)
+        .register_into(&mut host)
+        .unwrap();
 
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let status = status.to_owned();
-    let headers = headers.to_owned();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request).unwrap();
+    let captured = host.unregister(&id).unwrap();
+    assert_eq!(captured, 5);
+    assert!(host.list_providers(None).is_empty());
+    assert!(matches!(
+        host.execute_task_with_cancel(&id, 5, &task("x"), CancellationToken::new()),
+        Err(HarnessError::ProviderNotFound { .. })
+    ));
+    assert!(matches!(
+        host.unregister(&id),
+        Err(HarnessError::ProviderNotFound { .. })
+    ));
+}
+
+#[test]
+fn drain_stops_new_admission_and_reports_draining() {
+    let runtime = test_runtime();
+    let mut host = ProviderHost::new().with_runtime_handle(runtime.handle().clone());
+    let id = ProviderId("canary".to_owned());
+    TestCanaryProvider::new(id.clone(), "text", 3)
+        .register_into(&mut host)
+        .unwrap();
+    let generation = host.begin_drain(&id).unwrap();
+    assert_eq!(generation, 3);
+    // A zero-lease drained generation is reclaimed, so the id no longer has a
+    // selectable slot and `get_provider` reports it gone.
+    assert!(matches!(
+        host.get_provider(&id),
+        Err(HarnessError::ProviderNotFound { .. })
+    ));
+    // A call beginning after drain is fenced: no new admission on a drained
+    // generation. In-flight work admitted before the drain keeps its captured
+    // provider+activity and may still complete, but a fresh call cannot enter.
+    let result = host.execute_task_with_cancel(&id, 3, &task("drain"), CancellationToken::new());
+    assert!(matches!(result, Err(HarnessError::ProviderNotFound { .. })));
+}
+
+/// H4: two registrations with different protocol/transport bindings coexist and
+/// execute over their own captured binding without cross-route contamination.
+#[cfg(unix)]
+#[test]
+fn per_registration_protocol_transport_isolation() {
+    // Anthropic-bound MiniMax registration.
+    let anthropic_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let anthropic_endpoint = format!(
+        "http://{}/anthropic/v1",
+        anthropic_listener.local_addr().unwrap()
+    );
+    let anthropic_server = std::thread::spawn(move || {
+        let (mut stream, _) = anthropic_listener.accept().unwrap();
+        let mut buf = vec![0_u8; 16 * 1024];
+        let size = stream.read(&mut buf).unwrap();
+        buf.truncate(size);
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("POST /anthropic/v1/messages HTTP/1.1"));
+        assert!(
+            text.to_ascii_lowercase()
+                .contains("x-api-key: anthropic-secret")
+        );
+        let body = serde_json::json!({
+            "content": [{"type": "text", "text": "ANTHROPIC_ROUTE_OK"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+        .to_string();
         write!(
             stream,
-            "HTTP/1.1 {status}\r\ncontent-length: {}\r\n{headers}\r\n{}",
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
             body.len(),
             body
         )
         .unwrap();
         stream.flush().unwrap();
     });
-    let error = match real_host(&endpoint).execute_task(&task("typed failure")) {
-        Err(error) => error,
-        Ok(result) => panic!("fixture unexpectedly succeeded: {result:?}"),
-    };
-    server.join().unwrap();
-    error
-}
 
-#[cfg(unix)]
-#[test]
-fn real_provider_preserves_typed_failure_matrix_without_detail_leak() {
-    assert_eq!(
-        execute_against_response(
-            "429 Too Many Requests",
-            "retry-after: 7\r\n",
-            "credential=secret-upstream".to_owned(),
-        ),
-        HarnessError::RateLimited {
-            id: ProviderId("real-1".to_owned()),
-            retry_after_seconds: Some(7),
-        }
-    );
-    assert_eq!(
-        execute_against_response(
-            "503 Service Unavailable",
-            "",
-            "credential=secret-upstream".to_owned(),
-        ),
-        HarnessError::UpstreamUnavailable {
-            id: ProviderId("real-1".to_owned()),
-            status: 503,
-        }
-    );
-    assert_eq!(
-        execute_against_response(
-            "200 OK",
-            "content-type: application/json\r\n",
-            "not-json".to_owned()
-        ),
-        HarnessError::ProtocolViolation {
-            id: ProviderId("real-1".to_owned()),
-        }
-    );
-
-    let oversized = serde_json::json!({
-        "choices": [{"message": {"content": "x".repeat(1024 * 1024 + 1), "reasoning_content": null}}],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "reasoning_tokens": 0}
-    })
-    .to_string();
-    assert_eq!(
-        execute_against_response("200 OK", "content-type: application/json\r\n", oversized),
-        HarnessError::OutputExceeded {
-            id: ProviderId("real-1".to_owned()),
-        }
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn real_provider_transport_and_deadline_are_typed_without_fallback_masking() {
-    use std::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-    assert_eq!(
-        real_host(&endpoint).execute_task(&task("transport")),
-        Err(HarnessError::TransportUnavailable {
-            id: ProviderId("real-1".to_owned()),
+    // OpenAI-bound DeepSeek registration.
+    let openai_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let openai_endpoint = format!("http://{}", openai_listener.local_addr().unwrap());
+    let openai_server = std::thread::spawn(move || {
+        let (mut stream, _) = openai_listener.accept().unwrap();
+        let mut buf = vec![0_u8; 16 * 1024];
+        let size = stream.read(&mut buf).unwrap();
+        buf.truncate(size);
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert!(
+            text.to_ascii_lowercase()
+                .contains("authorization: bearer openai-secret")
+        );
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "OPENAI_ROUTE_OK", "reasoning_content": null}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "reasoning_tokens": 0}
         })
-    );
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    });
 
-    let expired = TaskDescription {
-        intent: "deadline".to_owned(),
-        context: "bounded".to_owned(),
-        budget: Some(1),
-        deadline: Some(1),
-    };
-    assert_eq!(
-        real_host("http://127.0.0.1:9").execute_task(&expired),
-        Err(HarnessError::DeadlineExceeded)
+    let runtime = test_runtime();
+    let host = ProviderHost::new().with_runtime_handle(runtime.handle().clone());
+
+    let anthropic_transport = HttpTransport::new(&anthropic_endpoint, Duration::from_secs(2))
+        .with_anthropic_key("anthropic-secret")
+        .unwrap();
+    let anthropic_binding = TransportBinding::new(
+        ProtocolKind::AnthropicMessages,
+        anthropic_transport,
+        MAX_BYTES,
+        MAX_ITEMS,
     );
+    let anthropic_provider = HttpExecuteProvider::new(
+        Box::new(MiniMaxM3Adapter::new(
+            ProviderId("minimax".to_owned()),
+            "llm-chat",
+            1,
+        )),
+        &anthropic_binding,
+        MAX_BYTES,
+        MAX_ITEMS,
+    );
+    host.register(ProviderRegistration::new(
+        anthropic_provider as Arc<_>,
+        ProtocolKind::AnthropicMessages,
+        anthropic_binding,
+        RegistrationLimits {
+            max_output_bytes: MAX_BYTES,
+            max_output_items: MAX_ITEMS,
+        },
+    ))
+    .unwrap();
+
+    let openai_transport = HttpTransport::new(&openai_endpoint, Duration::from_secs(2))
+        .with_bearer("openai-secret")
+        .unwrap();
+    let openai_binding = TransportBinding::new(
+        ProtocolKind::OpenAiChatCompletions,
+        openai_transport,
+        MAX_BYTES,
+        MAX_ITEMS,
+    );
+    let openai_provider = HttpExecuteProvider::new(
+        Box::new(DeepSeekFlashAdapter::new(
+            ProviderId("deepseek".to_owned()),
+            "llm-chat",
+            1,
+        )),
+        &openai_binding,
+        MAX_BYTES,
+        MAX_ITEMS,
+    );
+    host.register(ProviderRegistration::new(
+        openai_provider as Arc<_>,
+        ProtocolKind::OpenAiChatCompletions,
+        openai_binding,
+        RegistrationLimits {
+            max_output_bytes: MAX_BYTES,
+            max_output_items: MAX_ITEMS,
+        },
+    ))
+    .unwrap();
+
+    let anthropic_result = host
+        .execute_task_with_cancel(
+            &ProviderId("minimax".to_owned()),
+            1,
+            &task("route"),
+            CancellationToken::new(),
+        )
+        .unwrap();
+    let openai_result = host
+        .execute_task_with_cancel(
+            &ProviderId("deepseek".to_owned()),
+            1,
+            &task("route"),
+            CancellationToken::new(),
+        )
+        .unwrap();
+    anthropic_server.join().unwrap();
+    openai_server.join().unwrap();
+
+    // Each registration used its own captured protocol/transport binding.
+    assert_eq!(anthropic_result.output, "ANTHROPIC_ROUTE_OK");
+    assert_eq!(openai_result.output, "OPENAI_ROUTE_OK");
+}
+
+/// H3: the shared Conformance suite runs the same rows over the canary and the
+/// reference through the same public registration + execute path.
+#[test]
+fn shared_conformance_suite_covers_canary_and_reference() {
+    let runtime = test_runtime();
+    let expected_cases = [
+        ConformanceCase::Registration,
+        ConformanceCase::ExactGenerationSelection,
+        ConformanceCase::SuccessTerminal,
+        ConformanceCase::DuplicateRejection,
+        ConformanceCase::UnknownRejection,
+        ConformanceCase::Cancellation,
+        ConformanceCase::ReplaceFencesOldGeneration,
+        ConformanceCase::DrainStopsNewAdmission,
+        ConformanceCase::ActivityLeaseLifecycle,
+        ConformanceCase::SlotReclamationBounded,
+        ConformanceCase::StaleGenerationCommitFenced,
+    ];
+
+    let canary_cases = ConformanceSuite::run_deterministic(
+        runtime.handle().clone(),
+        "text",
+        |id, generation| TestCanaryProvider::new(id, "text", generation),
+        |host, provider| provider.register_into(host),
+        |intent| format!("canary:{intent}"),
+    );
+    assert_eq!(canary_cases, expected_cases);
+
+    let reference_cases = ConformanceSuite::run_deterministic(
+        runtime.handle().clone(),
+        "text",
+        |id, generation| ReferenceProvider::new(id, "text", generation),
+        |host, provider| provider.register_into(host),
+        |intent| intent.to_owned(),
+    );
+    assert_eq!(reference_cases, expected_cases);
+}
+
+/// Diagnostics/list surface stays additive-compatible: `ProviderInfo` still
+/// exposes id/capability/generation/status.
+#[test]
+fn provider_info_shape_is_stable() {
+    let info = ProviderInfo {
+        id: ProviderId("p".to_owned()),
+        capability: "llm-chat".to_owned(),
+        generation: 1,
+        status: ProviderStatus::Ready,
+    };
+    assert_eq!(info.id.0, "p");
+    assert_eq!(info.capability, "llm-chat");
+    assert_eq!(info.generation, 1);
+    assert_eq!(info.status, ProviderStatus::Ready);
 }

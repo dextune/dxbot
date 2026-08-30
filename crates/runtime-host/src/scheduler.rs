@@ -17,10 +17,12 @@ use application::{
 };
 use dxbot_core::types::{CoreLeaseId, ExecutionId, ProviderId};
 use provider_host::{
-    CancellationToken, HarnessError, ProviderHost, ProviderStatus, TaskDescription,
-    TaskStatus as ProviderTaskStatus,
+    AllowOnceGrant, CancellationToken, ExecuteRequest, HarnessError, ProviderActivityRef,
+    ProviderHost, ProviderStatus, TaskDescription, TaskStatus as ProviderTaskStatus,
+    ToolDisposition,
 };
 use runtime_security::SecurityState;
+use runtime_security::approval::ApprovalState;
 
 use crate::audit_projection::AuditProjection;
 
@@ -258,6 +260,7 @@ fn run_loop(
             let worker_providers = Arc::clone(providers);
             let worker_governor = Arc::clone(governor);
             let worker_calls = Arc::clone(current_provider_calls);
+            let worker_security = Arc::clone(audit.security);
             if let Ok(worker) = thread::Builder::new()
                 .name(format!("dxbot-execution-{}", candidate.execution_id.0))
                 .spawn(move || {
@@ -267,6 +270,7 @@ fn run_loop(
                         &worker_governor,
                         scheduler_generation,
                         &worker_calls,
+                        &worker_security,
                         &candidate,
                     );
                 })
@@ -288,6 +292,7 @@ fn run_candidate(
     governor: &Arc<ResourceGovernor>,
     scheduler_generation: i64,
     current_provider_calls: &Mutex<HashMap<ExecutionId, CancellationToken>>,
+    security: &Arc<Mutex<SecurityState>>,
     candidate: &ExecutionCandidate,
 ) {
     let Ok(Some(lease)) = governor.try_acquire(&candidate.execution_id) else {
@@ -349,13 +354,50 @@ fn run_candidate(
                 thread::sleep(Duration::from_millis(10));
             }
         });
+    let mut activity_ref: Option<ProviderActivityRef> = None;
     let task = TaskDescription {
         intent: candidate.task.intent.clone(),
         context: candidate.task.context.clone(),
         budget: candidate.task.budget,
         deadline: candidate.task.deadline,
     };
-    let provider_result = providers.execute_task_with_cancel(&task, cancellation);
+    // Resolve the request-scoped allow-once authority grant (`DXB-DEL-068`
+    // H10 Task 7). It is minted ONLY from an Approved runtime-security Approval
+    // bound to action `provider-tool-allow-once`, target the exact execution
+    // ref, and a positive policy generation. Absent an approved authority, the
+    // grant is `None` and the provider defaults to reject; a DSH/ambient
+    // approval never suffices because it never appears in the canonical
+    // Security ApprovalManager consulted here.
+    let allow_once_grant = resolve_allow_once_grant(security, &candidate.execution_id);
+    let side_effect_ref = Some(side_effect_id.clone());
+    let core_lease_ref = Some(lease.lease_id.0.clone());
+    let request = ExecuteRequest {
+        provider_id: candidate.provider_id.clone(),
+        provider_generation: candidate.provider_generation,
+        intent: task.intent.clone(),
+        context: task.context.clone(),
+        budget: task.budget,
+        deadline: task.deadline,
+        permission_refs: candidate.task.permission_refs.clone(),
+        resource_refs: candidate.task.resource_refs.clone(),
+        side_effect_ref,
+        core_lease_ref,
+        allow_once_grant,
+    };
+    // Hold the in-flight activity lease for the whole call (`DXB-DEL-068` H9).
+    // The captured generation travels with the lease so a result produced under
+    // a generation that has since been superseded (replaced/unregistered) is
+    // fenced at commit time and never committed as a fresh result.
+    let provider_result = providers
+        .execute_with_activity(&request, cancellation)
+        .map(|(result, activity)| (result, Some(activity)));
+    let provider_result = match provider_result {
+        Ok((result, activity)) => {
+            activity_ref = activity;
+            Ok(result)
+        }
+        Err(error) => Err(error),
+    };
     monitor_done.store(true, Ordering::Release);
     if let Ok(monitor) = monitor {
         let _ = monitor.join();
@@ -388,6 +430,56 @@ fn run_candidate(
             }
         }
         Ok(result) if !result.output.is_empty() => {
+            // Commit-time generation fence (`DXB-DEL-068` H9). A result produced
+            // under a captured generation that has since been superseded
+            // (provider replaced or unregistered mid-flight) must not be
+            // committed as a fresh result. The lease kept the old slot alive for
+            // this call, but the active generation has moved on, so we mark the
+            // side effect Unknown and require reconciliation rather than
+            // duplicating an effect under a stale fence.
+            let generation_current = activity_ref.as_ref().is_some_and(|activity| {
+                providers.is_active_generation(activity.provider_id(), activity.generation())
+            });
+            if !generation_current {
+                let _ = application.mark_provider_side_effect_unknown(
+                    &fence,
+                    &side_effect_id,
+                    "Provider generation superseded before result commit",
+                );
+                let _ = application.fail_execution(
+                    &fence,
+                    "Provider generation fenced at commit; reconciliation required",
+                    true,
+                );
+                drop(activity_ref);
+                lease.release();
+                return;
+            }
+            // Per-tool side-effect disposition fold (`DXB-DEL-068` H10 Task 8).
+            // Any tool effect whose disposition is Unknown forces the execution
+            // into RecoveryRequired with the side effect marked Unknown; the
+            // committed final result is never produced under an unknown external
+            // effect, and there is no blind retry. Rejected/Prepared/Dispatched/
+            // Confirmed dispositions do not block a clean commit.
+            let has_unknown_effect = result
+                .tool_effects
+                .iter()
+                .any(|effect| effect.disposition == ToolDisposition::Unknown);
+            if has_unknown_effect {
+                let _ = application.mark_provider_side_effect_unknown(
+                    &fence,
+                    &side_effect_id,
+                    "Tool side effect disposition Unknown; reconciliation required",
+                );
+                let _ = application.fail_execution(
+                    &fence,
+                    "Unknown tool side effect; reconciliation required, no blind retry",
+                    true,
+                );
+                drop(activity_ref);
+                lease.release();
+                return;
+            }
             let input = ExecutionResultInput {
                 output: result.output,
                 evidence: result
@@ -436,6 +528,44 @@ fn run_candidate(
     lease.release();
 }
 
+/// The canonical binding action for a provider tool allow-once authority. Only
+/// an Approved runtime-security Approval bound to this exact action, targeting
+/// the exact execution, with a positive policy generation, authorizes a single
+/// provider allow-once tool decision (`DXB-DEL-068` H10 Task 7).
+const ALLOW_ONCE_ACTION: &str = "provider-tool-allow-once";
+
+/// Resolve the request-scoped allow-once authority grant for an execution from
+/// the canonical Security ApprovalManager. Returns `Some` only when an Approval
+/// is `Approved`, bound to action [`ALLOW_ONCE_ACTION`], targets exactly this
+/// execution, and has a positive policy generation. Any other state — pending,
+/// denied, mis-targeted, wrong action, non-positive generation, or absent —
+/// yields `None`, so the provider defaults to reject. A DSH/ambient approval is
+/// never consulted and can never mint a grant.
+fn resolve_allow_once_grant(
+    security: &Arc<Mutex<SecurityState>>,
+    execution_id: &ExecutionId,
+) -> Option<AllowOnceGrant> {
+    let target = format!("execution:{}", execution_id.0);
+    let guard = security.lock().ok()?;
+    for approval in guard.approvals.list_approvals() {
+        if approval.state == ApprovalState::Approved
+            && approval.binding.action == ALLOW_ONCE_ACTION
+            && approval.binding.target == target
+            && approval.binding.policy_generation > 0
+        {
+            let grant = AllowOnceGrant {
+                approval_ref: approval.id.0.clone(),
+                execution_ref: target.clone(),
+                policy_generation: approval.binding.policy_generation,
+            };
+            if grant.is_valid() {
+                return Some(grant);
+            }
+        }
+    }
+    None
+}
+
 fn provider_failure_reason(provider_id: &ProviderId, error: &HarnessError) -> String {
     let kind = match error {
         HarnessError::RateLimited { .. } => "rate-limited",
@@ -448,7 +578,8 @@ fn provider_failure_reason(provider_id: &ProviderId, error: &HarnessError) -> St
         HarnessError::DeadlineExceeded => "deadline-exceeded",
         HarnessError::ProviderUnavailable { .. } => "provider-unavailable",
         HarnessError::ProviderNotFound { .. } => "provider-not-found",
-        HarnessError::NoReferenceProvider | HarnessError::NoHarnessAdapter => "unconfigured",
+        HarnessError::GenerationFenced { .. } => "generation-fenced",
+        HarnessError::NoProviderConfigured => "unconfigured",
         HarnessError::AlreadyRegistered { .. }
         | HarnessError::InvalidProvider { .. }
         | HarnessError::ExecutionFailed { .. } => "execution-failed",
@@ -461,6 +592,117 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+    use dxbot_core::types::{OperationId, PrincipalRef};
+    use runtime_security::approval::{ApprovalBinding, ApprovalDecision};
+
+    fn approved_allow_once(
+        security: &Arc<Mutex<SecurityState>>,
+        execution_ref: &str,
+        approver: &PrincipalRef,
+    ) {
+        let mut guard = security.lock().expect("security");
+        let id = guard
+            .approvals
+            .create_bound_approval(
+                OperationId(format!("op-{execution_ref}")),
+                ApprovalBinding {
+                    action: ALLOW_ONCE_ACTION.to_owned(),
+                    target: execution_ref.to_owned(),
+                    policy_generation: 3,
+                },
+                vec![approver.clone()],
+            )
+            .expect("create approval");
+        let state = guard
+            .approvals
+            .decide_approval(&id, ApprovalDecision::Approve, approver)
+            .expect("approve");
+        assert_eq!(state, ApprovalState::Approved);
+    }
+
+    #[test]
+    fn allow_once_grant_requires_approved_authority_bound_to_exact_execution() {
+        let security = Arc::new(Mutex::new(SecurityState::new()));
+        let approver = PrincipalRef("operator".to_owned());
+        let execution = ExecutionId("exec-1".to_owned());
+        // No approval yet: default deny (no grant).
+        assert!(resolve_allow_once_grant(&security, &execution).is_none());
+
+        // An Approved allow-once bound to the exact execution mints a valid grant.
+        approved_allow_once(&security, "execution:exec-1", &approver);
+        let grant = resolve_allow_once_grant(&security, &execution).expect("grant");
+        assert!(grant.is_valid());
+        assert_eq!(grant.execution_ref, "execution:exec-1");
+        assert_eq!(grant.policy_generation, 3);
+    }
+
+    #[test]
+    fn allow_once_grant_is_denied_for_a_different_execution_target() {
+        let security = Arc::new(Mutex::new(SecurityState::new()));
+        let approver = PrincipalRef("operator".to_owned());
+        // Approved, but bound to a DIFFERENT execution: never grants ours.
+        approved_allow_once(&security, "execution:other", &approver);
+        assert!(
+            resolve_allow_once_grant(&security, &ExecutionId("exec-1".to_owned())).is_none(),
+            "an approval for another execution must never authorize this one"
+        );
+    }
+
+    #[test]
+    fn allow_once_grant_is_denied_for_wrong_action() {
+        let security = Arc::new(Mutex::new(SecurityState::new()));
+        let approver = PrincipalRef("operator".to_owned());
+        {
+            let mut guard = security.lock().expect("security");
+            let id = guard
+                .approvals
+                .create_bound_approval(
+                    OperationId("op-x".to_owned()),
+                    ApprovalBinding {
+                        // Wrong action: not the allow-once tool authority.
+                        action: "continue-operation".to_owned(),
+                        target: "execution:exec-1".to_owned(),
+                        policy_generation: 1,
+                    },
+                    vec![approver.clone()],
+                )
+                .expect("create");
+            guard
+                .approvals
+                .decide_approval(&id, ApprovalDecision::Approve, &approver)
+                .expect("approve");
+        }
+        assert!(
+            resolve_allow_once_grant(&security, &ExecutionId("exec-1".to_owned())).is_none(),
+            "an approval for a different action must never authorize allow-once"
+        );
+    }
+
+    #[test]
+    fn allow_once_grant_is_denied_while_pending() {
+        let security = Arc::new(Mutex::new(SecurityState::new()));
+        let approver = PrincipalRef("operator".to_owned());
+        {
+            let mut guard = security.lock().expect("security");
+            guard
+                .approvals
+                .create_bound_approval(
+                    OperationId("op-1".to_owned()),
+                    ApprovalBinding {
+                        action: ALLOW_ONCE_ACTION.to_owned(),
+                        target: "execution:exec-1".to_owned(),
+                        policy_generation: 1,
+                    },
+                    vec![approver],
+                )
+                .expect("create");
+            // Left Pending on purpose.
+        }
+        assert!(
+            resolve_allow_once_grant(&security, &ExecutionId("exec-1".to_owned())).is_none(),
+            "a pending approval must never authorize allow-once"
+        );
+    }
 
     #[test]
     fn core_lease_is_unique_and_drop_releases_permit() {
@@ -541,6 +783,56 @@ mod tests {
         for worker in workers {
             worker.join().expect("worker joined");
         }
+        assert_eq!(governor.active_permits().expect("released"), 0);
+    }
+
+    #[test]
+    fn documented_resource_bounds_are_exactly_active_four_queue_sixtyfour() {
+        // `DXB-DEL-068` H11 §10: the runtime's bounded high-water marks are a
+        // single-owner fact. Assert the exact documented numbers so a silent
+        // drift of the active/queue bound fails this owner test.
+        assert_eq!(MAX_ACTIVE_EXECUTIONS, 4, "active high-water must be 4");
+        assert_eq!(
+            MAX_ADMITTED_QUEUE, 64,
+            "admitted queue high-water must be 64"
+        );
+        // The production coordinator's governor is built at exactly the active
+        // bound, so its capacity is the same single-owner number.
+        let governor = ResourceGovernor::new(1, MAX_ACTIVE_EXECUTIONS).expect("governor");
+        assert_eq!(governor.capacity(), 4);
+    }
+
+    #[test]
+    fn governor_never_exceeds_active_high_water_under_sequential_pressure() {
+        // Deterministic (no timing): acquire up to capacity, then every further
+        // acquire is bounded-rejected, and the live permit count never exceeds
+        // the high-water mark. Releasing returns the count to zero (no leak).
+        let governor = ResourceGovernor::new(2, MAX_ACTIVE_EXECUTIONS).expect("governor");
+        let mut leases = Vec::new();
+        for index in 0..MAX_ACTIVE_EXECUTIONS {
+            let lease = governor
+                .try_acquire(&ExecutionId(format!("execution-{index}")))
+                .expect("acquire")
+                .expect("within capacity");
+            leases.push(lease);
+            assert!(
+                governor.active_permits().expect("active") <= MAX_ACTIVE_EXECUTIONS,
+                "live permits must never exceed the high-water mark"
+            );
+        }
+        assert_eq!(governor.active_permits().expect("active"), 4);
+        // Pressure beyond capacity: fail closed, no over-admission.
+        for over in 0..8 {
+            assert!(
+                governor
+                    .try_acquire(&ExecutionId(format!("over-{over}")))
+                    .expect("bounded")
+                    .is_none(),
+                "over-capacity admission must be rejected, not queued unbounded"
+            );
+        }
+        assert_eq!(governor.active_permits().expect("active"), 4);
+        leases.clear();
         assert_eq!(governor.active_permits().expect("released"), 0);
     }
 }

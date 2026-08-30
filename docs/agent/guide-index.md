@@ -32,6 +32,7 @@
 | concurrency/crash 검증 | [quality/concurrency-fault-testing.md](quality/concurrency-fault-testing.md) |
 | 성능 최적화 | [quality/benchmark-performance.md](quality/benchmark-performance.md) |
 | 문서 작성/구조 변경 | [documentation-rules.md](documentation-rules.md) → [quality/documentation-consistency.md](quality/documentation-consistency.md) |
+| Web UI 화면/토큰/시안 대응 | [../webui/index.md](../webui/index.md) |
 | 완료/재검수 | [quality/review-completion.md](quality/review-completion.md) |
 
 ## Category Index

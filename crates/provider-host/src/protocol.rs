@@ -5,55 +5,12 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use serde::Deserialize;
-use tokio::sync::watch;
 
+use crate::cancellation::{CancellationToken, UsageInfo};
 use crate::transport::HttpTransport;
 
 const PROTOCOL_OVERHEAD_BYTES: usize = 64 * 1024;
 const ERROR_DETAIL_BYTES: usize = 16 * 1024;
-
-/// Level-triggered caller cancellation owned by provider Common.
-///
-/// The state is retained after cancellation, so a subscriber created after the
-/// cancel request still observes it immediately. This avoids the lost-wakeup
-/// semantics of using a bare notification as a cancellation token.
-#[derive(Debug, Clone)]
-pub struct CancellationToken {
-    state: watch::Sender<bool>,
-}
-
-impl Default for CancellationToken {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CancellationToken {
-    pub fn new() -> Self {
-        let (state, _) = watch::channel(false);
-        Self { state }
-    }
-
-    pub fn cancel(&self) {
-        self.state.send_replace(true);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        *self.state.borrow()
-    }
-
-    async fn cancelled(&self) {
-        let mut receiver = self.state.subscribe();
-        if *receiver.borrow_and_update() {
-            return;
-        }
-        while receiver.changed().await.is_ok() {
-            if *receiver.borrow_and_update() {
-                return;
-            }
-        }
-    }
-}
 
 /// A single chat message with role and content.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -71,14 +28,6 @@ pub struct ProviderRequest {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub stream: bool,
-}
-
-/// Token usage reported by the upstream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct UsageInfo {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub reasoning_tokens: Option<u32>,
 }
 
 /// Unified output event produced by the common handler.
@@ -117,13 +66,44 @@ pub struct ProviderExecuteConfig {
     pub max_output_items: usize,
 }
 
-/// OpenAI-compatible chat completion protocol handler.
-/// Owns the wire format; extension providers only supply model-specific fields.
+/// Common text-generation protocol handler.
+/// Owns OpenAI-compatible Chat Completions and Anthropic-compatible Messages
+/// wire formats; extension providers only supply model-specific fields.
 #[derive(Debug, Clone)]
 pub struct ChatCompletionProtocol {
     pub transport: HttpTransport,
     pub max_output_bytes: usize,
     pub max_output_items: usize,
+    wire_protocol: WireProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireProtocol {
+    OpenAiChatCompletions,
+    AnthropicMessages,
+}
+
+#[derive(Deserialize)]
+struct AnthropicMessagesResponse {
+    content: Vec<AnthropicContentBlock>,
+    usage: Option<AnthropicUsageResponse>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum AnthropicContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct AnthropicUsageResponse {
+    input_tokens: u64,
+    output_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -176,12 +156,37 @@ impl ChatCompletionProtocol {
             transport,
             max_output_bytes,
             max_output_items,
+            wire_protocol: WireProtocol::OpenAiChatCompletions,
+        }
+    }
+
+    pub fn new_anthropic(
+        transport: HttpTransport,
+        max_output_bytes: usize,
+        max_output_items: usize,
+    ) -> Self {
+        Self {
+            transport,
+            max_output_bytes,
+            max_output_items,
+            wire_protocol: WireProtocol::AnthropicMessages,
         }
     }
 
     /// Executes one bounded provider request under the same deadline and
-    /// cancellation authority for connect, body reads, and streaming reads.
+    /// cancellation authority for connect and response body reads.
     pub async fn execute(
+        &self,
+        request: &ProviderRequest,
+        config: &ProviderExecuteConfig,
+    ) -> Result<Vec<ProviderEvent>, ProviderError> {
+        match self.wire_protocol {
+            WireProtocol::OpenAiChatCompletions => self.execute_openai(request, config).await,
+            WireProtocol::AnthropicMessages => self.execute_anthropic(request, config).await,
+        }
+    }
+
+    async fn execute_openai(
         &self,
         request: &ProviderRequest,
         config: &ProviderExecuteConfig,
@@ -236,6 +241,133 @@ impl ChatCompletionProtocol {
         } else {
             self.parse_non_stream(response, config).await
         }
+    }
+
+    async fn execute_anthropic(
+        &self,
+        request: &ProviderRequest,
+        config: &ProviderExecuteConfig,
+    ) -> Result<Vec<ProviderEvent>, ProviderError> {
+        self.check_control(config)?;
+        if request.stream {
+            return Err(ProviderError::ProtocolViolation {
+                detail: "Anthropic Messages streaming is not enabled".to_owned(),
+            });
+        }
+
+        let system = request
+            .messages
+            .iter()
+            .filter(|message| message.role == "system")
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let messages = request
+            .messages
+            .iter()
+            .filter(|message| message.role != "system")
+            .map(|message| serde_json::json!({"role": message.role, "content": message.content}))
+            .collect::<Vec<_>>();
+        let mut body = serde_json::json!({
+            "model": request.model,
+            "messages": messages,
+            "max_tokens": request.max_tokens.unwrap_or(4096),
+            "temperature": request.temperature,
+            "stream": false,
+        });
+        if !system.is_empty() {
+            body["system"] = serde_json::Value::String(system);
+        }
+
+        let url = format!("{}/messages", self.transport.base_url.trim_end_matches('/'));
+        let response = self
+            .controlled(self.transport.client.post(&url).json(&body).send(), config)
+            .await?
+            .map_err(map_reqwest_error)?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs);
+            return Err(ProviderError::RateLimited { retry_after });
+        }
+        if status.is_client_error() {
+            let detail = self.read_error_detail(response, config).await?;
+            return Err(ProviderError::InvalidRequest {
+                status: status.as_u16(),
+                detail,
+            });
+        }
+        if status.is_server_error() {
+            let detail = self.read_error_detail(response, config).await?;
+            return Err(ProviderError::UpstreamUnavailable {
+                status: status.as_u16(),
+                detail,
+            });
+        }
+
+        self.parse_anthropic_non_stream(response, config).await
+    }
+
+    async fn parse_anthropic_non_stream(
+        &self,
+        response: reqwest::Response,
+        config: &ProviderExecuteConfig,
+    ) -> Result<Vec<ProviderEvent>, ProviderError> {
+        let (max_bytes, max_items) = self.effective_limits(config);
+        let wire_limit = max_bytes.saturating_add(PROTOCOL_OVERHEAD_BYTES);
+        let bytes = self.read_body_limited(response, config, wire_limit).await?;
+        let body: AnthropicMessagesResponse =
+            serde_json::from_slice(&bytes).map_err(|error| ProviderError::ProtocolViolation {
+                detail: error.to_string(),
+            })?;
+
+        let mut events = Vec::new();
+        let mut total_bytes = 0usize;
+        let mut sequence = 0u64;
+        for block in body.content {
+            match block {
+                AnthropicContentBlock::Text { text } if !text.is_empty() => push_delta(
+                    &mut events,
+                    &mut total_bytes,
+                    &mut sequence,
+                    text,
+                    false,
+                    max_bytes,
+                    max_items,
+                )?,
+                AnthropicContentBlock::Thinking { thinking } if !thinking.is_empty() => push_delta(
+                    &mut events,
+                    &mut total_bytes,
+                    &mut sequence,
+                    thinking,
+                    true,
+                    max_bytes,
+                    max_items,
+                )?,
+                AnthropicContentBlock::Text { .. }
+                | AnthropicContentBlock::Thinking { .. }
+                | AnthropicContentBlock::Other => {}
+            }
+        }
+        let usage = body.usage.map_or(
+            UsageInfo {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                reasoning_tokens: None,
+            },
+            |usage| UsageInfo {
+                prompt_tokens: u32::try_from(usage.input_tokens).unwrap_or(u32::MAX),
+                completion_tokens: u32::try_from(usage.output_tokens).unwrap_or(u32::MAX),
+                reasoning_tokens: None,
+            },
+        );
+        push_completed(&mut events, usage, max_items)?;
+        Ok(events)
     }
 
     async fn parse_non_stream(

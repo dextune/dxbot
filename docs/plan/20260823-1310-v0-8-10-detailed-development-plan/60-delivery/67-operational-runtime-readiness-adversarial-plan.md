@@ -579,6 +579,7 @@ R0 CLI residual closure
 | OJ-003 | built `dxb` 401/429/503/malformed/output overflow/transport/deadline matrix: typed outcome, secret 비노출, no blind retry, doctor active permits 0; unconfigured/bad credential/generation fence 회귀 포함 | PASS |
 | OJ-007 | built `dxb` repeated supervised stop/start: stable InstanceId, strictly increasing HostGeneration, bounded lock handoff/state size, endpoint unpublish, Task/Process/Memory/Approval/Audit continuity, audit duplicate 0, active permits 0 | PASS |
 | Provider backtest | isolated explicit `DXBOT_TEST_OPENAI_ENDPOINT` local proxy에서 기존 ignored `AT-DEEPSEEK-002~005` 4/4, `AT-PROVIDER-INFRA-002/003/005` 3/3 직접 실행 | PASS |
+| MiniMax M3 extension | OpenCode metadata의 `MiniMax-M3`/Anthropic API base/`MINIMAX_API_KEY` source를 secret 비노출로 resolve; deterministic Common Host fixture 2/2, Runtime config test, actual endpoint live canary 1/1, isolated built `dxb` start→doctor→Bot activate→Task submit→non-empty Result/Evidence(`minimax-m3-production`)→stop | PASS |
 | 전체 quality/backtest | `cargo fmt --all -- --check`; strict workspace all-target/all-feature clippy; `cargo test --workspace --all-features`(CLI entrypoint 18/18 포함); plan/agent-guide validators active+self-test; `git diff --check` | 모두 exit 0 / PASS |
 
 ### 15.1 독립 검수 3회와 finding closure
@@ -595,4 +596,11 @@ R0 CLI residual closure
 
 **최종 판정: DXBOT local P0 Operational Runtime — Operational Ready.**
 
-경계: 이 판정은 owner-local Linux Runtime과 configured OpenAI-compatible Provider contract에 대한 것이다. 특정 commercial endpoint의 SLA·모델 품질·비용 정책 인증이나 M6 full product freeze를 의미하지 않는다.
+경계: 이 판정은 owner-local Linux Runtime과 configured OpenAI Chat Completions 또는 Anthropic Messages compatible Provider contract에 대한 것이다. 현재 production adapter allowlist는 `deepseek-flash`와 `minimax-m3`다. 특정 commercial endpoint의 SLA·모델 품질·비용 정책 인증이나 M6 full product freeze를 의미하지 않는다.
+
+
+## 17. Harness 모듈화 후속 경계
+
+본 문서의 local P0 Operational Ready는 direct OpenAI/Anthropic-compatible Provider 경로와 `minimax-m3` production allowlist에 대한 역사적 실행 판정이다. 이는 external Harness의 공통 Execute contract, per-registration protocol/transport, static factory registry, drain/replace/unregister, shared Conformance와 adapter-removal build가 완료됐다는 뜻이 아니다.
+
+production 모델 `MiniMax-M3`와 공식 DeepSeek Harness ACP subprocess adapter를 고정한 후속 단계·gate·위험·중단 조건은 [DXB-DEL-068](68-modular-harness-adoption-plan.md)이 소유한다. 해당 문서의 executable checklist 전에는 `Harness Modularization Complete`를 선언하지 않는다.

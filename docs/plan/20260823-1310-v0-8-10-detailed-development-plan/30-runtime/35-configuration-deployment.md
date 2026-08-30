@@ -37,6 +37,13 @@ profile state는 owner-only directory에서 descriptor-relative no-follow, temp+
 
 `ADR-0138`에 따라 P0 config owner는 Runtime Host의 user-scoped runtime root에 있는 owner-only `provider-config.json`이다. 이 파일은 schema version, adapter, ProviderId, capability, ProviderGeneration, endpoint, model, bounded timeout, `env:<NAME>` credential reference만 저장한다. credential 원문은 파일·discovery·Application state·CLI journal·audit에 저장하지 않으며 Runtime Host process 환경에서 reference를 일시 resolve해 Common `HttpTransport`에만 전달한다.
 
+schema v1의 production adapter allowlist와 wire contract는 다음과 같다.
+
+- `deepseek-flash`: OpenAI-compatible Chat Completions, Bearer credential, configured endpoint에 `/v1/chat/completions`를 추가한다.
+- `minimax-m3`: Anthropic-compatible Messages, scoped `x-api-key` + `anthropic-version: 2023-06-01`, configured API base(예: `https://api.minimax.io/anthropic/v1`)에 `/messages`를 추가한다. 기본 model은 `MiniMax-M3`이며 credential reference는 `env:MINIMAX_API_KEY`를 사용할 수 있다.
+
+adapter가 wire format과 credential header를 명시적으로 선택하며 endpoint 문자열이나 model 이름으로 protocol을 추측하지 않는다. Anthropic P0 path는 non-streaming이며 unsupported stream을 silent downgrade하지 않는다.
+
 파일 부재는 explicit `unconfigured`이며 Activate/Task admission은 typed `provider-unavailable`로 fail closed한다. symlink/non-regular file, owner 외 권한, unknown schema/field/adapter, invalid generation/endpoint/limit, unresolved credential reference는 Runtime start를 실패시킨다. Runtime Host는 구성한 **동일 ProviderHost instance**를 Control query/admission/execution에 전달하고 discovery/doctor는 그 owner state의 redacted ProviderId/readiness projection만 게시한다. ReferenceProvider는 production fallback으로 등록하지 않는다. P0는 단일 configured Provider만 허용하며 multi-provider registry, persistent credential vault, reload/replace는 별도 generation-drain 결정 전 비범위다.
 
 ## Provider readiness

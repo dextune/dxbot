@@ -10,15 +10,53 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# Production adapters as independently removable slices (`DXB-DEL-068` H11).
+# `default` enables every production adapter. Each production feature gates its
+# adapter module, its public re-exports, its static `ProviderFactory` row, its
+# adapter-specific dependencies, and its adapter-specific tests. Removing a
+# feature removes that adapter's slice without touching unrelated rows, and the
+# Common contract (Execute SPI, registration, host, factory registry) is always
+# present.
+default = ["direct-deepseek", "direct-minimax", "dsh-acp"]
+
+# Direct DeepSeek v4 Flash adapter over the Common HTTP transport.
+direct-deepseek = ["http-transport"]
+# Direct MiniMax-M3 adapter over the Common Anthropic-compatible HTTP transport.
+direct-minimax = ["http-transport"]
+# Official DeepSeek Harness ACP subprocess adapter. Pulls in only the
+# subprocess-integrity dependencies (`sha2` spawn-time digest recheck, `nix`
+# process-group teardown) which no other slice needs.
+dsh-acp = ["dep:sha2", "dep:nix"]
+
+# Internal: the Common HTTP transport/protocol stack shared by the direct HTTP
+# adapters and the HTTP conformance reference. Enabled transitively; not a
+# production selection on its own.
+http-transport = ["dep:reqwest", "dep:futures", "dep:bytes"]
+
+# Test-only synthetic canary/reference providers and the shared Conformance
+# suite. Never enabled by production consumers; enabled via dev-dependency in
+# tests and via downstream `--features` for conformance runs. The HTTP
+# conformance reference needs the Common HTTP stack.
+testkit = ["http-transport"]
+
 [dependencies]
 dxbot-core = { path = "../dxbot-core" }
 runtime-audit = { path = "../runtime-audit" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
-futures = "0.3"
-bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"], optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process", "io-util"] }
+futures = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = { version = "=0.10.9", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process", "fs", "user"], optional = true }
 
 [dev-dependencies]
 runtime-security = { path = "../runtime-security" }
+# Tests exercise the shared Conformance testkit and every default production
+# adapter. Removal-variant builds are driven by `scripts/adapter-removal-matrix.sh`
+# with explicit `--no-default-features --features ...` selections.
+provider-host = { path = ".", default-features = false, features = ["testkit"] }

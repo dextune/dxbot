@@ -1,0 +1,36 @@
+{
+  "_comment": "DXB-DEL-068 H6/H7 example provider-config for the official DeepSeek Harness ACP provider. Install at $XDG_STATE_HOME/dxbot/runtime/provider-config.json with mode 0600. This file stores ONLY an env: credential reference; never place the MINIMAX_API_KEY value here. All harness paths are absolute and validated; DSH_HOME is a dedicated isolated directory (owner-only 0700, never a symlink, never the ambient user DSH home). The command must be a direct regular file, owner-executable, and not group/other-writable. The patch must be a direct regular file (not a symlink) and not group/other-writable.",
+  "_source_identity": "The harness is pinned to the exact upstream identity recorded in DXB-DEL-064: commit cd5ef8148158c3a752a658978873241fdf8e2bbc, tag dsh-v0.1.2-alpha.1, root package version 0.1.2-alpha.1. source_commit and source_version below must be these exact values or composition fails closed.",
+  "_digests": "command_sha256 and patch_sha256 are lowercase 64-hex SHA-256 digests. Replace the placeholder command_sha256 below with the digest of your pinned dsh executable: run 'sha256sum /usr/lib/dxbot/dsh/bin/dsh'. patch_sha256 must be the digest of the audited deploy/dsh/dsh-acp.patch.yaml you ship; run 'sha256sum deploy/dsh/dsh-acp.patch.yaml' and use that value. The Runtime independently recomputes both from disk and additionally requires the on-disk patch to match the compile-time audited digest of the repository patch; a mismatch fails closed before any secret is resolved.",
+  "schema_version": 2,
+  "adapter": "deepseek-harness-acp",
+  "provider_id": "deepseek-harness-acp",
+  "capability": "llm-chat",
+  "generation": 1,
+  "model": "MiniMax-M3",
+  "credential_ref": "env:MINIMAX_API_KEY",
+  "timeout_ms": 60000,
+  "harness": {
+    "command": "/usr/lib/dxbot/dsh/bin/dsh",
+    "args": ["--profile", "acp", "--patch", "/usr/lib/dxbot/dsh/dsh-acp.patch.yaml"],
+    "patch_path": "/usr/lib/dxbot/dsh/dsh-acp.patch.yaml",
+    "dsh_home": "/var/lib/dxbot/dsh-home",
+    "workspace": "/var/lib/dxbot/workspace",
+    "path_env": "/usr/bin:/bin",
+    "permission": "reject",
+    "source_commit": "cd5ef8148158c3a752a658978873241fdf8e2bbc",
+    "source_version": "0.1.2-alpha.1",
+    "command_sha256": "REPLACE_WITH_SHA256SUM_OF_YOUR_PINNED_DSH_EXECUTABLE_0000000000000000",
+    "patch_sha256": "1fe22c1e2a674c5f0912e612a9d59259a6b52fb50d90889a4c326bddbb9b6b7a",
+    "limits": {
+      "max_line_bytes": 262144,
+      "max_output_bytes": 1048576,
+      "max_update_frames": 4096,
+      "max_stderr_bytes": 16384,
+      "handshake_deadline_ms": 15000,
+      "prompt_deadline_ms": 120000,
+      "eof_grace_ms": 6000,
+      "term_grace_ms": 3000
+    }
+  }
+}

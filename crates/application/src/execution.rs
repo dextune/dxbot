@@ -25,6 +25,14 @@ pub struct ExecutionWork {
     pub context: String,
     pub budget: Option<u64>,
     pub deadline: Option<i64>,
+    /// Immutable Context Plan permission references, propagated into the
+    /// provider call so a provider-neutral tool/permission bridge can attribute
+    /// requests to the committed plan (`DXB-DEL-068` H10 Task 4). In-memory
+    /// candidate field only; no persisted schema change.
+    pub permission_refs: Vec<String>,
+    /// Immutable Context Plan resource references / budget ref, propagated for
+    /// the same reason. In-memory candidate field only.
+    pub resource_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +144,13 @@ impl ApplicationMutator {
                         context: execution.context_plan.bounded_context.clone(),
                         budget,
                         deadline,
+                        permission_refs: execution.context_plan.permission_refs.clone(),
+                        resource_refs: execution
+                            .context_plan
+                            .resource_budget
+                            .clone()
+                            .into_iter()
+                            .collect(),
                     },
                 })
             })
